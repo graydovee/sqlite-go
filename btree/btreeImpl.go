@@ -7,14 +7,10 @@ import (
 	"github.com/sqlite-go/sqlite-go/pager"
 )
 
-// Page header offsets for the B-Tree page header.
-// For page 1, the B-Tree header starts at offset 100 (after DB header).
 const (
-	DBHeaderSize = 100 // SQLite database file header size (page 1 only)
+	DBHeaderSize = 100
 )
 
-// pageOffset returns the offset of the B-Tree header within the page.
-// Page 1 has a 100-byte database file header before the B-Tree header.
 func pageOffset(pageNum PageNumber) int {
 	if pageNum == 1 {
 		return DBHeaderSize
@@ -22,19 +18,16 @@ func pageOffset(pageNum PageNumber) int {
 	return 0
 }
 
-// BTreeImpl implements the BTree interface.
 type BTreeImpl struct {
 	pgr       pager.Pager
 	pageSize  int
 	pageCount int
 }
 
-// BTreeConnImpl implements the BTreeConn interface.
 type BTreeConnImpl struct {
 	pgr pager.Pager
 }
 
-// OpenBTreeConn opens a B-Tree connection.
 func OpenBTreeConn(pgr pager.Pager) BTreeConn {
 	return &BTreeConnImpl{pgr: pgr}
 }
@@ -82,62 +75,81 @@ func (c *BTreeConnImpl) SetMeta(idx int, value int32) error {
 func (c *BTreeConnImpl) SchemaVersion() (int32, error)  { return c.GetMeta(1) }
 func (c *BTreeConnImpl) SetSchemaVersion(v int32) error { return c.SetMeta(1, v) }
 
-func (b *BTreeImpl) Close() error  { return nil }
-func (b *BTreeImpl) Begin(write bool) error { return b.pgr.Begin(write) }
-func (b *BTreeImpl) Commit() error  { return b.pgr.Commit() }
-func (b *BTreeImpl) Rollback() error { return b.pgr.Rollback() }
+func (b *BTreeImpl) Close() error                                        { return nil }
+func (b *BTreeImpl) Begin(write bool) error                              { return b.pgr.Begin(write) }
+func (b *BTreeImpl) Commit() error                                       { return b.pgr.Commit() }
+func (b *BTreeImpl) Rollback() error                                     { return b.pgr.Rollback() }
 
-// hdrSize returns the total header size (page offset + 8-byte B-Tree header).
 func hdrSize(pageNum PageNumber) int {
 	return pageOffset(pageNum) + 8
 }
 
-// CreateBTree creates a new B-Tree root page.
+func hdrSizeInterior(pageNum PageNumber) int {
+	return pageOffset(pageNum) + 12
+}
+
 func (b *BTreeImpl) CreateBTree(flags CreateFlags) (PageNumber, error) {
 	page, err := b.pgr.GetNewPage()
 	if err != nil {
 		return 0, err
 	}
 	pageNum := page.PageNum
-	off := pageOffset(pageNum)
-
-	// Page type
-	switch flags {
-	case CreateTable:
-		page.Data[off] = PageTypeLeafTable
-	case CreateIndex:
-		page.Data[off] = PageTypeLeafIndex
-	default:
-		page.Data[off] = PageTypeLeafTable
+	pageType := PageTypeLeafTable
+	if flags == CreateIndex {
+		pageType = PageTypeLeafIndex
 	}
-
-	// First free block = 0
-	binary.BigEndian.PutUint16(page.Data[off+1:off+3], 0)
-	// Number of cells = 0
-	binary.BigEndian.PutUint16(page.Data[off+3:off+5], 0)
-	// Cell content offset = pageSize (empty, meaning full page available)
-	binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(b.pageSize))
-	// Fragmented free bytes
-	page.Data[off+7] = 0
-
+	initPage(page.Data, pageNum, pageType, b.pageSize)
 	b.pgr.MarkDirty(page)
 	b.pgr.WritePage(page)
 	b.pgr.ReleasePage(page)
 	return pageNum, nil
 }
 
-func (b *BTreeImpl) Drop(rootPage PageNumber) error { return nil }
+func (b *BTreeImpl) Drop(rootPage PageNumber) error {
+	return b.freePageRecursive(rootPage)
+}
+
+func (b *BTreeImpl) freePageRecursive(pageNum PageNumber) error {
+	page, err := b.pgr.GetPage(pageNum)
+	if err != nil {
+		return err
+	}
+	hdr := readPageHeader(page.Data, pageNum)
+	b.pgr.ReleasePage(page)
+	if isInteriorPage(hdr.pageType) {
+		hs := hdrSizeInterior(pageNum)
+		pg, err := b.pgr.GetPage(pageNum)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < int(hdr.numCells); i++ {
+			cellPtr := int(binary.BigEndian.Uint16(pg.Data[hs+i*2 : hs+i*2+2]))
+			if cellPtr > 0 && cellPtr+4 <= len(pg.Data) {
+				leftChild := PageNumber(binary.BigEndian.Uint32(pg.Data[cellPtr : cellPtr+4]))
+				if leftChild > 0 {
+					b.freePageRecursive(leftChild)
+				}
+			}
+		}
+		if hdr.rightChild > 0 {
+			b.freePageRecursive(PageNumber(hdr.rightChild))
+		}
+		b.pgr.ReleasePage(pg)
+	}
+	return b.pgr.FreePage(pageNum)
+}
 
 func (b *BTreeImpl) Clear(rootPage PageNumber) error {
+	_ = b.Drop(rootPage)
 	page, err := b.pgr.GetPage(rootPage)
 	if err != nil {
 		return err
 	}
-	defer b.pgr.ReleasePage(page)
-	off := pageOffset(rootPage)
-	binary.BigEndian.PutUint16(page.Data[off+3:off+5], 0)
+	initPage(page.Data, rootPage, PageTypeLeafTable, b.pageSize)
 	b.pgr.MarkDirty(page)
-	return b.pgr.WritePage(page)
+	b.pgr.WritePage(page)
+	b.pgr.ReleasePage(page)
+	return nil
 }
 
 func (b *BTreeImpl) Cursor(rootPage PageNumber, write bool) (BTCursor, error) {
@@ -148,14 +160,13 @@ func (b *BTreeImpl) Cursor(rootPage PageNumber, write bool) (BTCursor, error) {
 	}, nil
 }
 
-// pageHeader reads B-Tree page header fields.
 type pageHeader struct {
-	pageType    byte
-	firstFree   uint16
-	numCells    uint16
-	contentOff  uint16
-	fragBytes   byte
-	rightChild  uint32 // Interior pages only
+	pageType   byte
+	firstFree  uint16
+	numCells   uint16
+	contentOff uint16
+	fragBytes  byte
+	rightChild uint32
 }
 
 func readPageHeader(data []byte, pageNum PageNumber) pageHeader {
@@ -167,108 +178,304 @@ func readPageHeader(data []byte, pageNum PageNumber) pageHeader {
 		contentOff: binary.BigEndian.Uint16(data[off+5 : off+7]),
 		fragBytes:  data[off+7],
 	}
-	if h.pageType == PageTypeInteriorTable || h.pageType == PageTypeInteriorIndex {
+	if isInteriorPage(h.pageType) {
 		h.rightChild = binary.BigEndian.Uint32(data[off+8 : off+12])
 	}
 	return h
 }
 
-// cellPtrOffset returns the byte offset of the i-th cell pointer.
-func cellPtrOffset(pageNum PageNumber, i int) int {
-	return hdrSize(pageNum) + i*2
-}
+// --- Insert with split support ---
 
-// Insert inserts a key/value pair.
 func (b *BTreeImpl) Insert(cursor BTCursor, key []byte, data []byte, rowid RowID, seekResult SeekResult) error {
 	cur := cursor.(*CursorImpl)
 
-	// For updates (SeekFound), delete the old entry first to free space.
 	if seekResult == SeekFound {
-		page, err := b.pgr.GetPage(cur.rootPage)
+		if err := b.findLeafForInsert(cur, rowid); err != nil {
+			return err
+		}
+		page, err := b.pgr.GetPage(cur.currentPage)
 		if err != nil {
 			return err
 		}
-		hdr := readPageHeader(page.Data, cur.rootPage)
-		hs := hdrSize(cur.rootPage)
+		hdr := readPageHeader(page.Data, cur.currentPage)
+		hs := hdrSize(cur.currentPage)
 		for i := 0; i < int(hdr.numCells); i++ {
 			ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
 			if ptr == 0 || ptr >= len(page.Data) {
 				continue
 			}
-			// Read rowid from cell data
-			existingRowid := readCellRowidFromPage(page.Data, ptr, hdr.pageType)
-			if RowID(existingRowid) == rowid {
-				// Remove this cell by shifting pointers
-				for j := i; j < int(hdr.numCells)-1; j++ {
-					nextPtr := binary.BigEndian.Uint16(page.Data[hs+(j+1)*2 : hs+(j+1)*2+2])
-					binary.BigEndian.PutUint16(page.Data[hs+j*2:], nextPtr)
-				}
-				off := pageOffset(cur.rootPage)
-				binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(int(hdr.numCells)-1))
+			if readCellRowid(page.Data[ptr:], hdr.pageType) == int64(rowid) {
+				b.deleteCellPtr(page, cur.currentPage, i)
 				break
 			}
 		}
 		b.pgr.MarkDirty(page)
 		b.pgr.WritePage(page)
 		b.pgr.ReleasePage(page)
+		cur.currentPage = cur.rootPage
+		cur.path = cur.path[:0]
 	}
 
-	page, err := b.pgr.GetPage(cur.rootPage)
+	if err := b.findLeafForInsert(cur, rowid); err != nil {
+		return err
+	}
+
+	cell, err := b.buildCell(cur.currentPage, key, data, rowid)
+	if err != nil {
+		return err
+	}
+
+	err = b.insertCellIntoPage(cur.currentPage, cell)
+	if err == nil {
+		return nil
+	}
+	if err.Error() != "page full" {
+		return err
+	}
+	return b.splitAndInsert(cur, cell, rowid)
+}
+
+func (b *BTreeImpl) findLeafForInsert(cur *CursorImpl, rowid RowID) error {
+	cur.currentPage = cur.rootPage
+	cur.path = cur.path[:0]
+	for {
+		page, err := b.pgr.GetPage(cur.currentPage)
+		if err != nil {
+			return err
+		}
+		hdr := readPageHeader(page.Data, cur.currentPage)
+		b.pgr.ReleasePage(page)
+		if !isInteriorPage(hdr.pageType) {
+			return nil
+		}
+		childPage, childIdx, err := b.findChildForRowid(cur.currentPage, rowid)
+		if err != nil {
+			return err
+		}
+		cur.path = append(cur.path, pathEntry{pageNum: cur.currentPage, childIdx: childIdx})
+		cur.currentPage = childPage
+	}
+}
+
+func (b *BTreeImpl) findChildForRowid(pageNum PageNumber, rowid RowID) (PageNumber, int, error) {
+	page, err := b.pgr.GetPage(pageNum)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer b.pgr.ReleasePage(page)
+	hdr := readPageHeader(page.Data, pageNum)
+	hs := hdrSizeInterior(pageNum)
+	childIdx := int(hdr.numCells)
+	childPage := PageNumber(hdr.rightChild)
+	lo, hi := 0, int(hdr.numCells)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		cellPtr := int(binary.BigEndian.Uint16(page.Data[hs+mid*2 : hs+mid*2+2]))
+		if cellPtr == 0 || cellPtr+4 >= len(page.Data) {
+			break
+		}
+		cellRowid, _ := ReadVarint(page.Data[cellPtr+4:])
+		if RowID(cellRowid) < rowid {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+			childIdx = mid
+			childPage = PageNumber(binary.BigEndian.Uint32(page.Data[cellPtr : cellPtr+4]))
+		}
+	}
+	return childPage, childIdx, nil
+}
+
+func (b *BTreeImpl) buildCell(pageNum PageNumber, key []byte, data []byte, rowid RowID) ([]byte, error) {
+	page, err := b.pgr.GetPage(pageNum)
+	if err != nil {
+		return nil, err
+	}
+	hdr := readPageHeader(page.Data, pageNum)
+	b.pgr.ReleasePage(page)
+
+	switch hdr.pageType {
+	case PageTypeLeafTable:
+		payload := data
+		if payload == nil {
+			payload = []byte{}
+		}
+		local := maxLocalSize(len(payload))
+		if local > len(payload) {
+			local = len(payload)
+		}
+		pl := VarintLen(int64(len(payload)))
+		rl := VarintLen(int64(rowid))
+		cellSize := pl + rl + local
+		if len(payload) > local {
+			cellSize += 4
+		}
+		buf := make([]byte, cellSize)
+		pos := PutVarint(buf, int64(len(payload)))
+		pos += PutVarint(buf[pos:], int64(rowid))
+		copy(buf[pos:], payload[:local])
+		pos += local
+		if len(payload) > local {
+			ovfl, err := b.writeOverflowPages(payload[local:])
+			if err != nil {
+				return nil, err
+			}
+			binary.BigEndian.PutUint32(buf[pos:], uint32(ovfl))
+		}
+		return buf, nil
+
+	case PageTypeLeafIndex:
+		payload := key
+		if payload == nil {
+			payload = []byte{}
+		}
+		local := maxLocalSize(len(payload))
+		if local > len(payload) {
+			local = len(payload)
+		}
+		pl := VarintLen(int64(len(payload)))
+		cellSize := pl + local
+		if len(payload) > local {
+			cellSize += 4
+		}
+		buf := make([]byte, cellSize)
+		pos := PutVarint(buf, int64(len(payload)))
+		copy(buf[pos:], payload[:local])
+		pos += local
+		if len(payload) > local {
+			ovfl, err := b.writeOverflowPages(payload[local:])
+			if err != nil {
+				return nil, err
+			}
+			binary.BigEndian.PutUint32(buf[pos:], uint32(ovfl))
+		}
+		return buf, nil
+
+	default:
+		return nil, fmt.Errorf("cannot build cell for page type %d", hdr.pageType)
+	}
+}
+
+func (b *BTreeImpl) writeOverflowPages(payload []byte) (PageNumber, error) {
+	if len(payload) == 0 {
+		return 0, nil
+	}
+	usable := pageSize - 4
+	var firstPage, prevPage PageNumber
+	offset := 0
+	for offset < len(payload) {
+		oPage, err := b.pgr.GetNewPage()
+		if err != nil {
+			return 0, err
+		}
+		pNum := oPage.PageNum
+		toWrite := len(payload) - offset
+		if toWrite > usable {
+			toWrite = usable
+		}
+		copy(oPage.Data[4:], payload[offset:offset+toWrite])
+		binary.BigEndian.PutUint32(oPage.Data[0:4], 0)
+		if prevPage > 0 {
+			prev, err := b.pgr.GetPage(prevPage)
+			if err != nil {
+				b.pgr.ReleasePage(oPage)
+				return 0, err
+			}
+			binary.BigEndian.PutUint32(prev.Data[0:4], uint32(pNum))
+			b.pgr.MarkDirty(prev)
+			b.pgr.WritePage(prev)
+			b.pgr.ReleasePage(prev)
+		}
+		if firstPage == 0 {
+			firstPage = pNum
+		}
+		prevPage = pNum
+		b.pgr.MarkDirty(oPage)
+		b.pgr.WritePage(oPage)
+		b.pgr.ReleasePage(oPage)
+		offset += toWrite
+	}
+	return firstPage, nil
+}
+
+func (b *BTreeImpl) readOverflowPayload(localData []byte, overflowPage PageNumber, totalLen int) ([]byte, error) {
+	result := make([]byte, totalLen)
+	copy(result, localData)
+	written := len(localData)
+	cur := overflowPage
+	for written < totalLen && cur > 0 {
+		page, err := b.pgr.GetPage(cur)
+		if err != nil {
+			return nil, fmt.Errorf("read overflow page %d: %w", cur, err)
+		}
+		next := PageNumber(0)
+		if len(page.Data) >= 4 {
+			next = PageNumber(binary.BigEndian.Uint32(page.Data[0:4]))
+		}
+		usable := pageSize - 4
+		remaining := totalLen - written
+		toRead := remaining
+		if toRead > usable {
+			toRead = usable
+		}
+		if written+toRead <= len(result) && 4+toRead <= len(page.Data) {
+			copy(result[written:], page.Data[4:4+toRead])
+			written += toRead
+		}
+		b.pgr.ReleasePage(page)
+		cur = next
+	}
+	return result, nil
+}
+
+func (b *BTreeImpl) insertCellIntoPage(pageNum PageNumber, cell []byte) error {
+	page, err := b.pgr.GetPage(pageNum)
 	if err != nil {
 		return err
 	}
 	defer b.pgr.ReleasePage(page)
 
-	hdr := readPageHeader(page.Data, cur.rootPage)
-	pageType := hdr.pageType
+	hdr := readPageHeader(page.Data, pageNum)
 	numCells := int(hdr.numCells)
-	hs := hdrSize(cur.rootPage)
-
-	// Build cell data
-	var cellData []byte
-	if pageType == PageTypeLeafTable {
-		payload := data
-		if payload == nil {
-			payload = []byte{}
-		}
-		pl := VarintLen(int64(len(payload)))
-		rl := VarintLen(int64(rowid))
-		cellData = make([]byte, pl+rl+len(payload))
-		pos := PutVarint(cellData, int64(len(payload)))
-		pos += PutVarint(cellData[pos:], int64(rowid))
-		copy(cellData[pos:], payload)
-	} else if pageType == PageTypeLeafIndex {
-		payload := key
-		pl := VarintLen(int64(len(payload)))
-		cellData = make([]byte, pl+len(payload))
-		pos := PutVarint(cellData, int64(len(payload)))
-		copy(cellData[pos:], payload)
-	} else {
-		return fmt.Errorf("unsupported page type for insert: %d", pageType)
+	isInt := isInteriorPage(hdr.pageType)
+	hs := hdrSize(pageNum)
+	if isInt {
+		hs = hdrSizeInterior(pageNum)
 	}
 
-	cellSize := len(cellData)
 	cellContentStart := int(hdr.contentOff)
 	if cellContentStart == 0 || cellContentStart > b.pageSize {
 		cellContentStart = b.pageSize
 	}
 
-	// Cell pointer area: from hs to hs + numCells*2
 	cellPtrAreaEnd := hs + numCells*2
-	newContentStart := cellContentStart - cellSize
+	newContentStart := cellContentStart - len(cell)
 
 	if newContentStart < cellPtrAreaEnd+2 {
-		return fmt.Errorf("page full: need split (not yet implemented)")
+		return fmt.Errorf("page full")
 	}
 
-	// Write cell data from bottom of page
-	copy(page.Data[newContentStart:], cellData)
+	insertIdx := numCells
+	cellRowid := readCellRowid(cell, hdr.pageType)
+	for i := 0; i < numCells; i++ {
+		ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
+		if ptr == 0 || ptr >= len(page.Data) {
+			continue
+		}
+		if readCellRowid(page.Data[ptr:], hdr.pageType) >= cellRowid {
+			insertIdx = i
+			break
+		}
+	}
 
-	// Append cell pointer
-	binary.BigEndian.PutUint16(page.Data[hs+numCells*2:], uint16(newContentStart))
+	copy(page.Data[newContentStart:], cell)
+	for i := numCells; i > insertIdx; i-- {
+		ptr := binary.BigEndian.Uint16(page.Data[hs+(i-1)*2 : hs+(i-1)*2+2])
+		binary.BigEndian.PutUint16(page.Data[hs+i*2:], ptr)
+	}
+	binary.BigEndian.PutUint16(page.Data[hs+insertIdx*2:], uint16(newContentStart))
 
-	// Update header: numCells++ and contentOff
-	off := pageOffset(cur.rootPage)
+	off := pageOffset(pageNum)
 	binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(numCells+1))
 	binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(newContentStart))
 
@@ -276,7 +483,360 @@ func (b *BTreeImpl) Insert(cursor BTCursor, key []byte, data []byte, rowid RowID
 	return b.pgr.WritePage(page)
 }
 
-// Delete deletes the entry at the cursor position.
+func (b *BTreeImpl) splitAndInsert(cur *CursorImpl, newCell []byte, rowid RowID) error {
+	page, err := b.pgr.GetPage(cur.currentPage)
+	if err != nil {
+		return err
+	}
+	hdr := readPageHeader(page.Data, cur.currentPage)
+	b.pgr.ReleasePage(page)
+
+	if len(cur.path) == 0 {
+		return b.splitRoot(cur, newCell, hdr)
+	}
+	return b.splitNonRoot(cur, newCell, hdr)
+}
+
+func (b *BTreeImpl) splitRoot(cur *CursorImpl, newCell []byte, hdr pageHeader) error {
+	leftPage, err := b.pgr.GetNewPage()
+	if err != nil {
+		return err
+	}
+	rightPage, err := b.pgr.GetNewPage()
+	if err != nil {
+		return err
+	}
+	leftNum := leftPage.PageNum
+	rightNum := rightPage.PageNum
+
+	rootPage, err := b.pgr.GetPage(cur.rootPage)
+	if err != nil {
+		return err
+	}
+	rootHdr := readPageHeader(rootPage.Data, cur.rootPage)
+
+	allCells := make([][]byte, 0, int(rootHdr.numCells)+1)
+	for i := 0; i < int(rootHdr.numCells); i++ {
+		cd := extractCellData(rootPage.Data, cur.rootPage, i)
+		if cd != nil {
+			allCells = append(allCells, cd)
+		}
+	}
+	b.pgr.ReleasePage(rootPage)
+
+	newRowid := readCellRowid(newCell, rootHdr.pageType)
+	inserted := false
+	for i, c := range allCells {
+		if readCellRowid(c, rootHdr.pageType) >= newRowid {
+			allCells = append(allCells, nil)
+			copy(allCells[i+1:], allCells[i:])
+			allCells[i] = newCell
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		allCells = append(allCells, newCell)
+	}
+
+	mid := len(allCells) / 2
+	leftCells := allCells[:mid]
+	rightCells := allCells[mid:]
+
+	initPage(leftPage.Data, leftNum, rootHdr.pageType, b.pageSize)
+	b.writeCellsToPage(leftPage, leftNum, leftCells, rootHdr.pageType)
+	b.pgr.MarkDirty(leftPage)
+	b.pgr.WritePage(leftPage)
+	b.pgr.ReleasePage(leftPage)
+
+	initPage(rightPage.Data, rightNum, rootHdr.pageType, b.pageSize)
+	b.writeCellsToPage(rightPage, rightNum, rightCells, rootHdr.pageType)
+	b.pgr.MarkDirty(rightPage)
+	b.pgr.WritePage(rightPage)
+	b.pgr.ReleasePage(rightPage)
+
+	rootPage, err = b.pgr.GetPage(cur.rootPage)
+	if err != nil {
+		return err
+	}
+
+	intType := PageTypeInteriorTable
+	if rootHdr.pageType == PageTypeLeafIndex || rootHdr.pageType == PageTypeInteriorIndex {
+		intType = PageTypeInteriorIndex
+	}
+
+	dividerRowid := int64(0)
+	if len(leftCells) > 0 {
+		dividerRowid = readCellRowid(leftCells[len(leftCells)-1], rootHdr.pageType)
+	}
+
+	rl := VarintLen(dividerRowid)
+	intCell := make([]byte, 4+rl)
+	binary.BigEndian.PutUint32(intCell[0:4], uint32(leftNum))
+	PutVarint(intCell[4:], dividerRowid)
+
+	initPage(rootPage.Data, cur.rootPage, intType, b.pageSize)
+	hsInt := hdrSizeInterior(cur.rootPage)
+	contentStart := b.pageSize - len(intCell)
+	copy(rootPage.Data[contentStart:], intCell)
+	binary.BigEndian.PutUint16(rootPage.Data[hsInt:], uint16(contentStart))
+
+	off := pageOffset(cur.rootPage)
+	binary.BigEndian.PutUint16(rootPage.Data[off+3:off+5], 1)
+	binary.BigEndian.PutUint16(rootPage.Data[off+5:off+7], uint16(contentStart))
+	binary.BigEndian.PutUint32(rootPage.Data[off+8:off+12], uint32(rightNum))
+
+	b.pgr.MarkDirty(rootPage)
+	b.pgr.WritePage(rootPage)
+	b.pgr.ReleasePage(rootPage)
+
+	if newRowid <= dividerRowid {
+		cur.currentPage = leftNum
+		cur.path = []pathEntry{{pageNum: cur.rootPage, childIdx: 0}}
+	} else {
+		cur.currentPage = rightNum
+		cur.path = []pathEntry{{pageNum: cur.rootPage, childIdx: 1}}
+	}
+	return nil
+}
+
+func (b *BTreeImpl) splitNonRoot(cur *CursorImpl, newCell []byte, hdr pageHeader) error {
+	page, err := b.pgr.GetPage(cur.currentPage)
+	if err != nil {
+		return err
+	}
+	allCells := make([][]byte, 0, int(hdr.numCells)+1)
+	for i := 0; i < int(hdr.numCells); i++ {
+		cd := extractCellData(page.Data, cur.currentPage, i)
+		if cd != nil {
+			allCells = append(allCells, cd)
+		}
+	}
+	b.pgr.ReleasePage(page)
+
+	newRowid := readCellRowid(newCell, hdr.pageType)
+	inserted := false
+	for i, c := range allCells {
+		if readCellRowid(c, hdr.pageType) >= newRowid {
+			allCells = append(allCells, nil)
+			copy(allCells[i+1:], allCells[i:])
+			allCells[i] = newCell
+			inserted = true
+			break
+		}
+	}
+	if !inserted {
+		allCells = append(allCells, newCell)
+	}
+
+	mid := len(allCells) / 2
+	leftCells := allCells[:mid]
+	rightCells := allCells[mid:]
+
+	p, _ := b.pgr.GetPage(cur.currentPage)
+	initPage(p.Data, cur.currentPage, hdr.pageType, b.pageSize)
+	b.pgr.MarkDirty(p)
+	b.pgr.WritePage(p)
+	b.pgr.ReleasePage(p)
+
+	p, _ = b.pgr.GetPage(cur.currentPage)
+	b.writeCellsToPage(p, cur.currentPage, leftCells, hdr.pageType)
+	b.pgr.ReleasePage(p)
+
+	sibPage, err := b.pgr.GetNewPage()
+	if err != nil {
+		return err
+	}
+	sibNum := sibPage.PageNum
+	initPage(sibPage.Data, sibNum, hdr.pageType, b.pageSize)
+	b.writeCellsToPage(sibPage, sibNum, rightCells, hdr.pageType)
+	b.pgr.MarkDirty(sibPage)
+	b.pgr.WritePage(sibPage)
+	b.pgr.ReleasePage(sibPage)
+
+	dividerRowid := readCellRowid(leftCells[len(leftCells)-1], hdr.pageType)
+
+	parent := cur.path[len(cur.path)-1]
+	cur.path = cur.path[:len(cur.path)-1]
+
+	if err := b.insertDividerIntoParent(parent.pageNum, parent.childIdx, cur.currentPage, dividerRowid, sibNum); err != nil {
+		return err
+	}
+
+	if newRowid > dividerRowid {
+		cur.currentPage = sibNum
+	}
+	return nil
+}
+
+func (b *BTreeImpl) insertDividerIntoParent(parentPage PageNumber, childIdx int, leftChild PageNumber, dividerRowid int64, rightChild PageNumber) error {
+	rl := VarintLen(dividerRowid)
+	dividerCell := make([]byte, 4+rl)
+	binary.BigEndian.PutUint32(dividerCell[0:4], uint32(leftChild))
+	PutVarint(dividerCell[4:], dividerRowid)
+
+	page, err := b.pgr.GetPage(parentPage)
+	if err != nil {
+		return err
+	}
+	hdr := readPageHeader(page.Data, parentPage)
+	b.pgr.ReleasePage(page)
+
+	numCells := int(hdr.numCells)
+	hsInt := hdrSizeInterior(parentPage)
+	cellContentStart := int(hdr.contentOff)
+	if cellContentStart == 0 || cellContentStart > b.pageSize {
+		cellContentStart = b.pageSize
+	}
+
+	newContentStart := cellContentStart - len(dividerCell)
+	if newContentStart < hsInt+numCells*2+2 {
+		return b.splitInteriorPage(parentPage, childIdx, dividerCell, rightChild)
+	}
+
+	page, err = b.pgr.GetPage(parentPage)
+	if err != nil {
+		return err
+	}
+	defer b.pgr.ReleasePage(page)
+
+	copy(page.Data[newContentStart:], dividerCell)
+	for i := numCells; i > childIdx; i-- {
+		ptr := binary.BigEndian.Uint16(page.Data[hsInt+(i-1)*2 : hsInt+(i-1)*2+2])
+		binary.BigEndian.PutUint16(page.Data[hsInt+i*2:], ptr)
+	}
+	binary.BigEndian.PutUint16(page.Data[hsInt+childIdx*2:], uint16(newContentStart))
+
+	off := pageOffset(parentPage)
+	binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(numCells+1))
+	binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(newContentStart))
+	if childIdx >= numCells {
+		binary.BigEndian.PutUint32(page.Data[off+8:off+12], uint32(rightChild))
+	}
+
+	b.pgr.MarkDirty(page)
+	return b.pgr.WritePage(page)
+}
+
+func (b *BTreeImpl) splitInteriorPage(parentPage PageNumber, newChildIdx int, newDividerCell []byte, newRightChild PageNumber) error {
+	page, err := b.pgr.GetPage(parentPage)
+	if err != nil {
+		return err
+	}
+	hdr := readPageHeader(page.Data, parentPage)
+	_ = hdrSizeInterior(parentPage)
+
+	allCells := make([][]byte, 0, int(hdr.numCells)+1)
+	for i := 0; i < int(hdr.numCells); i++ {
+		cd := extractCellData(page.Data, parentPage, i)
+		if cd != nil {
+			allCells = append(allCells, cd)
+		}
+	}
+	oldRightChild := hdr.rightChild
+	b.pgr.ReleasePage(page)
+
+	if newChildIdx <= len(allCells) {
+		allCells = append(allCells, nil)
+		copy(allCells[newChildIdx+1:], allCells[newChildIdx:])
+		allCells[newChildIdx] = newDividerCell
+	} else {
+		allCells = append(allCells, newDividerCell)
+	}
+
+	mid := len(allCells) / 2
+	leftCells := allCells[:mid]
+	rightCells := allCells[mid:]
+	dividerRowid := readCellRowid(leftCells[len(leftCells)-1], PageTypeInteriorTable)
+
+	p, _ := b.pgr.GetPage(parentPage)
+	initPage(p.Data, parentPage, PageTypeInteriorTable, b.pageSize)
+	b.writeCellsToPage(p, parentPage, leftCells, PageTypeInteriorTable)
+	off := pageOffset(parentPage)
+	binary.BigEndian.PutUint32(p.Data[off+8:off+12], uint32(oldRightChild))
+	b.pgr.MarkDirty(p)
+	b.pgr.WritePage(p)
+	b.pgr.ReleasePage(p)
+
+	sibPage, err := b.pgr.GetNewPage()
+	if err != nil {
+		return err
+	}
+	sibNum := sibPage.PageNum
+	initPage(sibPage.Data, sibNum, PageTypeInteriorTable, b.pageSize)
+	off = pageOffset(sibNum)
+	binary.BigEndian.PutUint32(sibPage.Data[off+8:off+12], uint32(newRightChild))
+	b.writeCellsToPage(sibPage, sibNum, rightCells, PageTypeInteriorTable)
+	b.pgr.MarkDirty(sibPage)
+	b.pgr.WritePage(sibPage)
+	b.pgr.ReleasePage(sibPage)
+
+	newRoot, err := b.pgr.GetNewPage()
+	if err != nil {
+		return err
+	}
+	newRootNum := newRoot.PageNum
+	initPage(newRoot.Data, newRootNum, PageTypeInteriorTable, b.pageSize)
+
+	rl := VarintLen(dividerRowid)
+	dividerCell := make([]byte, 4+rl)
+	binary.BigEndian.PutUint32(dividerCell[0:4], uint32(parentPage))
+	PutVarint(dividerCell[4:], dividerRowid)
+
+	hsNew := hdrSizeInterior(newRootNum)
+	contentStart := b.pageSize - len(dividerCell)
+	copy(newRoot.Data[contentStart:], dividerCell)
+	binary.BigEndian.PutUint16(newRoot.Data[hsNew:], uint16(contentStart))
+
+	off = pageOffset(newRootNum)
+	binary.BigEndian.PutUint16(newRoot.Data[off+3:off+5], 1)
+	binary.BigEndian.PutUint16(newRoot.Data[off+5:off+7], uint16(contentStart))
+	binary.BigEndian.PutUint32(newRoot.Data[off+8:off+12], uint32(sibNum))
+
+	b.pgr.MarkDirty(newRoot)
+	b.pgr.WritePage(newRoot)
+	b.pgr.ReleasePage(newRoot)
+	return nil
+}
+
+func (b *BTreeImpl) writeCellsToPage(page *pager.Page, pageNum PageNumber, cells [][]byte, pageType byte) error {
+	if page == nil {
+		var err error
+		page, err = b.pgr.GetPage(pageNum)
+		if err != nil {
+			return err
+		}
+		defer b.pgr.ReleasePage(page)
+	}
+	hs := hdrSize(pageNum)
+	if isInteriorPage(pageType) {
+		hs = hdrSizeInterior(pageNum)
+	}
+	contentStart := b.pageSize
+	for i := len(cells) - 1; i >= 0; i-- {
+		contentStart -= len(cells[i])
+		copy(page.Data[contentStart:], cells[i])
+	}
+	for i := range cells {
+		cellOff := contentStart
+		for j := 0; j < i; j++ {
+			cellOff += len(cells[j])
+		}
+		binary.BigEndian.PutUint16(page.Data[hs+i*2:], uint16(cellOff))
+	}
+	off := pageOffset(pageNum)
+	binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(len(cells)))
+	if len(cells) > 0 {
+		binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(contentStart))
+	} else {
+		binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(b.pageSize))
+	}
+	b.pgr.MarkDirty(page)
+	return b.pgr.WritePage(page)
+}
+
+// --- Delete ---
+
 func (b *BTreeImpl) Delete(cursor BTCursor) error {
 	cur := cursor.(*CursorImpl)
 	if !cur.valid {
@@ -290,28 +850,35 @@ func (b *BTreeImpl) Delete(cursor BTCursor) error {
 
 	hdr := readPageHeader(page.Data, cur.currentPage)
 	numCells := int(hdr.numCells)
-	hs := hdrSize(cur.currentPage)
-
 	if cur.cellIndex < 0 || cur.cellIndex >= numCells {
 		return fmt.Errorf("cell index out of range: %d", cur.cellIndex)
 	}
-
-	// Shift cell pointers to remove the deleted one
-	for i := cur.cellIndex; i < numCells-1; i++ {
-		ptr := binary.BigEndian.Uint16(page.Data[hs+(i+1)*2 : hs+(i+1)*2+2])
-		binary.BigEndian.PutUint16(page.Data[hs+i*2:], ptr)
-	}
-
-	// Update cell count
-	off := pageOffset(cur.currentPage)
-	binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(numCells-1))
-
+	b.deleteCellPtr(page, cur.currentPage, cur.cellIndex)
 	b.pgr.MarkDirty(page)
 	cur.valid = false
 	return b.pgr.WritePage(page)
 }
 
-// Count returns the number of entries in the B-Tree.
+func (b *BTreeImpl) deleteCellPtr(page *pager.Page, pageNum PageNumber, cellIndex int) {
+	hdr := readPageHeader(page.Data, pageNum)
+	numCells := int(hdr.numCells)
+	hs := hdrSize(pageNum)
+	if isInteriorPage(hdr.pageType) {
+		hs = hdrSizeInterior(pageNum)
+	}
+	if cellIndex < 0 || cellIndex >= numCells {
+		return
+	}
+	for i := cellIndex; i < numCells-1; i++ {
+		ptr := binary.BigEndian.Uint16(page.Data[hs+(i+1)*2 : hs+(i+1)*2+2])
+		binary.BigEndian.PutUint16(page.Data[hs+i*2:], ptr)
+	}
+	off := pageOffset(pageNum)
+	binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(numCells-1))
+}
+
+// --- Count ---
+
 func (b *BTreeImpl) Count(rootPage PageNumber) (int64, error) {
 	return b.countPages(rootPage)
 }
@@ -322,14 +889,11 @@ func (b *BTreeImpl) countPages(pageNum PageNumber) (int64, error) {
 		return 0, err
 	}
 	defer b.pgr.ReleasePage(page)
-
 	hdr := readPageHeader(page.Data, pageNum)
-	numCells := int64(hdr.numCells)
-
-	if hdr.pageType == PageTypeInteriorTable || hdr.pageType == PageTypeInteriorIndex {
-		hs := hdrSize(pageNum)
-		total := numCells
-		for i := 0; i < int(numCells); i++ {
+	if isInteriorPage(hdr.pageType) {
+		hs := hdrSizeInterior(pageNum)
+		var total int64
+		for i := 0; i < int(hdr.numCells); i++ {
 			cellPtr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
 			if cellPtr == 0 || cellPtr >= b.pageSize {
 				continue
@@ -352,8 +916,55 @@ func (b *BTreeImpl) countPages(pageNum PageNumber) (int64, error) {
 		}
 		return total, nil
 	}
-	return numCells, nil
+	return int64(hdr.numCells), nil
 }
 
-func (b *BTreeImpl) IntegrityCheck(rootPage PageNumber, depth int, errDest *[]string) {}
+func (b *BTreeImpl) IntegrityCheck(rootPage PageNumber, depth int, errDest *[]string) {
+	b.integrityCheckPage(rootPage, 0, errDest)
+}
+
+func (b *BTreeImpl) integrityCheckPage(pageNum PageNumber, depth int, errDest *[]string) {
+	if depth > 100 {
+		*errDest = append(*errDest, fmt.Sprintf("page %d: tree too deep", pageNum))
+		return
+	}
+	page, err := b.pgr.GetPage(pageNum)
+	if err != nil {
+		*errDest = append(*errDest, fmt.Sprintf("page %d: %v", pageNum, err))
+		return
+	}
+	defer b.pgr.ReleasePage(page)
+
+	hdr := readPageHeader(page.Data, pageNum)
+	hs := hdrSize(pageNum)
+	if isInteriorPage(hdr.pageType) {
+		hs = hdrSizeInterior(pageNum)
+	}
+
+	var lastRowid int64
+	for i := 0; i < int(hdr.numCells); i++ {
+		cellPtr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
+		if cellPtr == 0 || cellPtr >= b.pageSize {
+			*errDest = append(*errDest, fmt.Sprintf("page %d cell %d: invalid ptr %d", pageNum, i, cellPtr))
+			continue
+		}
+		if hdr.pageType == PageTypeLeafTable || hdr.pageType == PageTypeInteriorTable {
+			rowid := readCellRowid(page.Data[cellPtr:], hdr.pageType)
+			if i > 0 && rowid <= lastRowid {
+				*errDest = append(*errDest, fmt.Sprintf("page %d: rowids out of order at cell %d (%d <= %d)", pageNum, i, rowid, lastRowid))
+			}
+			lastRowid = rowid
+		}
+		if isInteriorPage(hdr.pageType) && cellPtr+4 <= len(page.Data) {
+			leftChild := PageNumber(binary.BigEndian.Uint32(page.Data[cellPtr : cellPtr+4]))
+			if leftChild > 0 {
+				b.integrityCheckPage(leftChild, depth+1, errDest)
+			}
+		}
+	}
+	if isInteriorPage(hdr.pageType) && hdr.rightChild > 0 {
+		b.integrityCheckPage(PageNumber(hdr.rightChild), depth+1, errDest)
+	}
+}
+
 func (b *BTreeImpl) PageCount() int { return b.pgr.PageCount() }

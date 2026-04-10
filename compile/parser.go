@@ -756,7 +756,8 @@ func (p *Parser) isReservedForOnUsing() bool {
 		lower == "limit" || lower == "join" || lower == "inner" ||
 		lower == "left" || lower == "right" || lower == "cross" ||
 		lower == "natural" || lower == "full" ||
-		lower == "union" || lower == "intersect" || lower == "except"
+		lower == "union" || lower == "intersect" || lower == "except" ||
+		lower == "window"
 }
 
 func (p *Parser) lookaheadRParen() bool {
@@ -2227,15 +2228,17 @@ func (p *Parser) parseIdentExpr() *Expr {
 		p.advance()
 
 		// COUNT(*) or other func(*)
-		if p.peek().Type == TokenStar {
-			p.advance()
-			p.expectType(TokenRParen)
-			return &Expr{
-				Kind:         ExprFunctionCall,
-				FunctionName: name,
-				StarArg:      true,
+			if p.peek().Type == TokenStar {
+				p.advance()
+				p.expectType(TokenRParen)
+				p.tryParseOverClause()
+				p.tryParseFilterClause()
+				return &Expr{
+					Kind:         ExprFunctionCall,
+					FunctionName: name,
+					StarArg:      true,
+				}
 			}
-		}
 
 		// Check for DISTINCT
 		distinct := false

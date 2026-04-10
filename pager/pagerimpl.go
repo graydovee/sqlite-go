@@ -28,6 +28,11 @@ type PagerImpl struct {
 	readonly    bool
 	changeCount uint32
 	freeList    []PageNumber // in-memory freelist of reusable page numbers
+
+	// In-memory transaction snapshot
+	snapshot       map[PageNumber]*Page
+	snapshotPageCount int
+	snapshotFreeList []PageNumber
 }
 
 type journalOps interface {
@@ -307,7 +312,16 @@ func (p *PagerImpl) Begin(write bool) error {
 }
 
 func (p *PagerImpl) beginJournal() error {
-	if p.journalMode == JournalOff || p.isMemory {
+	if p.isMemory {
+		// For in-memory databases, take a snapshot of all cached pages
+		p.snapshot = p.cache.Snapshot()
+		p.snapshotPageCount = p.pageCount
+		p.snapshotFreeList = make([]PageNumber, len(p.freeList))
+		copy(p.snapshotFreeList, p.freeList)
+		return nil
+	}
+
+	if p.journalMode == JournalOff {
 		return nil
 	}
 
@@ -383,6 +397,19 @@ func (p *PagerImpl) Rollback() error {
 		return nil
 	}
 
+	// Restore in-memory snapshot
+	if p.isMemory && p.snapshot != nil {
+		for k, snap := range p.snapshot {
+			if cached := p.cache.Fetch(k); cached != nil {
+				copy(cached.Data, snap.Data)
+				cached.Dirty = false
+			}
+		}
+		p.pageCount = p.snapshotPageCount
+		p.freeList = p.snapshotFreeList
+		p.snapshot = nil
+	}
+
 	// Rollback journal: restore original pages
 	if p.journal != nil {
 		records, err := p.journal.Rollback()
@@ -407,6 +434,19 @@ func (p *PagerImpl) Rollback() error {
 	// Rollback WAL
 	if p.wal != nil {
 		p.wal.Rollback()
+	}
+
+	// Rollback in-memory snapshot
+	if p.snapshot != nil {
+		for k, snap := range p.snapshot {
+			if cached := p.cache.Fetch(k); cached != nil {
+				copy(cached.Data, snap.Data)
+				cached.Dirty = false
+			}
+		}
+		p.pageCount = p.snapshotPageCount
+		p.freeList = p.snapshotFreeList
+		p.snapshot = nil
 	}
 
 	p.cache.ClearDirty()

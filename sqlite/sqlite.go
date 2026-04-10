@@ -738,13 +738,19 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 	}
 
 	// For now, update all rows (no WHERE support)
+	// Collect all rows first, then apply updates to avoid cursor invalidation
+	type updateEntry struct {
+		rowid   int64
+		newData []byte
+	}
+	var updates []updateEntry
+
 	cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
 	if err != nil {
 		return NewErrorf(Error, "open cursor: %s", err)
 	}
 	defer cursor.Close()
 
-	var count int64
 	hasRow, err := cursor.First()
 	if err != nil {
 		return err
@@ -779,18 +785,23 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 		newData := rb.Build()
 
-		keyBuf := make([]byte, 9)
-		keyLen := encodeVarintKey(keyBuf, int64(rowid))
-
-		if err := db.bt.Insert(cursor, keyBuf[:keyLen], newData, btree.RowID(rowid), btree.SeekFound); err != nil {
-			return err
-		}
-		count++
-
+		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData})
 		hasRow, err = cursor.Next()
 		if err != nil {
 			return err
 		}
+	}
+
+	// Now apply all updates
+	var count int64
+	for _, upd := range updates {
+		keyBuf := make([]byte, 9)
+		keyLen := encodeVarintKey(keyBuf, upd.rowid)
+
+		if err := db.bt.Insert(cursor, keyBuf[:keyLen], upd.newData, btree.RowID(upd.rowid), btree.SeekFound); err != nil {
+			return err
+		}
+		count++
 	}
 
 	db.changes = count

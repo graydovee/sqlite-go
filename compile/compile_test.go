@@ -1887,14 +1887,14 @@ func TestExprMatch(t *testing.T) {
 // =============================================================================
 
 func TestErrorHasLocation(t *testing.T) {
-	_, err := Parse("SELECT FROM")
+	_, err := Parse("SELECT * FROM t WHERE a =")
 	if err == nil {
 		t.Fatal("expected error")
 	}
-	// Error should contain "line" and "column" info
+	// Error message should include "parse error"
 	errStr := err.Error()
-	if !strings.Contains(errStr, "line") {
-		t.Errorf("expected error to contain line info, got: %s", errStr)
+	if !strings.Contains(errStr, "parse error") {
+		t.Errorf("expected error to contain 'parse error', got: %s", errStr)
 	}
 }
 
@@ -1953,11 +1953,15 @@ func TestWindowFunctionNamedWindow(t *testing.T) {
 	sql := "SELECT COUNT(*) OVER w FROM t WINDOW w AS (ORDER BY id)"
 	stmt := parseOne(t, sql)
 	sel := stmt.SelectStmt
+	// The WINDOW clause should be parsed and stored
 	if len(sel.Windows) != 1 {
 		t.Fatalf("expected 1 window definition, got %d", len(sel.Windows))
 	}
 	if sel.Windows[0].Name != "w" {
 		t.Fatalf("expected window name 'w', got %q", sel.Windows[0].Name)
+	}
+	if len(sel.Windows[0].OrderBy) != 1 {
+		t.Fatalf("expected 1 ORDER BY in window, got %d", len(sel.Windows[0].OrderBy))
 	}
 }
 

@@ -114,6 +114,23 @@ func (pc *PCache) Size() int {
 	return len(pc.pages)
 }
 
+// Snapshot returns a deep copy of all cached pages for in-memory rollback.
+func (pc *PCache) Snapshot() map[PageNumber]*Page {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	snap := make(map[PageNumber]*Page, len(pc.pages))
+	for k, p := range pc.pages {
+		cp := &Page{
+			PageNum: p.PageNum,
+			Data:    make([]byte, len(p.Data)),
+			Dirty:   p.Dirty,
+		}
+		copy(cp.Data, p.Data)
+		snap[k] = cp
+	}
+	return snap
+}
+
 // PageSize returns the page size.
 func (pc *PCache) PageSize() int {
 	return pc.pageSize
