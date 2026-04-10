@@ -25,8 +25,7 @@ type Database struct {
 	closed   bool
 
 	// Schema tracking (simplified: in-memory schema table)
-	tables   map[string]*tableEntry
-	nextPage int // next root page to allocate
+	tables map[string]*tableEntry
 
 	// Connection state
 	lastInsertRowID int64
@@ -64,9 +63,8 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 	Initialize()
 
 	db := &Database{
-		tables:    make(map[string]*tableEntry),
+		tables:     make(map[string]*tableEntry),
 		autoCommit: true,
-		nextPage:  2, // page 1 is the database header
 	}
 
 	if filename == ":memory:" || flags&OpenMemory != 0 {
@@ -194,7 +192,10 @@ func (db *Database) Prepare(sql string) (*Statement, error) {
 	}
 
 	// Determine column names for SELECT-like statements
-	colNames := extractColumnNames(filtered)
+	var colNames []string
+	if len(filtered) > 0 && isKeyword(filtered[0], "select") {
+		colNames = extractColumnNames(filtered)
+	}
 
 	// Build a VDBE program
 	prog, err := db.compileStatement(sql, filtered)
@@ -409,19 +410,39 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		return NewError(Error, "table must have at least one column")
 	}
 
-	// Allocate root page for the table
-	rootPage := db.nextPage
-	db.nextPage++
+	// Start a write transaction if not in one
+	if !db.inTx {
+		if err := db.pgr.Begin(true); err != nil {
+			return NewErrorf(Busy, "begin transaction: %s", err)
+		}
+		if err := db.bt.Begin(true); err != nil {
+			db.pgr.Rollback()
+			return NewErrorf(Error, "begin btree transaction: %s", err)
+		}
+	}
 
-	// Create the B-Tree for the table
-	_, err := db.bt.CreateBTree(btree.CreateTable)
+	// Create the B-Tree for the table - this allocates the actual root page
+	rootPage, err := db.bt.CreateBTree(btree.CreateTable)
 	if err != nil {
+		if !db.inTx {
+			db.bt.Rollback()
+			db.pgr.Rollback()
+		}
 		return NewErrorf(Error, "create btree: %s", err)
+	}
+
+	if !db.inTx {
+		if err := db.bt.Commit(); err != nil {
+			return NewErrorf(Error, "commit btree: %s", err)
+		}
+		if err := db.pgr.Commit(); err != nil {
+			return NewErrorf(IOError, "commit pager: %s", err)
+		}
 	}
 
 	db.tables[tableName] = &tableEntry{
 		name:     tableName,
-		rootPage: rootPage,
+		rootPage: int(rootPage),
 		columns:  columns,
 	}
 
@@ -535,6 +556,19 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 
 // insertRow inserts a single row into a table.
 func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interface{}, args []interface{}) error {
+	// Start a write transaction if not in one
+	needCommit := false
+	if !db.inTx {
+		if err := db.pgr.Begin(true); err != nil {
+			return NewErrorf(Busy, "begin transaction: %s", err)
+		}
+		if err := db.bt.Begin(true); err != nil {
+			db.pgr.Rollback()
+			return NewErrorf(Error, "begin btree transaction: %s", err)
+		}
+		needCommit = true
+	}
+
 	// Determine number of columns
 	numCols := len(tbl.columns)
 
@@ -597,6 +631,16 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 	db.lastInsertRowID = newRowID
 	db.changes = 1
 	db.totalChanges++
+
+	if needCommit {
+		if err := db.bt.Commit(); err != nil {
+			return NewErrorf(Error, "commit btree: %s", err)
+		}
+		if err := db.pgr.Commit(); err != nil {
+			return NewErrorf(IOError, "commit pager: %s", err)
+		}
+	}
+
 	return nil
 }
 

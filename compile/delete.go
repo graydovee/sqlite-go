@@ -21,7 +21,7 @@ func (b *Build) compileDelete(stmt *DeleteStmt) error {
 		return err
 	}
 
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, true)
 
 	// Open the table for writing
@@ -105,6 +105,5 @@ func (b *Build) compileDelete(stmt *DeleteStmt) error {
 	}
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }

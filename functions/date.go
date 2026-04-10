@@ -223,17 +223,21 @@ func jdToYMD(jd float64) (int, int, int) {
 
 // jdToHMS extracts hour, minute, second from a Julian Day.
 func jdToHMS(jd float64) (int, int, float64) {
-	// The fractional part of the Julian Day
+	// The fractional part of the Julian Day (time since noon)
 	frac := jd - float64(int(jd)) + 0.5
 	if frac >= 1.0 {
 		frac -= 1.0
 	}
 
-	totalSeconds := frac * 86400.0
+	// Add a tiny epsilon to avoid floating-point truncation
+	totalSeconds := frac*86400.0 + 0.5
 	hour := int(totalSeconds / 3600.0)
 	totalSeconds -= float64(hour) * 3600.0
 	minute := int(totalSeconds / 60.0)
-	second := totalSeconds - float64(minute)*60.0
+	second := totalSeconds - float64(minute)*60.0 - 0.5
+
+	// Round second to avoid floating-point artifacts
+	second = float64(int(second*1000+0.5)) / 1000.0
 
 	return hour, minute, second
 }

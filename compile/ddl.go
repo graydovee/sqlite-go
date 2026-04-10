@@ -13,7 +13,7 @@ func (b *Build) compileCreateTable(stmt *CreateTableStmt) error {
 		return fmt.Errorf("nil CREATE TABLE statement")
 	}
 
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, true)
 
 	tableName := stmt.Name
@@ -24,7 +24,6 @@ func (b *Build) compileCreateTable(stmt *CreateTableStmt) error {
 		if err == nil {
 			// Table exists, skip creation
 			b.emitHalt(0)
-			b.b.DefineLabel(startLabel)
 			return nil
 		}
 	}
@@ -65,7 +64,6 @@ func (b *Build) compileCreateTable(stmt *CreateTableStmt) error {
 	b.emitParseSchema()
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
@@ -75,7 +73,7 @@ func (b *Build) compileDropTable(stmt *DropTableStmt) error {
 		return fmt.Errorf("nil DROP TABLE statement")
 	}
 
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, true)
 
 	// Look up the table to get its root page
@@ -84,7 +82,6 @@ func (b *Build) compileDropTable(stmt *DropTableStmt) error {
 		if stmt.IfExists {
 			// Table doesn't exist but IF EXISTS, so just halt
 			b.emitHalt(0)
-			b.b.DefineLabel(startLabel)
 			return nil
 		}
 		return err
@@ -141,7 +138,6 @@ func (b *Build) compileDropTable(stmt *DropTableStmt) error {
 	b.emitParseSchema()
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
@@ -151,7 +147,7 @@ func (b *Build) compileCreateIndex(stmt *CreateIndexStmt) error {
 		return fmt.Errorf("nil CREATE INDEX statement")
 	}
 
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, true)
 
 	// If IF NOT EXISTS, check if index already exists
@@ -159,7 +155,6 @@ func (b *Build) compileCreateIndex(stmt *CreateIndexStmt) error {
 		_, err := b.lookupIndex(stmt.Name)
 		if err == nil {
 			b.emitHalt(0)
-			b.b.DefineLabel(startLabel)
 			return nil
 		}
 	}
@@ -261,7 +256,6 @@ func (b *Build) compileCreateIndex(stmt *CreateIndexStmt) error {
 	b.emitParseSchema()
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
@@ -271,14 +265,13 @@ func (b *Build) compileDropIndex(stmt *DropIndexStmt) error {
 		return fmt.Errorf("nil DROP INDEX statement")
 	}
 
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, true)
 
 	idx, err := b.lookupIndex(stmt.Name)
 	if err != nil {
 		if stmt.IfExists {
 			b.emitHalt(0)
-			b.b.DefineLabel(startLabel)
 			return nil
 		}
 		return err
@@ -321,13 +314,12 @@ func (b *Build) compileDropIndex(stmt *DropIndexStmt) error {
 	b.emitParseSchema()
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
 // compileBegin compiles a BEGIN TRANSACTION statement.
 func (b *Build) compileBegin(stmt *BeginStmt) {
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.b.Emit(vdbe.OpAutoCommit, 0, 0, 0)
 	if stmt != nil && stmt.Immediate {
 		b.b.Emit(vdbe.OpTransaction, 0, 1, 0)
@@ -337,20 +329,18 @@ func (b *Build) compileBegin(stmt *BeginStmt) {
 		b.b.Emit(vdbe.OpTransaction, 0, 0, 0)
 	}
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 }
 
 // compileCommit compiles a COMMIT statement.
 func (b *Build) compileCommit() {
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitAutoCommit(true)
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 }
 
 // compileRollback compiles a ROLLBACK statement.
 func (b *Build) compileRollback(stmt *RollbackStmt) {
-	startLabel := b.emitInit()
+	b.emitInit()
 	if stmt != nil && stmt.Savepoint != "" {
 		// ROLLBACK TO savepoint
 		b.b.EmitP4(vdbe.OpSavepoint, 2, 0, 0, stmt.Savepoint, "rollback to savepoint")
@@ -359,7 +349,6 @@ func (b *Build) compileRollback(stmt *RollbackStmt) {
 		b.b.Emit(vdbe.OpHalt, 0, 0, 0)
 	}
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 }
 
 // buildCreateTableSQL reconstructs a CREATE TABLE SQL string from the AST.

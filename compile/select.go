@@ -30,7 +30,7 @@ func (b *Build) compileSelect(stmt *SelectStmt) error {
 
 // compileSimpleSelect compiles a non-aggregate SELECT.
 func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, false)
 
 	// Open cursors for FROM tables
@@ -103,13 +103,12 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 	}
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
 // compileAggregateSelect compiles a SELECT with aggregate functions or GROUP BY.
 func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, false)
 
 	// Open cursors for FROM tables
@@ -234,7 +233,6 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 	}
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 
@@ -242,7 +240,7 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 func (b *Build) compileCompoundSelect(stmt *SelectStmt) error {
 	// For compound selects, each sub-select produces rows into an
 	// ephemeral table, then we deduplicate as needed.
-	startLabel := b.emitInit()
+	b.emitInit()
 	b.emitTransaction(0, false)
 
 	resultCols, err := b.expandResultColumns(stmt.Columns)
@@ -302,7 +300,6 @@ func (b *Build) compileCompoundSelect(stmt *SelectStmt) error {
 	b.emitClose(unionCursor)
 
 	b.emitHalt(0)
-	b.b.DefineLabel(startLabel)
 	return nil
 }
 

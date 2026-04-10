@@ -1300,8 +1300,11 @@ func TestValuesClause(t *testing.T) {
 		t.Fatalf("expected StmtSelect, got %d", stmt.Type)
 	}
 	sel := stmt.SelectStmt
-	if len(sel.Columns) != 4 {
-		t.Fatalf("expected 4 result columns (2 rows * 2 cols), got %d", len(sel.Columns))
+	if len(sel.Columns) != 2 {
+		t.Fatalf("expected 2 result columns in first row, got %d", len(sel.Columns))
+	}
+	if len(sel.CompoundSelects) != 1 {
+		t.Fatalf("expected 1 compound select (second row), got %d", len(sel.CompoundSelects))
 	}
 }
 

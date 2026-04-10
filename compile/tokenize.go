@@ -138,6 +138,9 @@ func scanToken(sql string, pos, line, col int) Token {
 		// Unterminated comment
 		return tok(TokenComment, sql[start:], line, col)
 
+	case c == '/':
+		return tok(TokenSlash, "/", line, col)
+
 	// String literal '...'
 	case c == '\'':
 		return scanString(sql, pos, line, col)
@@ -171,6 +174,9 @@ func scanToken(sql string, pos, line, col int) Token {
 		return tok(TokenStar, "*", line, col)
 	case c == '+':
 		return tok(TokenPlus, "+", line, col)
+	case c == '-':
+		// Note: -- comment is handled above
+		return tok(TokenMinus, "-", line, col)
 	case c == '%':
 		return tok(TokenRem, "%", line, col)
 	case c == '&':

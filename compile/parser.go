@@ -472,6 +472,7 @@ func (p *Parser) parseSelectCore() *SelectStmt {
 }
 
 // parseValuesClause parses a VALUES clause as a SELECT.
+// Multiple rows become compound selects so INSERT can extract them.
 func (p *Parser) parseValuesClause() *SelectStmt {
 	p.advance() // VALUES
 	sel := &SelectStmt{}
@@ -479,7 +480,9 @@ func (p *Parser) parseValuesClause() *SelectStmt {
 	sel.Columns = exprsToResultCols(row)
 	for p.matchType(TokenComma) {
 		row = p.parseExprListInParens()
-		sel.Columns = append(sel.Columns, exprsToResultCols(row)...)
+		rightSel := &SelectStmt{Columns: exprsToResultCols(row)}
+		sel.CompoundOps = append(sel.CompoundOps, CompoundUnionAll)
+		sel.CompoundSelects = append(sel.CompoundSelects, rightSel)
 	}
 	return sel
 }
@@ -643,7 +646,9 @@ func (p *Parser) parseFromClause() *FromClause {
 			ref.On = p.parseExpr()
 		} else if p.isKw(KwUsing) {
 			p.advance()
+			p.expectType(TokenLParen)
 			ref.Using = p.parseIdentList()
+			p.expectType(TokenRParen)
 		}
 
 		fc.Tables = append(fc.Tables, ref)
@@ -782,7 +787,8 @@ func (p *Parser) isReservedForOnUsing() bool {
 		lower == "group" || lower == "having" || lower == "order" ||
 		lower == "limit" || lower == "join" || lower == "inner" ||
 		lower == "left" || lower == "right" || lower == "cross" ||
-		lower == "natural" || lower == "full"
+		lower == "natural" || lower == "full" ||
+		lower == "union" || lower == "intersect" || lower == "except"
 }
 
 func (p *Parser) lookaheadRParen() bool {
@@ -883,8 +889,8 @@ func (p *Parser) parseInsert() *Statement {
 	} else if p.isKw(KwSelect) || p.isKw(KwValues) {
 		sel := p.parseSelectBody()
 		if sel != nil {
-			if len(sel.Columns) > 0 && len(sel.CompoundOps) == 0 && sel.From == nil && sel.Where == nil {
-				// This looks like VALUES - convert to rows
+			if sel.From == nil && sel.Where == nil && sel.GroupBy == nil && sel.Having == nil {
+				// This is a VALUES-style select - convert to rows
 				stmt.Values = extractValueRows(sel)
 			} else {
 				stmt.Select = sel

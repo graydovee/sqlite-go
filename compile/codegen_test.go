@@ -1699,15 +1699,15 @@ func TestProgramStructure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Program should have Init at start and Halt at the end of main code
+	// Program should have Init at start
 	if prog.Instructions[0].Op != vdbe.OpInit {
 		t.Fatalf("first instruction should be Init, got %v", prog.Instructions[0].Op)
 	}
 
-	// Init should jump to the start of the main code
+	// Init should jump to the next instruction (addr 1)
 	initTarget := prog.Instructions[0].P2
-	if initTarget <= 0 || initTarget >= len(prog.Instructions) {
-		t.Errorf("Init target %d is out of range [1, %d)", initTarget, len(prog.Instructions))
+	if initTarget != 1 {
+		t.Errorf("Init target should be 1, got %d", initTarget)
 	}
 
 	// NumRegs should be > 0

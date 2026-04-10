@@ -228,11 +228,9 @@ func (b *Build) emitHalt(errCode int) {
 }
 
 // emitInit emits the standard program prologue.
-// Returns the label for the start of actual code.
-func (b *Build) emitInit() int {
-	startLabel := b.b.NewLabel()
-	b.b.EmitJump(vdbe.OpInit, 0, startLabel, 0)
-	return startLabel
+// Init jumps to the instruction immediately following itself.
+func (b *Build) emitInit() {
+	b.b.Emit(vdbe.OpInit, 0, b.b.CurrentAddr()+1, 0)
 }
 
 // emitTransaction emits OP_Transaction for the given database and mode.
