@@ -85,6 +85,8 @@ func (e *Engine) handlePragma(tokens []compile.Token) ([]PragmaRow, bool, error)
 	switch pragmaName {
 	case "table_info":
 		return e.pragmaTableInfo(valueStr)
+	case "table_xinfo":
+		return e.pragmaTableXInfo(valueStr)
 	case "database_list":
 		return e.pragmaDatabaseList()
 	case "user_version":
@@ -122,6 +124,12 @@ func (e *Engine) handlePragma(tokens []compile.Token) ([]PragmaRow, bool, error)
 		return e.pragmaForeignKeyList(valueStr)
 	case "foreign_key_check":
 		return e.pragmaForeignKeyCheck()
+	case "index_list":
+		return e.pragmaIndexList(valueStr)
+	case "index_info":
+		return e.pragmaIndexInfo(valueStr)
+	case "stats":
+		return e.pragmaStats()
 	default:
 		return nil, false, fmt.Errorf("unknown pragma: %s", pragmaName)
 	}
@@ -396,5 +404,156 @@ func (e *Engine) pragmaForeignKeyCheck() ([]PragmaRow, bool, error) {
 	if len(rows) == 0 {
 		rows = append(rows, PragmaRow{Values: []interface{}{"ok"}})
 	}
+	return rows, true, nil
+}
+
+// pragmaTableXInfo returns extended column info for a table (includes hidden columns).
+// Columns: cid, name, type, notnull, dflt_value, pk, hidden
+func (e *Engine) pragmaTableXInfo(tableName string) ([]PragmaRow, bool, error) {
+	if tableName == "" {
+		return nil, false, fmt.Errorf("table_xinfo requires a table name")
+	}
+
+	tbl, ok := e.tables[tableName]
+	if !ok {
+		return nil, false, fmt.Errorf("no such table: %s", tableName)
+	}
+
+	var rows []PragmaRow
+	for _, col := range tbl.Columns {
+		notNull := 0
+		if col.NotNull {
+			notNull = 1
+		}
+		pk := 0
+		if col.IsPK {
+			pk = 1
+		}
+		var defaultVal interface{}
+		if col.DefaultValue != "" {
+			defaultVal = col.DefaultValue
+		}
+		// hidden: 0 = normal column, 1 = hidden (e.g. generated columns),
+		// 2 = virtual table hidden column, 3 = special rowid alias
+		hidden := 0
+		rows = append(rows, PragmaRow{
+			Values: []interface{}{col.CID, col.Name, col.Type, notNull, defaultVal, pk, hidden},
+		})
+	}
+	return rows, true, nil
+}
+
+// pragmaIndexList returns the list of indexes for a table.
+// Columns: seq, name, unique, origin, partial
+func (e *Engine) pragmaIndexList(tableName string) ([]PragmaRow, bool, error) {
+	if tableName == "" {
+		return nil, false, fmt.Errorf("index_list requires a table name")
+	}
+
+	// Look for indexes in the engine's index tracking
+	var rows []PragmaRow
+	seq := 0
+
+	// Check tables map for autoindexes
+	if tbl, ok := e.tables[tableName]; ok {
+		// Check if there are indexes stored for this table
+		if e.indexes != nil {
+			for _, idx := range e.indexes {
+				if idx.TableName == tableName {
+					unique := 0
+					if idx.Unique {
+						unique = 1
+					}
+					// origin: "c" = CREATE INDEX, "u" = UNIQUE constraint, "pk" = PRIMARY KEY
+					origin := "c"
+					partial := 0
+					rows = append(rows, PragmaRow{
+						Values: []interface{}{seq, idx.Name, unique, origin, partial},
+					})
+					seq++
+				}
+			}
+		}
+
+		// If no tracked indexes but table has PK, report autoindex
+		if seq == 0 {
+			for _, col := range tbl.Columns {
+				if col.IsPK {
+					rows = append(rows, PragmaRow{
+						Values: []interface{}{0, fmt.Sprintf("sqlite_autoindex_%s_1", tableName), 1, "pk", 0},
+					})
+					break
+				}
+			}
+		}
+	}
+
+	return rows, true, nil
+}
+
+// pragmaIndexInfo returns column info for an index.
+// Columns: seqno, cid, name
+func (e *Engine) pragmaIndexInfo(indexName string) ([]PragmaRow, bool, error) {
+	if indexName == "" {
+		return nil, false, fmt.Errorf("index_info requires an index name")
+	}
+
+	var rows []PragmaRow
+
+	if e.indexes != nil {
+		for _, idx := range e.indexes {
+			if idx.Name == indexName {
+				for seqNo, col := range idx.Columns {
+					// Look up the column CID from the table
+					cid := -1
+					if tbl, ok := e.tables[idx.TableName]; ok {
+						for i, c := range tbl.Columns {
+							if c.Name == col {
+								cid = i
+								break
+							}
+						}
+					}
+					rows = append(rows, PragmaRow{
+						Values: []interface{}{seqNo, cid, col},
+					})
+				}
+				return rows, true, nil
+			}
+		}
+	}
+
+	return nil, false, fmt.Errorf("no such index: %s", indexName)
+}
+
+// pragmaStats returns database statistics.
+// Columns: table, index, width, height, rows
+func (e *Engine) pragmaStats() ([]PragmaRow, bool, error) {
+	var rows []PragmaRow
+
+	for name, tbl := range e.tables {
+		// Estimate rows from btree
+		rowEstimate := int64(0)
+		if e.bt != nil {
+			cursor, err := e.bt.Cursor(btree.PageNumber(tbl.RootPage), false)
+			if err == nil {
+				if hasRow, _ := cursor.First(); hasRow {
+					rowEstimate = 1
+					for {
+						if hasMore, _ := cursor.Next(); !hasMore {
+							break
+						}
+						rowEstimate++
+					}
+				}
+				cursor.Close()
+			}
+		}
+
+		rows = append(rows, PragmaRow{
+			Values: []interface{}{name, "", 0, 0, rowEstimate},
+		})
+	}
+
 	return rows, true, nil
 }

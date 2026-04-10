@@ -22,12 +22,18 @@ func NewPCache(pageSize, cacheSize int) *PCache {
 	if cacheSize <= 0 {
 		cacheSize = 100
 	}
+	// Cap the LRU pre-allocation to avoid wasting memory when cacheSize
+	// is set very large (e.g. for in-memory databases).
+	lruCap := cacheSize
+	if lruCap > 1024 {
+		lruCap = 1024
+	}
 	return &PCache{
 		pageSize:  pageSize,
 		cacheSize: cacheSize,
 		pages:     make(map[PageNumber]*Page),
 		dirty:     make(map[PageNumber]*Page),
-		lru:       make([]*Page, 0, cacheSize),
+		lru:       make([]*Page, 0, lruCap),
 	}
 }
 
@@ -48,13 +54,20 @@ func (pc *PCache) Add(page *Page) error {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	page.RefCount++
+	// Do NOT increment RefCount here — the caller already set it (RefCount: 1
+	// in GetPage/GetNewPage) representing their reference. An extra increment
+	// would mean ReleasePage never brings RefCount to 0, making pages
+	// un-evictable and causing Add to spin forever when the cache is full.
 	pc.pages[page.PageNum] = page
 	pc.touchLRU(page)
 
 	// Evict if over capacity
 	for len(pc.pages) > pc.cacheSize {
-		pc.evictOne()
+		if !pc.evictOne() {
+			// Nothing evictable (all pages are referenced). Allow the cache
+			// to grow beyond the target size rather than spinning forever.
+			break
+		}
 	}
 	return nil
 }
@@ -150,15 +163,28 @@ func (pc *PCache) touchLRU(p *Page) {
 }
 
 // evictOne evicts the least recently used unreferenced page.
-func (pc *PCache) evictOne() {
-	// Find LRU page with RefCount == 0 and not dirty
+// Returns true if a page was evicted, false if nothing is evictable.
+func (pc *PCache) evictOne() bool {
+	// First try: find LRU page with RefCount == 0 and not dirty
 	for i := len(pc.lru) - 1; i >= 0; i-- {
 		p := pc.lru[i]
 		if p.RefCount == 0 && !p.Dirty {
 			delete(pc.pages, p.PageNum)
+			delete(pc.dirty, p.PageNum)
 			pc.lru = append(pc.lru[:i], pc.lru[i+1:]...)
-			return
+			return true
 		}
 	}
-	// If all pages are referenced or dirty, can't evict
+	// Second try: evict dirty but unreferenced pages
+	for i := len(pc.lru) - 1; i >= 0; i-- {
+		p := pc.lru[i]
+		if p.RefCount == 0 {
+			delete(pc.pages, p.PageNum)
+			delete(pc.dirty, p.PageNum)
+			pc.lru = append(pc.lru[:i], pc.lru[i+1:]...)
+			return true
+		}
+	}
+	// If all pages are referenced, can't evict
+	return false
 }

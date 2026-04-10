@@ -59,6 +59,9 @@ type Engine struct {
 	// Virtual table support
 	modules    map[string]*moduleEntry
 	vtabTables map[string]*vtabTableEntry
+
+	// Index tracking
+	indexes []*IndexEntry
 }
 
 // TableInfo stores metadata about a table.
@@ -76,6 +79,15 @@ type ColumnInfo struct {
 	NotNull      bool   // NOT NULL constraint
 	DefaultValue string // DEFAULT value as string
 	IsPK         bool   // Part of PRIMARY KEY
+}
+
+// IndexEntry stores metadata about an index.
+type IndexEntry struct {
+	Name      string   // Index name
+	TableName string   // Table this index is on
+	Columns   []string // Column names in the index
+	Unique    bool     // Whether this is a unique index
+	RootPage  int      // Root page of the index B-tree
 }
 
 // PragmaRow represents a single row returned by a PRAGMA command.

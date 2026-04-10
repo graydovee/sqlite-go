@@ -37,6 +37,8 @@ const (
 	TokenLShift
 	TokenRShift
 	TokenAssign      // =
+	TokenArrow       // ->
+	TokenArrow2      // ->>
 	TokenInteger
 	TokenFloat
 	TokenString

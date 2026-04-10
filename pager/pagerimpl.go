@@ -4,9 +4,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sqlite-go/sqlite-go/vfs"
 )
+
+// memDBCounter generates unique paths for in-memory database backing files.
+var memDBCounter atomic.Int64
 
 // PagerImpl implements the Pager interface.
 type PagerImpl struct {
@@ -59,16 +63,27 @@ func OpenPager(cfg PagerConfig) (*PagerImpl, error) {
 		cfg.VFS = vfs.Default()
 	}
 
+	isMem := cfg.Path == "" || cfg.Path == ":memory:"
+
+	// For in-memory databases the page cache IS the database — evicting a
+	// page means permanent data loss.  Use a cache size large enough that
+	// eviction never triggers.  The LRU slice is only pre-allocated to a
+	// reasonable capacity; it will grow via append as needed.
+	cacheSize := cfg.CacheSize
+	if isMem {
+		cacheSize = 1 << 20 // ~1 M pages — effectively unlimited
+	}
+
 	p := &PagerImpl{
 		vfs:         cfg.VFS,
 		path:        cfg.Path,
 		pageSize:    cfg.PageSize,
-		cacheSize:   cfg.CacheSize,
+		cacheSize:   cacheSize,
 		journalMode: cfg.JournalMode,
 		syncMode:    cfg.SyncMode,
-		isMemory:    cfg.Path == "" || cfg.Path == ":memory:",
+		isMemory:    isMem,
 		readonly:    cfg.ReadOnly,
-		cache:       NewPCache(cfg.PageSize, cfg.CacheSize),
+		cache:       NewPCache(cfg.PageSize, cacheSize),
 	}
 
 	if p.journalMode == JournalWAL && !p.isMemory {

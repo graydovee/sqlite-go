@@ -1154,3 +1154,91 @@ func TestFuncContextError(t *testing.T) {
 		t.Error("new Context should have nil Error")
 	}
 }
+
+// --- JSON Arrow operator tests ---
+
+func TestJSONArrowOperator(t *testing.T) {
+	r := newRegistry()
+
+	doc := `{"a": 1, "b": "hello", "c": [1,2,3]}`
+
+	// -> returns JSON text representation
+	result := callScalar(r, "json_arrow",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.a"),
+	)
+	if result.Type != vdbe.MemStr || result.TextValue() != "1" {
+		t.Errorf("-> $.a = %v, want \"1\"", result)
+	}
+
+	result = callScalar(r, "json_arrow",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.c"),
+	)
+	if result.Type != vdbe.MemStr || result.TextValue() != "[1,2,3]" {
+		t.Errorf("-> $.c = %v, want \"[1,2,3]\"", result)
+	}
+}
+
+func TestJSONArrow2Operator(t *testing.T) {
+	r := newRegistry()
+
+	doc := `{"a": 1, "b": "hello", "c": [10,20,30]}`
+
+	// ->> returns SQL value (unwrapped)
+	result := callScalar(r, "json_arrow2",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.a"),
+	)
+	if result.Type != vdbe.MemInt || result.IntVal != 1 {
+		t.Errorf("->> $.a = %v, want int 1", result)
+	}
+
+	result = callScalar(r, "json_arrow2",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.b"),
+	)
+	if result.Type != vdbe.MemStr || result.TextValue() != "hello" {
+		t.Errorf("->> $.b = %v, want string \"hello\"", result)
+	}
+}
+
+// --- JSON Extended tests ---
+
+func TestJSONPatch(t *testing.T) {
+	r := newRegistry()
+
+	// json_remove
+	result := callScalar(r, "json_remove",
+		vdbe.NewMemStr(`{"a":1,"b":2,"c":3}`),
+		vdbe.NewMemStr("$.b"),
+	)
+	if result.Type != vdbe.MemStr {
+		t.Fatalf("json_remove type = %v, want MemStr", result.Type)
+	}
+	if result.TextValue() != `{"a":1,"c":3}` {
+		t.Errorf("json_remove = %q, want {\"a\":1,\"c\":3}", result.TextValue())
+	}
+}
+
+func TestJSONNestedPath(t *testing.T) {
+	r := newRegistry()
+
+	doc := `{"users": [{"name": "alice", "age": 30}, {"name": "bob", "age": 25}]}`
+
+	result := callScalar(r, "json_extract",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.users[0].name"),
+	)
+	if result.Type != vdbe.MemStr || result.TextValue() != "alice" {
+		t.Errorf("json_extract $.users[0].name = %v, want alice", result)
+	}
+
+	result = callScalar(r, "json_extract",
+		vdbe.NewMemStr(doc),
+		vdbe.NewMemStr("$.users[1].age"),
+	)
+	if result.Type != vdbe.MemInt || result.IntVal != 25 {
+		t.Errorf("json_extract $.users[1].age = %v, want 25", result)
+	}
+}

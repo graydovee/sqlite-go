@@ -539,7 +539,7 @@ func (b *BTreeImpl) splitRoot(cur *CursorImpl, newCell []byte, hdr pageHeader) e
 		allCells = append(allCells, newCell)
 	}
 
-	mid := len(allCells) / 2
+	mid := b.findSplitPoint(allCells, rootHdr.pageType)
 	leftCells := allCells[:mid]
 	rightCells := allCells[mid:]
 
@@ -629,7 +629,7 @@ func (b *BTreeImpl) splitNonRoot(cur *CursorImpl, newCell []byte, hdr pageHeader
 		allCells = append(allCells, newCell)
 	}
 
-	mid := len(allCells) / 2
+	mid := b.findSplitPoint(allCells, hdr.pageType)
 	leftCells := allCells[:mid]
 	rightCells := allCells[mid:]
 
@@ -744,7 +744,7 @@ func (b *BTreeImpl) splitInteriorPage(parentPage PageNumber, newChildIdx int, ne
 		allCells = append(allCells, newDividerCell)
 	}
 
-	mid := len(allCells) / 2
+	mid := b.findSplitPoint(allCells, PageTypeInteriorTable)
 	leftCells := allCells[:mid]
 	rightCells := allCells[mid:]
 	dividerRowid := readCellRowid(leftCells[len(leftCells)-1], PageTypeInteriorTable)
@@ -812,6 +812,14 @@ func (b *BTreeImpl) writeCellsToPage(page *pager.Page, pageNum PageNumber, cells
 	if isInteriorPage(pageType) {
 		hs = hdrSizeInterior(pageNum)
 	}
+	totalCellSize := 0
+	for _, c := range cells {
+		totalCellSize += len(c)
+	}
+	cellPtrArea := len(cells) * 2
+	if totalCellSize+cellPtrArea > b.pageSize-hs {
+		return fmt.Errorf("writeCellsToPage: %d bytes of cells exceed available space (%d)", totalCellSize, b.pageSize-hs-cellPtrArea)
+	}
 	contentStart := b.pageSize
 	for i := len(cells) - 1; i >= 0; i-- {
 		contentStart -= len(cells[i])
@@ -833,6 +841,70 @@ func (b *BTreeImpl) writeCellsToPage(page *pager.Page, pageNum PageNumber, cells
 	}
 	b.pgr.MarkDirty(page)
 	return b.pgr.WritePage(page)
+}
+
+// findSplitPoint chooses a split index within allCells such that both
+// allCells[:mid] and allCells[mid:] fit on a fresh page of the given type.
+// It starts near the size-weighted median and adjusts until both halves fit.
+func (b *BTreeImpl) findSplitPoint(allCells [][]byte, pageType byte) int {
+	if len(allCells) <= 1 {
+		return len(allCells)
+	}
+
+	hs := 8
+	if isInteriorPage(pageType) {
+		hs = 12
+	}
+
+	totalSize := 0
+	for _, c := range allCells {
+		totalSize += len(c)
+	}
+
+	// Start at the size-weighted median.
+	half := totalSize / 2
+	cumulative := 0
+	mid := 1
+	for i, c := range allCells {
+		cumulative += len(c)
+		if cumulative >= half {
+			mid = i + 1
+			break
+		}
+	}
+	if mid >= len(allCells) {
+		mid = len(allCells) - 1
+	}
+
+	// Shrink left side until it fits on a page.
+	leftSize := 0
+	for i := 0; i < mid; i++ {
+		leftSize += len(allCells[i])
+	}
+	for mid > 1 {
+		avail := b.pageSize - hs - mid*2
+		if leftSize <= avail {
+			break
+		}
+		mid--
+		leftSize -= len(allCells[mid])
+	}
+
+	// Grow left side until right side fits on a page.
+	rightSize := totalSize - leftSize
+	rightCount := len(allCells) - mid
+	for mid < len(allCells)-1 {
+		avail := b.pageSize - hs - rightCount*2
+		if rightSize <= avail {
+			break
+		}
+		leftSize += len(allCells[mid])
+		mid++
+		rightSize = totalSize - leftSize
+		rightCount = len(allCells) - mid
+	}
+
+	return mid
 }
 
 // --- Delete ---

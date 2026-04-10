@@ -1899,6 +1899,22 @@ func (p *Parser) parseComparisonExpr() *Expr {
 			continue
 		}
 
+		// -> and ->> JSON arrow operators
+		if p.peek().Type == TokenArrow || p.peek().Type == TokenArrow2 {
+			fnName := "json_arrow"
+			if p.peek().Type == TokenArrow2 {
+				fnName = "json_arrow2"
+			}
+			p.advance()
+			right := p.parseAddExpr()
+			left = &Expr{
+				Kind:         ExprFunctionCall,
+				FunctionName: fnName,
+				Args:         []*Expr{left, right},
+			}
+			continue
+		}
+
 		break
 	}
 

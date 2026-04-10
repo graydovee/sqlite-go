@@ -189,6 +189,54 @@ func TestTokenizeLineCol(t *testing.T) {
 	}
 }
 
+func TestTokenizeArrowOperators(t *testing.T) {
+	// Test -> operator
+	tokens := Tokenize("a->b")
+	filtered := filterWS(tokens)
+	if len(filtered) != 3 {
+		t.Fatalf("expected 3 tokens, got %d: %v", len(filtered), filtered)
+	}
+	if filtered[1].Type != TokenArrow {
+		t.Errorf("token type = %d, want TokenArrow (%d)", filtered[1].Type, TokenArrow)
+	}
+	if filtered[1].Value != "->" {
+		t.Errorf("token value = %q, want \"->\"", filtered[1].Value)
+	}
+
+	// Test ->> operator
+	tokens = Tokenize("a->>b")
+	filtered = filterWS(tokens)
+	if len(filtered) != 3 {
+		t.Fatalf("expected 3 tokens, got %d: %v", len(filtered), filtered)
+	}
+	if filtered[1].Type != TokenArrow2 {
+		t.Errorf("token type = %d, want TokenArrow2 (%d)", filtered[1].Type, TokenArrow2)
+	}
+	if filtered[1].Value != "->>" {
+		t.Errorf("token value = %q, want \">>\"", filtered[1].Value)
+	}
+
+	// Ensure regular minus is still recognized
+	tokens = Tokenize("a - b")
+	filtered = filterWS(tokens)
+	if len(filtered) != 3 {
+		t.Fatalf("expected 3 tokens, got %d", len(filtered))
+	}
+	if filtered[1].Type != TokenMinus {
+		t.Errorf("token type = %d, want TokenMinus (%d)", filtered[1].Type, TokenMinus)
+	}
+}
+
+func filterWS(tokens []Token) []Token {
+	var result []Token
+	for _, t := range tokens {
+		if t.Type != TokenWhitespace {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
 func compareTokens(t *testing.T, tokens []Token, expected []struct {
 	typ TokenType
 	val string

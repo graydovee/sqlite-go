@@ -176,6 +176,13 @@ func scanToken(sql string, pos, line, col int) Token {
 		return tok(TokenPlus, "+", line, col)
 	case c == '-':
 		// Note: -- comment is handled above
+		// Check for -> and ->> JSON operators
+		if pos+1 < len(sql) && sql[pos+1] == '>' {
+			if pos+2 < len(sql) && sql[pos+2] == '>' {
+				return tok(TokenArrow2, "->>", line, col)
+			}
+			return tok(TokenArrow, "->", line, col)
+		}
 		return tok(TokenMinus, "-", line, col)
 	case c == '%':
 		return tok(TokenRem, "%", line, col)
