@@ -114,7 +114,7 @@ func TestSQLArithmeticExpressions(t *testing.T) {
 		{"(1 + 2) * 3", 9},  // parentheses
 		{"-5", -5},
 		{"+5", 5},
-		{"--5", 5},           // double negation
+		{"- -5", 5},           // double negation
 		{"1 + -1", 0},
 		{"10 / 3", 3},        // integer division
 		{"0 * 99999", 0},

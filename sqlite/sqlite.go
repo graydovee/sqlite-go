@@ -999,81 +999,235 @@ func (db *Database) selectWithoutTable(cols []selectCol, args []interface{}) (*R
 
 // evalSimpleExpr evaluates a simple expression (literal or arithmetic).
 func evalSimpleExpr(expr string, args []interface{}) *vdbe.Mem {
-	expr = strings.TrimSpace(expr)
+	p := &exprParser{src: strings.TrimSpace(expr), args: args}
+	val := p.parseAddSub()
+	if val != nil {
+		return val
+	}
+	return vdbe.NewMemStr(strings.TrimSpace(expr))
+}
 
-	// Try integer
-	if v, err := strconv.ParseInt(expr, 10, 64); err == nil {
-		return vdbe.NewMemInt(v)
+// exprParser is a simple recursive-descent expression parser.
+type exprParser struct {
+	src  string
+	pos  int
+	args []interface{}
+}
+
+func (p *exprParser) peek() byte {
+	if p.pos >= len(p.src) {
+		return 0
+	}
+	return p.src[p.pos]
+}
+
+func (p *exprParser) skipSpaces() {
+	for p.pos < len(p.src) && p.src[p.pos] == ' ' {
+		p.pos++
+	}
+}
+
+// parseAddSub handles + and - (lowest precedence).
+func (p *exprParser) parseAddSub() *vdbe.Mem {
+	left := p.parseMulDivMod()
+	if left == nil {
+		return nil
+	}
+	for {
+		p.skipSpaces()
+		if p.peek() == '+' || p.peek() == '-' {
+			op := p.src[p.pos]
+			p.pos++
+			right := p.parseMulDivMod()
+			if right == nil {
+				return nil
+			}
+			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
+				if op == '+' {
+					left = vdbe.NewMemInt(left.IntVal + right.IntVal)
+				} else {
+					left = vdbe.NewMemInt(left.IntVal - right.IntVal)
+				}
+			} else {
+				lf, rf := left.FloatValue(), right.FloatValue()
+				if op == '+' {
+					left = vdbe.NewMemFloat(lf + rf)
+				} else {
+					left = vdbe.NewMemFloat(lf - rf)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseMulDivMod handles *, /, % (higher precedence).
+func (p *exprParser) parseMulDivMod() *vdbe.Mem {
+	left := p.parseUnary()
+	if left == nil {
+		return nil
+	}
+	for {
+		p.skipSpaces()
+		ch := p.peek()
+		if ch == '*' || ch == '/' || ch == '%' {
+			op := ch
+			p.pos++
+			right := p.parseUnary()
+			if right == nil {
+				return nil
+			}
+			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
+				switch op {
+				case '*':
+					left = vdbe.NewMemInt(left.IntVal * right.IntVal)
+				case '/':
+					if right.IntVal != 0 {
+						left = vdbe.NewMemInt(left.IntVal / right.IntVal)
+					}
+				case '%':
+					if right.IntVal != 0 {
+						left = vdbe.NewMemInt(left.IntVal % right.IntVal)
+					}
+				}
+			} else {
+				lf, rf := left.FloatValue(), right.FloatValue()
+				switch op {
+				case '*':
+					left = vdbe.NewMemFloat(lf * rf)
+				case '/':
+					if rf != 0 {
+						left = vdbe.NewMemFloat(lf / rf)
+					}
+				case '%':
+					if rf != 0 {
+						left = vdbe.NewMemFloat(float64(int64(lf) % int64(rf)))
+					}
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseUnary handles unary + and -.
+func (p *exprParser) parseUnary() *vdbe.Mem {
+	p.skipSpaces()
+	if p.peek() == '-' {
+		p.pos++
+		val := p.parseUnary()
+		if val == nil {
+			return nil
+		}
+		if val.Type == vdbe.MemInt {
+			return vdbe.NewMemInt(-val.IntVal)
+		}
+		return vdbe.NewMemFloat(-val.FloatValue())
+	}
+	if p.peek() == '+' {
+		p.pos++
+		return p.parseUnary()
+	}
+	return p.parsePrimary()
+}
+
+// parsePrimary handles literals, parentheses, and bind variables.
+func (p *exprParser) parsePrimary() *vdbe.Mem {
+	p.skipSpaces()
+	if p.pos >= len(p.src) {
+		return nil
 	}
 
-	// Try float
-	if v, err := strconv.ParseFloat(expr, 64); err == nil {
-		return vdbe.NewMemFloat(v)
-	}
-
-	// String literal
-	if len(expr) >= 2 && expr[0] == '\'' && expr[len(expr)-1] == '\'' {
-		return vdbe.NewMemStr(expr[1 : len(expr)-1])
-	}
-
-	// NULL
-	if strings.EqualFold(expr, "null") {
-		return vdbe.NewMemNull()
+	// Parenthesized expression
+	if p.src[p.pos] == '(' {
+		p.pos++ // skip '('
+		val := p.parseAddSub()
+		p.skipSpaces()
+		if p.pos < len(p.src) && p.src[p.pos] == ')' {
+			p.pos++ // skip ')'
+		}
+		return val
 	}
 
 	// Bind variable
-	if expr[0] == '?' {
-		if idx, err := strconv.Atoi(expr[1:]); err == nil && idx > 0 && idx <= len(args) {
-			return vdbe.MakeMem(args[idx-1])
+	if p.src[p.pos] == '?' {
+		p.pos++
+		start := p.pos
+		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+			p.pos++
+		}
+		if idx, err := strconv.Atoi(p.src[start:p.pos]); err == nil && idx > 0 && idx <= len(p.args) {
+			return vdbe.MakeMem(p.args[idx-1])
+		}
+		return nil
+	}
+
+	// String literal
+	if p.src[p.pos] == '\'' {
+		p.pos++
+		start := p.pos
+		for p.pos < len(p.src) && p.src[p.pos] != '\'' {
+			p.pos++
+		}
+		val := vdbe.NewMemStr(p.src[start:p.pos])
+		if p.pos < len(p.src) {
+			p.pos++ // skip closing quote
+		}
+		return val
+	}
+
+	// Number (int or float)
+	start := p.pos
+	isFloat := false
+	if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
+		p.pos++
+	}
+	for p.pos < len(p.src) && ((p.src[p.pos] >= '0' && p.src[p.pos] <= '9') || p.src[p.pos] == '.') {
+		if p.src[p.pos] == '.' {
+			isFloat = true
+		}
+		p.pos++
+	}
+	// Handle scientific notation
+	if p.pos < len(p.src) && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
+		isFloat = true
+		p.pos++
+		if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
+			p.pos++
+		}
+		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+			p.pos++
+		}
+	}
+	numStr := p.src[start:p.pos]
+	if numStr == "" {
+		return nil
+	}
+	if isFloat {
+		if v, err := strconv.ParseFloat(numStr, 64); err == nil {
+			return vdbe.NewMemFloat(v)
+		}
+	} else {
+		if v, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+			return vdbe.NewMemInt(v)
+		}
+		if v, err := strconv.ParseFloat(numStr, 64); err == nil {
+			return vdbe.NewMemFloat(v)
 		}
 	}
 
-	// Arithmetic: try to evaluate simple binary expressions
-	// Look for +, -, *, /
-	for i := len(expr) - 1; i > 0; i-- {
-		switch expr[i] {
-		case '+', '-':
-			left := evalSimpleExpr(expr[:i], args)
-			right := evalSimpleExpr(expr[i+1:], args)
-			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
-				if expr[i] == '+' {
-					return vdbe.NewMemInt(left.IntVal + right.IntVal)
-				}
-				return vdbe.NewMemInt(left.IntVal - right.IntVal)
-			}
-			lf, rf := left.FloatValue(), right.FloatValue()
-			if expr[i] == '+' {
-				return vdbe.NewMemFloat(lf + rf)
-			}
-			return vdbe.NewMemFloat(lf - rf)
-		}
-	}
-	for i := len(expr) - 1; i > 0; i-- {
-		switch expr[i] {
-		case '*':
-			left := evalSimpleExpr(expr[:i], args)
-			right := evalSimpleExpr(expr[i+1:], args)
-			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
-				return vdbe.NewMemInt(left.IntVal * right.IntVal)
-			}
-			return vdbe.NewMemFloat(left.FloatValue() * right.FloatValue())
-		case '/':
-			left := evalSimpleExpr(expr[:i], args)
-			right := evalSimpleExpr(expr[i+1:], args)
-			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
-				if right.IntVal != 0 {
-					return vdbe.NewMemInt(left.IntVal / right.IntVal)
-				}
-			}
-			rf := right.FloatValue()
-			if rf != 0 {
-				return vdbe.NewMemFloat(left.FloatValue() / rf)
-			}
-		}
+	// NULL keyword
+	rest := p.src[start:]
+	if len(rest) >= 4 && strings.EqualFold(rest[:4], "null") {
+		p.pos = start + 4
+		return vdbe.NewMemNull()
 	}
 
-	// Default: return as text
-	return vdbe.NewMemStr(expr)
+	return nil
 }
 
 // compileStatement builds a VDBE program from tokenized SQL.
