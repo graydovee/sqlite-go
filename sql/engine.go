@@ -41,11 +41,24 @@ type Engine struct {
 	// Transaction state
 	inTx bool
 
+	// Foreign key state
+	fkStateData *fkState
+
+	// Authorization callback
+	authorizer AuthorizerFunc
+
+	// Notification registry
+	notifier *notifyRegistry
+
 	// Stats
 	lastInsertRowID int64
 	changes         int64
 	totalChanges    int64
 	autoCommit      bool
+
+	// Virtual table support
+	modules    map[string]*moduleEntry
+	vtabTables map[string]*vtabTableEntry
 }
 
 // TableInfo stores metadata about a table.
@@ -102,7 +115,7 @@ func OpenEngine() (*Engine, error) {
 		return nil, fmt.Errorf("failed to open btree: %w", err)
 	}
 
-	return &Engine{
+	eng := &Engine{
 		vfs:         memVFS,
 		pgr:         pgr,
 		btConn:      btConn,
@@ -113,7 +126,15 @@ func OpenEngine() (*Engine, error) {
 		cacheSize:   2000,
 		pageSize:    4096,
 		autoCommit:  true,
-	}, nil
+	}
+
+	// Register built-in eponymous virtual table modules
+	eng.CreateEponymousModule("dbstat", DbstatModule)
+
+	// Load auto-extensions
+	_ = eng.loadAutoExtensions()
+
+	return eng, nil
 }
 
 // Close closes the engine and releases all resources.
@@ -173,6 +194,8 @@ func (e *Engine) ExecSQL(sqlStr string) error {
 		return e.execCreateTrigger(filtered)
 	case "drop_trigger":
 		return e.execDropTrigger(filtered)
+	case "create_virtual":
+		return e.execCreateVirtualTable(filtered)
 	default:
 		return fmt.Errorf("unsupported SQL statement: %s", stmtType)
 	}
@@ -394,6 +417,9 @@ func (e *Engine) execCreateTable(tokens []compile.Token) error {
 		Columns:  columns,
 	}
 
+	// Parse foreign key constraints from the CREATE TABLE tokens
+	e.parseFKFromCreate(tokens, tableName)
+
 	return nil
 }
 
@@ -522,6 +548,11 @@ func (e *Engine) insertRow(tbl *TableInfo, colList []string, values []interface{
 		} else {
 			valMap[name] = nil
 		}
+
+		// Enforce foreign key constraints on INSERT
+		if err := e.enforceFKInsert(tbl.Name, valMap); err != nil {
+			return err
+		}
 	}
 
 	rb := vdbe.NewRecordBuilder()
@@ -620,6 +651,8 @@ func classifyStatement(tokens []compile.Token) string {
 				return "create_index"
 			case "trigger":
 				return "create_trigger"
+			case "virtual":
+				return "create_virtual"
 			}
 		}
 		return "create"

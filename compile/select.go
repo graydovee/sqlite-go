@@ -73,16 +73,27 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 		}
 		b.emitResultRow(resultBase, nResult)
 	} else {
-		// Loop: Rewind first table, iterate
+		// Plan the query to find optimal access paths
+		plan := b.planQuery(stmt.Where)
+
 		emptyLabel := b.b.NewLabel()
 		loopEndLabel := b.b.NewLabel()
 
-		// Rewind first table
-		b.b.EmitJump(vdbe.OpRewind, b.tables[0].cursor, emptyLabel, 0)
-
-		// Emit join loops
-		if err := b.emitJoinLoops(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, emptyLabel, loopEndLabel); err != nil {
-			return err
+		if len(b.tables) == 1 && plan.TablePlans[0].ScanType != scanTableFull {
+			// Use the optimized single-table scan from the planner
+			if err := b.emitOptimizedSingleTable(
+				plan, stmt, resultBase, resultCols,
+				needSorter, sorterCursor, orderByBase,
+				emptyLabel, loopEndLabel,
+			); err != nil {
+				return err
+			}
+		} else {
+			// Standard path: Rewind + iterate
+			b.b.EmitJump(vdbe.OpRewind, b.tables[0].cursor, emptyLabel, 0)
+			if err := b.emitJoinLoops(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, emptyLabel, loopEndLabel); err != nil {
+				return err
+			}
 		}
 
 		b.b.DefineLabel(emptyLabel)
@@ -809,6 +820,65 @@ func (s SortOrder) String() string {
 	default:
 		return ""
 	}
+}
+
+// emitOptimizedSingleTable emits a single-table loop using the query plan.
+// It uses index scans when beneficial and falls back to table scan when not.
+func (b *Build) emitOptimizedSingleTable(
+	plan *queryPlan,
+	stmt *SelectStmt,
+	resultBase int,
+	resultCols []*resultColumn,
+	needSorter bool,
+	sorterCursor, orderByBase int,
+	emptyLabel, loopEndLabel int,
+) error {
+	tplan := plan.TablePlans[0]
+
+	// Emit the scan start (index seek or table rewind)
+	loopBody, err := b.emitOptimizedScan(tplan, emptyLabel, loopEndLabel)
+	if err != nil {
+		return err
+	}
+	b.b.DefineLabel(loopBody)
+
+	// Evaluate remaining WHERE terms (not handled by index)
+	if len(plan.RemainingTerms) > 0 {
+		skipLabel := b.b.NewLabel()
+		if err := b.emitRemainingWhere(plan.RemainingTerms, skipLabel, loopEndLabel); err != nil {
+			return err
+		}
+		b.b.DefineLabel(skipLabel)
+	}
+
+	// Compute result columns
+	for i, rc := range resultCols {
+		if err := b.compileExpr(rc.Expr, resultBase+i); err != nil {
+			return err
+		}
+	}
+
+	if needSorter {
+		for i, ob := range stmt.OrderBy {
+			if err := b.compileExpr(ob.Expr, orderByBase+i); err != nil {
+				return err
+			}
+		}
+		recReg := b.b.AllocReg(1)
+		b.emitMakeRecord(resultBase, len(resultCols), recReg)
+		b.emitSorterInsert(sorterCursor, recReg)
+	} else {
+		b.emitResultRow(resultBase, len(resultCols))
+	}
+
+	// Advance the scan
+	b.emitOptimizedScanEnd(tplan, loopBody)
+	b.b.DefineLabel(loopEndLabel)
+
+	// Close cursors (table and index)
+	b.emitClose(tplan.TblCursor)
+
+	return nil
 }
 
 // ensureUnused prevents "imported and not used" errors

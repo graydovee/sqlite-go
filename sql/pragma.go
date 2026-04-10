@@ -118,6 +118,10 @@ func (e *Engine) handlePragma(tokens []compile.Token) ([]PragmaRow, bool, error)
 		return e.pragmaIntegrityCheck()
 	case "compile_options":
 		return e.pragmaCompileOptions()
+	case "foreign_key_list":
+		return e.pragmaForeignKeyList(valueStr)
+	case "foreign_key_check":
+		return e.pragmaForeignKeyCheck()
 	default:
 		return nil, false, fmt.Errorf("unknown pragma: %s", pragmaName)
 	}
@@ -374,4 +378,23 @@ func toInt(v interface{}) int {
 	default:
 		return 0
 	}
+}
+
+// pragmaForeignKeyList returns the list of FKs for a table.
+func (e *Engine) pragmaForeignKeyList(tableName string) ([]PragmaRow, bool, error) {
+	rows, err := e.getForeignKeyList(tableName)
+	return rows, true, err
+}
+
+// pragmaForeignKeyCheck verifies FK integrity.
+func (e *Engine) pragmaForeignKeyCheck() ([]PragmaRow, bool, error) {
+	violations := e.fkIntegrityCheck()
+	var rows []PragmaRow
+	for _, v := range violations {
+		rows = append(rows, PragmaRow{Values: []interface{}{v}})
+	}
+	if len(rows) == 0 {
+		rows = append(rows, PragmaRow{Values: []interface{}{"ok"}})
+	}
+	return rows, true, nil
 }

@@ -81,6 +81,7 @@ func (r *FuncRegistry) registerBuiltins() {
 	registerAggregateFunctions(r)
 	registerDateFunctions(r)
 	registerMathFunctions(r)
+	registerJSONFunctions(r)
 }
 
 // --- Helper functions shared across implementations ---

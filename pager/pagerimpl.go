@@ -29,8 +29,11 @@ type PagerImpl struct {
 	changeCount uint32
 	freeList    []PageNumber // in-memory freelist of reusable page numbers
 
+	// WAL reader state: mxFrame for consistent snapshot reads
+	walMxFrame int
+
 	// In-memory transaction snapshot
-	snapshot       map[PageNumber]*Page
+	snapshot         map[PageNumber]*Page
 	snapshotPageCount int
 	snapshotFreeList []PageNumber
 }
@@ -131,6 +134,10 @@ func (p *PagerImpl) Close() error {
 	}
 
 	if p.wal != nil {
+		if p.walMxFrame > 0 {
+			p.wal.EndReadTx(p.walMxFrame)
+			p.walMxFrame = 0
+		}
 		p.wal.Close()
 	}
 
@@ -182,8 +189,12 @@ func (p *PagerImpl) GetPage(pageNum PageNumber) (*Page, error) {
 		// In-memory: return zeroed page
 	} else {
 		// Check WAL for latest version of this page
-		if p.wal != nil && p.wal.open {
-			if data := p.wal.ReadFrame(pageNum); data != nil {
+		if p.wal != nil && p.wal.IsOpen() {
+			mx := p.walMxFrame
+			if mx == 0 {
+				mx = p.wal.MaxFrame()
+			}
+			if data, ok := p.wal.ReadPage(pageNum, mx); ok {
 				copy(page.Data, data)
 				p.cache.Add(page)
 				return page, nil
@@ -308,6 +319,12 @@ func (p *PagerImpl) Begin(write bool) error {
 		return p.beginJournal()
 	}
 
+	// For read transactions in WAL mode, snapshot the mxFrame
+	if p.wal != nil && p.journalMode == JournalWAL && p.wal.IsOpen() {
+		mx, _ := p.wal.BeginReadTx()
+		p.walMxFrame = mx
+	}
+
 	return nil
 }
 
@@ -326,6 +343,11 @@ func (p *PagerImpl) beginJournal() error {
 	}
 
 	if p.wal != nil && p.journalMode == JournalWAL {
+		// Also begin a read tx to snapshot the current state
+		if p.walMxFrame == 0 {
+			mx, _ := p.wal.BeginReadTx()
+			p.walMxFrame = mx
+		}
 		return p.wal.BeginWriteTx()
 	}
 
@@ -366,6 +388,11 @@ func (p *PagerImpl) Commit() error {
 	if p.wal != nil && p.journalMode == JournalWAL {
 		if err := p.wal.Commit(p.pageCount); err != nil {
 			return err
+		}
+		// End read transaction
+		if p.walMxFrame > 0 {
+			p.wal.EndReadTx(p.walMxFrame)
+			p.walMxFrame = 0
 		}
 	} else if p.journal != nil {
 		if err := p.journal.Commit(); err != nil {
@@ -434,6 +461,12 @@ func (p *PagerImpl) Rollback() error {
 	// Rollback WAL
 	if p.wal != nil {
 		p.wal.Rollback()
+		if p.walMxFrame > 0 {
+			p.wal.EndReadTx(p.walMxFrame)
+			p.walMxFrame = 0
+		}
+		// Discard dirty cached pages so they are re-read from the DB file
+		p.cache.DiscardAll()
 	}
 
 	// Rollback in-memory snapshot
