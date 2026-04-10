@@ -262,3 +262,20 @@ func (w *WAL) FrameCount() int {
 	defer w.mu.Unlock()
 	return len(w.frames)
 }
+
+// ReadFrame returns the latest committed version of a page from the WAL.
+// Returns nil if the page is not in the WAL.
+func (w *WAL) ReadFrame(pageNum PageNumber) []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Search backwards for the most recent version
+	for i := len(w.frames) - 1; i >= 0; i-- {
+		if w.frames[i].pageNum == pageNum && w.frames[i].commit > 0 || i < int(w.maxFrame) {
+			data := make([]byte, len(w.frames[i].data))
+			copy(data, w.frames[i].data)
+			return data
+		}
+	}
+	return nil
+}

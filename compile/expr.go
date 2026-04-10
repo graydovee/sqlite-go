@@ -580,7 +580,12 @@ func (b *Build) compileGroupConcat(expr *Expr, targetReg int) error {
 // compileIsNull compiles IS NULL / IS NOT NULL.
 func (b *Build) compileIsNull(expr *Expr, targetReg int, checkNull bool) error {
 	operandReg := b.b.AllocReg(1)
-	if err := b.compileExpr(expr.Left, operandReg); err != nil {
+	// The parser stores the operand in Right for IS NULL/IS NOT NULL
+	operand := expr.Right
+	if operand == nil {
+		operand = expr.Left
+	}
+	if err := b.compileExpr(operand, operandReg); err != nil {
 		return err
 	}
 

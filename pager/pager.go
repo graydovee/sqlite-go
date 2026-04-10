@@ -129,6 +129,12 @@ type Pager interface {
 	// FileSize returns the database file size.
 	FileSize() (int64, error)
 
+	// FreePage releases a page for reuse.
+	FreePage(pageNum PageNumber) error
+
+	// FreelistCount returns the number of pages on the freelist.
+	FreelistCount() int
+
 	// BackupInit initializes a backup operation.
 	BackupInit(dest Pager) (Backup, error)
 }

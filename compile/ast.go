@@ -129,6 +129,25 @@ type Statement struct {
 	Explain        bool   // true if EXPLAIN prefix
 	ExplainQuery   bool   // true if EXPLAIN QUERY PLAN
 	RawSQL         string // Original SQL text for the statement
+
+	// CTE (WITH clause) definitions
+	CTEs      []*CTEDef
+	Recursive bool // WITH RECURSIVE
+}
+
+// CTEDef represents a common table expression definition.
+type CTEDef struct {
+	Name    string      // CTE name
+	Columns []string    // Optional column list
+	Body    *SelectStmt // CTE body query
+}
+
+// WindowDef represents a window definition (basic parsing).
+type WindowDef struct {
+	Name         string   // Window name
+	PartitionBy  []*Expr  // PARTITION BY expressions
+	OrderBy      []*OrderItem // ORDER BY items
+	// Frame spec omitted for now - basic support
 }
 
 // =============================================================================
@@ -149,6 +168,9 @@ type SelectStmt struct {
 	Offset      *Expr        // OFFSET value (nil if not specified)
 	CompoundOps []CompoundOp // Compound select operators (UNION, INTERSECT, EXCEPT)
 	CompoundSelects []*SelectStmt // Right-hand selects for compound
+
+	// Window definitions (parsed but not deeply analyzed yet)
+	Windows []*WindowDef
 }
 
 // CompoundOp represents a compound select operator.
@@ -229,15 +251,16 @@ type TableRef struct {
 
 // InsertStmt represents an INSERT statement.
 type InsertStmt struct {
-	Table         *TableRef   // Target table
-	Columns       []string    // Column list (nil if not specified)
-	Values        [][]*Expr   // VALUES rows (each row is a list of expressions)
-	Select        *SelectStmt // INSERT ... SELECT ... (alternative to VALUES)
-	DefaultValues bool        // DEFAULT VALUES
-	OrReplace     bool        // INSERT OR REPLACE
-	OrAbort       bool        // INSERT OR ABORT
-	OrFail        bool        // INSERT OR FAIL
-	OrIgnore      bool        // INSERT OR IGNORE
+	Table         *TableRef     // Target table
+	Columns       []string      // Column list (nil if not specified)
+	Values        [][]*Expr     // VALUES rows (each row is a list of expressions)
+	Select        *SelectStmt   // INSERT ... SELECT ... (alternative to VALUES)
+	DefaultValues bool          // DEFAULT VALUES
+	OrReplace     bool          // INSERT OR REPLACE
+	OrAbort       bool          // INSERT OR ABORT
+	OrFail        bool          // INSERT OR FAIL
+	OrIgnore      bool          // INSERT OR IGNORE
+	Returning     []*ResultCol  // RETURNING clause
 }
 
 // =============================================================================
@@ -254,6 +277,7 @@ type UpdateStmt struct {
 	OrAbort   bool         // UPDATE OR ABORT
 	OrFail    bool         // UPDATE OR FAIL
 	OrIgnore  bool         // UPDATE OR IGNORE
+	Returning []*ResultCol // RETURNING clause
 }
 
 // SetClause represents a single SET assignment.
@@ -268,8 +292,11 @@ type SetClause struct {
 
 // DeleteStmt represents a DELETE statement.
 type DeleteStmt struct {
-	Table *TableRef // Target table
-	Where *Expr     // WHERE condition
+	Table     *TableRef    // Target table
+	Where     *Expr        // WHERE condition
+	Order     []*OrderItem // ORDER BY clause
+	Limit     *Expr        // LIMIT
+	Returning []*ResultCol // RETURNING clause
 }
 
 // =============================================================================

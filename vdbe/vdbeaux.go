@@ -140,6 +140,9 @@ func OpcodeName(op Opcode) string {
 		return "Init"
 	case OpInitCoroutine:
 		return "InitCoroutine"
+	case OpInteger:
+		return "Integer"
+		return "InitCoroutine"
 	case OpInsert:
 		return "Insert"
 	case OpInt64:
@@ -180,6 +183,8 @@ func OpcodeName(op Opcode) string {
 		return "Next"
 	case OpNoConflict:
 		return "NoConflict"
+	case OpNoop:
+		return "Noop"
 	case OpNot:
 		return "Not"
 	case OpNotNull:

@@ -94,8 +94,13 @@ func (p *Parser) err() error {
 }
 
 func (p *Parser) errorf(format string, args ...interface{}) {
+	tok := p.peek()
 	msg := fmt.Sprintf(format, args...)
-	p.errs = append(p.errs, fmt.Errorf("parse error: %s", msg))
+	var loc string
+	if tok.Line > 0 || tok.Col > 0 {
+		loc = fmt.Sprintf(" at line %d, column %d", tok.Line, tok.Col)
+	}
+	p.errs = append(p.errs, fmt.Errorf("parse error: %s%s", msg, loc))
 }
 
 func (p *Parser) expectType(t TokenType) Token {
@@ -304,49 +309,9 @@ func (p *Parser) parseExplain() *Statement {
 // WITH / CTE
 // =============================================================================
 
-func (p *Parser) parseWithOrSelect() *Statement {
-	// WITH ... SELECT ...
-	// For now, skip the WITH clause and parse the SELECT
-	if p.isKw(KwWith) {
-		p.advance() // WITH
-		if p.isKw(KwRecursive) {
-			p.advance() // RECURSIVE
-		}
-		// Parse CTE definitions: name AS (select) [, ...]
-		p.parseCTEList()
-	}
-	return p.parseSelectStatement()
-}
-
 func (p *Parser) parseCTEList() {
-	for {
-		p.parseName() // CTE name
-		// Optional column list
-		if p.peek().Type == TokenLParen {
-			p.advance()
-			for {
-				p.parseName()
-				if !p.matchType(TokenComma) {
-					break
-				}
-			}
-			p.expectType(TokenRParen)
-		}
-		p.expectKw(KwAs)
-		// Optional MATERIALIZED / NOT MATERIALIZED
-		if p.isKw(KwNot) {
-			p.advance()
-			p.expectKw(KwMaterialized)
-		} else if p.isKw(KwMaterialized) {
-			p.advance()
-		}
-		p.expectType(TokenLParen)
-		p.parseSelectBody()
-		p.expectType(TokenRParen)
-		if !p.matchType(TokenComma) {
-			break
-		}
-	}
+	// Legacy method - delegates to detailed version
+	p.parseCTEListDetailed()
 }
 
 // =============================================================================
@@ -467,6 +432,9 @@ func (p *Parser) parseSelectCore() *SelectStmt {
 			sel.Limit = p.parseExpr()
 		}
 	}
+
+	// WINDOW clause
+	sel.Windows = p.tryParseWindowClause()
 
 	return sel
 }
@@ -906,6 +874,9 @@ func (p *Parser) parseInsert() *Statement {
 		}
 	}
 
+	// Optional RETURNING clause
+	stmt.Returning = p.tryParseReturning()
+
 	return &Statement{
 		Type:       StmtInsert,
 		InsertStmt: stmt,
@@ -985,6 +956,9 @@ func (p *Parser) parseUpdate() *Statement {
 		stmt.Where = p.parseExpr()
 	}
 
+	// Optional RETURNING clause
+	stmt.Returning = p.tryParseReturning()
+
 	return &Statement{
 		Type:       StmtUpdate,
 		UpdateStmt: stmt,
@@ -1054,6 +1028,19 @@ func (p *Parser) parseDelete() *Statement {
 	if p.matchKw(KwWhere) {
 		stmt.Where = p.parseExpr()
 	}
+
+	// Optional ORDER BY and LIMIT (SQLite extension)
+	if p.isKw(KwOrder) {
+		p.advance()
+		p.expectKw(KwBy)
+		stmt.Order = p.parseOrderByList()
+	}
+	if p.matchKw(KwLimit) {
+		stmt.Limit = p.parseExpr()
+	}
+
+	// Optional RETURNING clause
+	stmt.Returning = p.tryParseReturning()
 
 	return &Statement{
 		Type:       StmtDelete,
@@ -2193,6 +2180,45 @@ func (p *Parser) parseFloatLiteral(s string) *Expr {
 	}
 }
 
+// tryParseOverClause parses OVER clause for window functions if present.
+func (p *Parser) tryParseOverClause() {
+	if !p.isKw(KwOver) {
+		return
+	}
+	p.advance()
+	if p.peek().Type == TokenLParen {
+		p.advance()
+		// Skip window spec content by tracking paren depth
+		depth := 1
+		for depth > 0 && !p.atEnd() {
+			if p.peek().Type == TokenLParen {
+				depth++
+			} else if p.peek().Type == TokenRParen {
+				depth--
+				if depth == 0 {
+					break
+				}
+			}
+			p.advance()
+		}
+		p.expectType(TokenRParen)
+	} else {
+		p.parseName() // window name reference
+	}
+}
+
+// tryParseFilterClause parses FILTER (WHERE ...) clause if present.
+func (p *Parser) tryParseFilterClause() {
+	if !p.isKw(KwFilter) {
+		return
+	}
+	p.advance()
+	p.expectType(TokenLParen)
+	p.expectKw(KwWhere)
+	p.parseExpr()
+	p.expectType(TokenRParen)
+}
+
 func (p *Parser) parseIdentExpr() *Expr {
 	name := p.parseName()
 
@@ -2220,6 +2246,8 @@ func (p *Parser) parseIdentExpr() *Expr {
 		// Empty args: func()
 		if p.peek().Type == TokenRParen {
 			p.advance()
+			p.tryParseOverClause()
+			p.tryParseFilterClause()
 			return &Expr{
 				Kind:         ExprFunctionCall,
 				FunctionName: name,
@@ -2230,38 +2258,9 @@ func (p *Parser) parseIdentExpr() *Expr {
 		args := p.parseExprList()
 		p.expectType(TokenRParen)
 
-		// OVER clause (window function) - parse but don't store details
-		if p.isKw(KwOver) {
-			p.advance()
-			if p.peek().Type == TokenLParen {
-				p.advance()
-				// Skip window spec
-				depth := 1
-				for depth > 0 && !p.atEnd() {
-					if p.peek().Type == TokenLParen {
-						depth++
-					} else if p.peek().Type == TokenRParen {
-						depth--
-						if depth == 0 {
-							break
-						}
-					}
-					p.advance()
-				}
-				p.expectType(TokenRParen)
-			} else {
-				p.parseName() // window name
-			}
-		}
-
-		// FILTER clause
-		if p.isKw(KwFilter) {
-			p.advance()
-			p.expectType(TokenLParen)
-			p.expectKw(KwWhere)
-			p.parseExpr()
-			p.expectType(TokenRParen)
-		}
+		// OVER and FILTER clauses for functions with args
+		p.tryParseOverClause()
+		p.tryParseFilterClause()
 
 		return &Expr{
 			Kind:         ExprFunctionCall,
@@ -2397,4 +2396,136 @@ func (p *Parser) parseIdentList() []string {
 		names = append(names, p.parseName())
 	}
 	return names
+}
+
+// =============================================================================
+// RETURNING clause
+// =============================================================================
+
+// tryParseReturning parses a RETURNING clause if present.
+func (p *Parser) tryParseReturning() []*ResultCol {
+	if !p.isKw(KwReturning) {
+		return nil
+	}
+	p.advance() // consume RETURNING
+	return p.parseResultColumns()
+}
+
+// =============================================================================
+// CTE (WITH clause) - improved
+// =============================================================================
+
+// parseWithOrSelect parses WITH ... SELECT or WITH ... INSERT/UPDATE/DELETE.
+func (p *Parser) parseWithOrSelect() *Statement {
+	if !p.isKw(KwWith) {
+		return p.parseSelectStatement()
+	}
+	p.advance() // consume WITH
+
+	recursive := false
+	if p.isKw(KwRecursive) {
+		p.advance()
+		recursive = true
+	}
+
+	ctes := p.parseCTEListDetailed()
+
+	// WITH can precede SELECT, INSERT, UPDATE, or DELETE
+	var stmt *Statement
+	switch {
+	case p.isKw(KwSelect), p.isKw(KwValues):
+		stmt = p.parseSelectStatement()
+	case p.isKw(KwInsert), p.isKw(KwReplace):
+		stmt = p.parseInsert()
+	case p.isKw(KwUpdate):
+		stmt = p.parseUpdate()
+	case p.isKw(KwDelete):
+		stmt = p.parseDelete()
+	default:
+		p.errorf("expected SELECT, INSERT, UPDATE, or DELETE after WITH clause")
+		return nil
+	}
+
+	if stmt != nil {
+		stmt.CTEs = ctes
+		stmt.Recursive = recursive
+	}
+	return stmt
+}
+
+// parseCTEListDetailed parses CTE definitions and returns them.
+func (p *Parser) parseCTEListDetailed() []*CTEDef {
+	var ctes []*CTEDef
+	for {
+		cte := &CTEDef{}
+		cte.Name = p.parseName()
+
+		// Optional column list
+		if p.peek().Type == TokenLParen && !p.isNextKw(KwAs) {
+			p.advance()
+			cte.Columns = p.parseIdentList()
+			p.expectType(TokenRParen)
+		}
+
+		p.expectKw(KwAs)
+
+		// Optional MATERIALIZED / NOT MATERIALIZED
+		if p.isKw(KwNot) {
+			p.advance()
+			p.expectKw(KwMaterialized)
+		} else if p.isKw(KwMaterialized) {
+			p.advance()
+		}
+
+		p.expectType(TokenLParen)
+		cte.Body = p.parseSelectBody()
+		p.expectType(TokenRParen)
+
+		ctes = append(ctes, cte)
+
+		if !p.matchType(TokenComma) {
+			break
+		}
+	}
+	return ctes
+}
+
+// =============================================================================
+// WINDOW clause (basic parsing)
+// =============================================================================
+
+// tryParseWindowClause parses a WINDOW clause if present.
+func (p *Parser) tryParseWindowClause() []*WindowDef {
+	if !p.isKw(KwWindow) {
+		return nil
+	}
+	p.advance() // consume WINDOW
+	var windows []*WindowDef
+	for {
+		wd := &WindowDef{}
+		wd.Name = p.parseName()
+		p.expectKw(KwAs)
+		p.expectType(TokenLParen)
+		// Parse window spec contents
+		if p.isKw(KwPartition) {
+			p.advance()
+			p.expectKw(KwBy)
+			wd.PartitionBy = p.parseExprList()
+		}
+		if p.isKw(KwOrder) {
+			p.advance()
+			p.expectKw(KwBy)
+			wd.OrderBy = p.parseOrderByList()
+		}
+		// Skip any remaining tokens until closing paren (handles frame spec etc.)
+		for !p.atEnd() && p.peek().Type != TokenRParen {
+			p.advance()
+		}
+		p.expectType(TokenRParen)
+		windows = append(windows, wd)
+		if !p.matchType(TokenComma) {
+			break
+		}
+	}
+	return windows
 }

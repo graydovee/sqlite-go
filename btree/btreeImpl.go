@@ -181,6 +181,38 @@ func cellPtrOffset(pageNum PageNumber, i int) int {
 // Insert inserts a key/value pair.
 func (b *BTreeImpl) Insert(cursor BTCursor, key []byte, data []byte, rowid RowID, seekResult SeekResult) error {
 	cur := cursor.(*CursorImpl)
+
+	// For updates (SeekFound), delete the old entry first to free space.
+	if seekResult == SeekFound {
+		page, err := b.pgr.GetPage(cur.rootPage)
+		if err != nil {
+			return err
+		}
+		hdr := readPageHeader(page.Data, cur.rootPage)
+		hs := hdrSize(cur.rootPage)
+		for i := 0; i < int(hdr.numCells); i++ {
+			ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
+			if ptr == 0 || ptr >= len(page.Data) {
+				continue
+			}
+			// Read rowid from cell data
+			existingRowid := readCellRowidFromPage(page.Data, ptr, hdr.pageType)
+			if RowID(existingRowid) == rowid {
+				// Remove this cell by shifting pointers
+				for j := i; j < int(hdr.numCells)-1; j++ {
+					nextPtr := binary.BigEndian.Uint16(page.Data[hs+(j+1)*2 : hs+(j+1)*2+2])
+					binary.BigEndian.PutUint16(page.Data[hs+j*2:], nextPtr)
+				}
+				off := pageOffset(cur.rootPage)
+				binary.BigEndian.PutUint16(page.Data[off+3:off+5], uint16(int(hdr.numCells)-1))
+				break
+			}
+		}
+		b.pgr.MarkDirty(page)
+		b.pgr.WritePage(page)
+		b.pgr.ReleasePage(page)
+	}
+
 	page, err := b.pgr.GetPage(cur.rootPage)
 	if err != nil {
 		return err

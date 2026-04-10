@@ -21,6 +21,44 @@ func NewSchema() *Schema {
 	}
 }
 
+// AddTable adds a table to the schema.
+func (s *Schema) AddTable(tbl *TableInfo) {
+	if s == nil || tbl == nil {
+		return
+	}
+	s.Tables[tbl.Name] = tbl
+}
+
+// AddIndex adds an index to the schema.
+func (s *Schema) AddIndex(idx *IndexInfo) {
+	if s == nil || idx == nil {
+		return
+	}
+	s.Indexes[idx.Name] = idx
+}
+
+// FindColumn finds a column by name in a table, returning its index or -1.
+func (t *TableInfo) FindColumn(name string) int {
+	if t == nil {
+		return -1
+	}
+	upper := strings.ToUpper(name)
+	for i, c := range t.Columns {
+		if strings.ToUpper(c.Name) == upper {
+			return i
+		}
+	}
+	return -1
+}
+
+// ColumnCount returns the number of columns in the table.
+func (t *TableInfo) ColumnCount() int {
+	if t == nil {
+		return 0
+	}
+	return len(t.Columns)
+}
+
 // TableInfo describes a table in the schema.
 type TableInfo struct {
 	Name      string

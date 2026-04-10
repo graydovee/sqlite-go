@@ -521,12 +521,13 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 	expectKeyword(tokens, &pos, "values")
 
 	// Parse value groups: (val, val, ...) or just val
+	bindIdx := 0
 	for pos < len(tokens) {
 		var values []interface{}
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
 			pos++ // skip (
 			for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
-				val, err := parseExprValue(tokens, &pos, args)
+				val, err := parseExprValue(tokens, &pos, args, &bindIdx)
 				if err != nil {
 					return err
 				}
@@ -716,6 +717,7 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		value interface{}
 	}
 	var sets []setPair
+	bindIdx := 0
 	for pos < len(tokens) {
 		if isKeyword(tokens[pos], "where") {
 			break
@@ -725,7 +727,7 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenEq {
 			pos++
 		}
-		val, err := parseExprValue(tokens, &pos, args)
+		val, err := parseExprValue(tokens, &pos, args, &bindIdx)
 		if err != nil {
 			return err
 		}
@@ -1199,9 +1201,20 @@ func classifyStatement(tokens []compile.Token) string {
 }
 
 // parseExprValue parses a simple expression value from tokens.
-func parseExprValue(tokens []compile.Token, pos *int, args []interface{}) (interface{}, error) {
+// bindIdx tracks the current position for sequential ? parameters (0-based, incremented per ?).
+func parseExprValue(tokens []compile.Token, pos *int, args []interface{}, bindIdx *int) (interface{}, error) {
 	if *pos >= len(tokens) {
 		return nil, fmt.Errorf("expected value")
+	}
+
+	// Handle leading minus for negative numbers
+	neg := false
+	if tokens[*pos].Type == compile.TokenMinus {
+		neg = true
+		*pos++
+		if *pos >= len(tokens) {
+			return nil, fmt.Errorf("expected value after -")
+		}
 	}
 
 	t := tokens[*pos]
@@ -1212,12 +1225,18 @@ func parseExprValue(tokens []compile.Token, pos *int, args []interface{}) (inter
 		if err != nil {
 			return t.Value, nil
 		}
+		if neg {
+			v = -v
+		}
 		return v, nil
 	case compile.TokenFloat:
 		*pos++
 		v, err := strconv.ParseFloat(t.Value, 64)
 		if err != nil {
 			return t.Value, nil
+		}
+		if neg {
+			v = -v
 		}
 		return v, nil
 	case compile.TokenString:
@@ -1241,12 +1260,12 @@ func parseExprValue(tokens []compile.Token, pos *int, args []interface{}) (inter
 				}
 			}
 		}
-		// Plain ? — use sequential binding
+		// Plain ? — sequential binding
 		if t.Value == "?" {
-			// Use next arg
-			bindIdx := 0 // simplified: use first arg for all ?
-			if bindIdx < len(args) {
-				return args[bindIdx], nil
+			idx := *bindIdx
+			*bindIdx++
+			if idx < len(args) {
+				return args[idx], nil
 			}
 		}
 		return nil, nil

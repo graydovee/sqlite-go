@@ -27,6 +27,7 @@ type PagerImpl struct {
 	isMemory    bool
 	readonly    bool
 	changeCount uint32
+	freeList    []PageNumber // in-memory freelist of reusable page numbers
 }
 
 type journalOps interface {
@@ -175,6 +176,14 @@ func (p *PagerImpl) GetPage(pageNum PageNumber) (*Page, error) {
 	if p.isMemory {
 		// In-memory: return zeroed page
 	} else {
+		// Check WAL for latest version of this page
+		if p.wal != nil && p.wal.open {
+			if data := p.wal.ReadFrame(pageNum); data != nil {
+				copy(page.Data, data)
+				p.cache.Add(page)
+				return page, nil
+			}
+		}
 		offset := int64(pageNum-1) * int64(p.pageSize)
 		if err := p.file.Read(page.Data, offset); err != nil {
 			return nil, fmt.Errorf("read page %d: %w", pageNum, err)
@@ -189,9 +198,29 @@ func (p *PagerImpl) GetNewPage() (*Page, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.pageCount++
+	var pageNum PageNumber
+	if len(p.freeList) > 0 {
+		// Reuse a free page
+		pageNum = p.freeList[len(p.freeList)-1]
+		p.freeList = p.freeList[:len(p.freeList)-1]
+		// Check if it's in cache already
+		if page := p.cache.Fetch(pageNum); page != nil {
+			// Clear the page data
+			for i := range page.Data {
+				page.Data[i] = 0
+			}
+			page.Dirty = true
+			p.cache.MarkDirty(page)
+			return page, nil
+		}
+	} else {
+		// Extend the file
+		p.pageCount++
+		pageNum = PageNumber(p.pageCount)
+	}
+
 	page := &Page{
-		PageNum:  PageNumber(p.pageCount),
+		PageNum:  pageNum,
 		Data:     make([]byte, p.pageSize),
 		Dirty:    true,
 		RefCount: 1,
@@ -199,6 +228,19 @@ func (p *PagerImpl) GetNewPage() (*Page, error) {
 	p.cache.Add(page)
 	p.cache.MarkDirty(page)
 	return page, nil
+}
+
+func (p *PagerImpl) FreePage(pageNum PageNumber) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.freeList = append(p.freeList, pageNum)
+	return nil
+}
+
+func (p *PagerImpl) FreelistCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.freeList)
 }
 
 func (p *PagerImpl) MarkDirty(page *Page) error {

@@ -3,6 +3,8 @@ package compile
 import (
 	"strings"
 	"testing"
+
+	"github.com/sqlite-go/sqlite-go/vdbe"
 )
 
 // =============================================================================
@@ -1592,5 +1594,657 @@ func TestInsertWithExpressions(t *testing.T) {
 	}
 	if len(ins.Values[0]) != 3 {
 		t.Fatalf("expected 3 values in row, got %d", len(ins.Values[0]))
+	}
+}
+
+// =============================================================================
+// RETURNING clause tests
+// =============================================================================
+
+func TestInsertReturning(t *testing.T) {
+	stmt := parseOne(t, "INSERT INTO users (id, name) VALUES (1, 'Alice') RETURNING id, name")
+	ins := stmt.InsertStmt
+	if len(ins.Returning) != 2 {
+		t.Fatalf("expected 2 RETURNING columns, got %d", len(ins.Returning))
+	}
+}
+
+func TestInsertReturningStar(t *testing.T) {
+	stmt := parseOne(t, "INSERT INTO users VALUES (1, 'Alice') RETURNING *")
+	ins := stmt.InsertStmt
+	if len(ins.Returning) != 1 || !ins.Returning[0].Star {
+		t.Fatalf("expected RETURNING *, got %v", ins.Returning)
+	}
+}
+
+func TestUpdateReturning(t *testing.T) {
+	stmt := parseOne(t, "UPDATE users SET name = 'Bob' WHERE id = 1 RETURNING id, name AS new_name")
+	upd := stmt.UpdateStmt
+	if len(upd.Returning) != 2 {
+		t.Fatalf("expected 2 RETURNING columns, got %d", len(upd.Returning))
+	}
+	if upd.Returning[1].As != "new_name" {
+		t.Fatalf("expected alias 'new_name', got %q", upd.Returning[1].As)
+	}
+}
+
+func TestDeleteReturning(t *testing.T) {
+	stmt := parseOne(t, "DELETE FROM users WHERE id = 1 RETURNING *")
+	del := stmt.DeleteStmt
+	if len(del.Returning) != 1 || !del.Returning[0].Star {
+		t.Fatalf("expected RETURNING *, got %v", del.Returning)
+	}
+}
+
+func TestDeleteReturningColumns(t *testing.T) {
+	stmt := parseOne(t, "DELETE FROM users WHERE id = 1 RETURNING id, name")
+	del := stmt.DeleteStmt
+	if len(del.Returning) != 2 {
+		t.Fatalf("expected 2 RETURNING columns, got %d", len(del.Returning))
+	}
+}
+
+// =============================================================================
+// CTE (WITH clause) tests
+// =============================================================================
+
+func TestWithCTE(t *testing.T) {
+	sql := "WITH cte AS (SELECT 1) SELECT * FROM cte"
+	stmt := parseOne(t, sql)
+	if len(stmt.CTEs) != 1 {
+		t.Fatalf("expected 1 CTE, got %d", len(stmt.CTEs))
+	}
+	if stmt.CTEs[0].Name != "cte" {
+		t.Fatalf("expected CTE name 'cte', got %q", stmt.CTEs[0].Name)
+	}
+	if stmt.CTEs[0].Body == nil {
+		t.Fatal("expected CTE body")
+	}
+}
+
+func TestWithRecursiveCTE(t *testing.T) {
+	sql := "WITH RECURSIVE cte(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cte WHERE x<10) SELECT * FROM cte"
+	stmt := parseOne(t, sql)
+	if !stmt.Recursive {
+		t.Fatal("expected Recursive=true")
+	}
+	if len(stmt.CTEs) != 1 {
+		t.Fatalf("expected 1 CTE, got %d", len(stmt.CTEs))
+	}
+	if len(stmt.CTEs[0].Columns) != 1 || stmt.CTEs[0].Columns[0] != "x" {
+		t.Fatalf("expected CTE column list [x], got %v", stmt.CTEs[0].Columns)
+	}
+}
+
+func TestWithMultipleCTEs(t *testing.T) {
+	sql := "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"
+	stmt := parseOne(t, sql)
+	if len(stmt.CTEs) != 2 {
+		t.Fatalf("expected 2 CTEs, got %d", len(stmt.CTEs))
+	}
+	if stmt.CTEs[0].Name != "a" {
+		t.Fatalf("expected first CTE 'a', got %q", stmt.CTEs[0].Name)
+	}
+	if stmt.CTEs[1].Name != "b" {
+		t.Fatalf("expected second CTE 'b', got %q", stmt.CTEs[1].Name)
+	}
+}
+
+// =============================================================================
+// DELETE with ORDER BY and LIMIT
+// =============================================================================
+
+func TestDeleteOrderByLimit(t *testing.T) {
+	stmt := parseOne(t, "DELETE FROM users ORDER BY id DESC LIMIT 10")
+	del := stmt.DeleteStmt
+	if len(del.Order) != 1 {
+		t.Fatalf("expected 1 ORDER BY item, got %d", len(del.Order))
+	}
+	if del.Order[0].Order != SortDesc {
+		t.Fatal("expected DESC order")
+	}
+	if del.Limit == nil {
+		t.Fatal("expected LIMIT")
+	}
+}
+
+// =============================================================================
+// CAST expression with various types
+// =============================================================================
+
+func TestCastAsReal(t *testing.T) {
+	stmt := parseOne(t, "SELECT CAST(x AS REAL)")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprCast {
+		t.Fatalf("expected ExprCast, got %d", expr.Kind)
+	}
+	if expr.CastType != "REAL" {
+		t.Fatalf("expected cast type REAL, got %q", expr.CastType)
+	}
+}
+
+func TestCastAsText(t *testing.T) {
+	stmt := parseOne(t, "SELECT CAST(123 AS TEXT)")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprCast {
+		t.Fatalf("expected ExprCast, got %d", expr.Kind)
+	}
+	if expr.CastType != "TEXT" {
+		t.Fatalf("expected cast type TEXT, got %q", expr.CastType)
+	}
+}
+
+// =============================================================================
+// BETWEEN with expressions
+// =============================================================================
+
+func TestBetweenWithExpressions(t *testing.T) {
+	stmt := parseOne(t, "SELECT a BETWEEN b AND c FROM t")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprBetween {
+		t.Fatalf("expected ExprBetween, got %d", expr.Kind)
+	}
+	if expr.Low == nil || expr.Low.Name != "b" {
+		t.Fatal("expected lower bound 'b'")
+	}
+	if expr.High == nil || expr.High.Name != "c" {
+		t.Fatal("expected upper bound 'c'")
+	}
+}
+
+// =============================================================================
+// IN with subquery
+// =============================================================================
+
+func TestInSubquery(t *testing.T) {
+	sql := "SELECT * FROM t WHERE id IN (SELECT id FROM other)"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where == nil {
+		t.Fatal("expected WHERE clause")
+	}
+	if sel.Where.Kind != ExprInSelect {
+		t.Fatalf("expected ExprInSelect, got %d", sel.Where.Kind)
+	}
+	if sel.Where.InSelect == nil {
+		t.Fatal("expected subquery in IN")
+	}
+}
+
+// =============================================================================
+// CASE with no ELSE
+// =============================================================================
+
+func TestCaseNoElse(t *testing.T) {
+	sql := "SELECT CASE WHEN a > 0 THEN 'pos' END FROM t"
+	stmt := parseOne(t, sql)
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprCase {
+		t.Fatalf("expected ExprCase, got %d", expr.Kind)
+	}
+	if len(expr.WhenList) != 1 {
+		t.Fatalf("expected 1 WHEN clause, got %d", len(expr.WhenList))
+	}
+	if expr.ElseExpr != nil {
+		t.Fatal("expected no ELSE")
+	}
+}
+
+// =============================================================================
+// EXISTS in WHERE
+// =============================================================================
+
+func TestExistsInWhere(t *testing.T) {
+	sql := "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM other WHERE other.id = t.id)"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where == nil {
+		t.Fatal("expected WHERE")
+	}
+	if sel.Where.Kind != ExprExists {
+		t.Fatalf("expected ExprExists, got %d", sel.Where.Kind)
+	}
+}
+
+// =============================================================================
+// Nested CASE
+// =============================================================================
+
+func TestNestedCase(t *testing.T) {
+	sql := "SELECT CASE WHEN a > 0 THEN CASE WHEN a > 10 THEN 'big' ELSE 'small' END ELSE 'neg' END FROM t"
+	parseOne(t, sql) // just ensure no error
+}
+
+// =============================================================================
+// Complex IN expressions
+// =============================================================================
+
+func TestInWithExpressions(t *testing.T) {
+	sql := "SELECT * FROM t WHERE a IN (1+2, 3*4, ABS(-5))"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where.Kind != ExprInList {
+		t.Fatalf("expected ExprInList, got %d", sel.Where.Kind)
+	}
+	if len(sel.Where.InValues) != 3 {
+		t.Fatalf("expected 3 IN values, got %d", len(sel.Where.InValues))
+	}
+}
+
+// =============================================================================
+// NOT EXISTS
+// =============================================================================
+
+func TestNotExistsInWhere(t *testing.T) {
+	sql := "SELECT * FROM t WHERE NOT EXISTS (SELECT 1 FROM other)"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where == nil {
+		t.Fatal("expected WHERE")
+	}
+	if sel.Where.Kind != ExprUnaryOp || sel.Where.Op != "NOT" {
+		t.Fatalf("expected NOT unary op, got %v", sel.Where)
+	}
+	if sel.Where.Right == nil || sel.Where.Right.Kind != ExprExists {
+		t.Fatal("expected EXISTS under NOT")
+	}
+}
+
+// =============================================================================
+// REGEXP
+// =============================================================================
+
+func TestExprRegexp(t *testing.T) {
+	stmt := parseOne(t, "SELECT a REGEXP '^[0-9]+$'")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprRegexp {
+		t.Fatalf("expected ExprRegexp, got %d", expr.Kind)
+	}
+}
+
+func TestExprNotRegexp(t *testing.T) {
+	stmt := parseOne(t, "SELECT a NOT REGEXP '^[0-9]+$'")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprRegexp || !expr.Not {
+		t.Fatalf("expected ExprRegexp with Not=true, got kind=%d not=%v", expr.Kind, expr.Not)
+	}
+}
+
+// =============================================================================
+// MATCH expression
+// =============================================================================
+
+func TestExprMatch(t *testing.T) {
+	stmt := parseOne(t, "SELECT a MATCH 'pattern'")
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprMatch {
+		t.Fatalf("expected ExprMatch, got %d", expr.Kind)
+	}
+}
+
+// =============================================================================
+// Error message with location
+// =============================================================================
+
+func TestErrorHasLocation(t *testing.T) {
+	_, err := Parse("SELECT FROM")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	// Error should contain "line" and "column" info
+	errStr := err.Error()
+	if !strings.Contains(errStr, "line") {
+		t.Errorf("expected error to contain line info, got: %s", errStr)
+	}
+}
+
+// =============================================================================
+// Complex WITH queries
+// =============================================================================
+
+func TestWithInsert(t *testing.T) {
+	sql := "WITH cte AS (SELECT 1 AS id) INSERT INTO t SELECT * FROM cte"
+	stmt := parseOne(t, sql)
+	if len(stmt.CTEs) != 1 {
+		t.Fatalf("expected 1 CTE, got %d", len(stmt.CTEs))
+	}
+	if stmt.Type != StmtInsert {
+		t.Fatalf("expected StmtInsert, got %d", stmt.Type)
+	}
+}
+
+func TestWithUpdate(t *testing.T) {
+	sql := "WITH cte AS (SELECT 1) UPDATE t SET a = 1"
+	stmt := parseOne(t, sql)
+	if len(stmt.CTEs) != 1 {
+		t.Fatalf("expected 1 CTE, got %d", len(stmt.CTEs))
+	}
+	if stmt.Type != StmtUpdate {
+		t.Fatalf("expected StmtUpdate, got %d", stmt.Type)
+	}
+}
+
+func TestWithDelete(t *testing.T) {
+	sql := "WITH cte AS (SELECT 1) DELETE FROM t"
+	stmt := parseOne(t, sql)
+	if len(stmt.CTEs) != 1 {
+		t.Fatalf("expected 1 CTE, got %d", len(stmt.CTEs))
+	}
+	if stmt.Type != StmtDelete {
+		t.Fatalf("expected StmtDelete, got %d", stmt.Type)
+	}
+}
+
+// =============================================================================
+// Window function parsing (basic)
+// =============================================================================
+
+func TestWindowFunctionOver(t *testing.T) {
+	sql := "SELECT ROW_NUMBER() OVER (ORDER BY id) FROM t"
+	parseOne(t, sql) // just ensure no error
+}
+
+func TestWindowFunctionPartitionBy(t *testing.T) {
+	sql := "SELECT COUNT(*) OVER (PARTITION BY dept ORDER BY name) FROM t"
+	parseOne(t, sql) // just ensure no error
+}
+
+func TestWindowFunctionNamedWindow(t *testing.T) {
+	sql := "SELECT COUNT(*) OVER w FROM t WINDOW w AS (ORDER BY id)"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if len(sel.Windows) != 1 {
+		t.Fatalf("expected 1 window definition, got %d", len(sel.Windows))
+	}
+	if sel.Windows[0].Name != "w" {
+		t.Fatalf("expected window name 'w', got %q", sel.Windows[0].Name)
+	}
+}
+
+// =============================================================================
+// Schema management tests
+// =============================================================================
+
+func TestSchemaAddTable(t *testing.T) {
+	s := NewSchema()
+	tbl := &TableInfo{
+		Name:     "test",
+		RootPage: 5,
+		Columns: []ColumnInfo{
+			{Name: "id", Type: "INTEGER"},
+			{Name: "name", Type: "TEXT"},
+		},
+	}
+	s.AddTable(tbl)
+	found, err := newBuild(s).lookupTable("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.Name != "test" {
+		t.Fatalf("expected 'test', got %q", found.Name)
+	}
+}
+
+func TestSchemaAddIndex(t *testing.T) {
+	s := NewSchema()
+	idx := &IndexInfo{
+		Name:     "idx_test",
+		Table:    "test",
+		RootPage: 6,
+	}
+	s.AddIndex(idx)
+	found, err := newBuild(s).lookupIndex("idx_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found.Name != "idx_test" {
+		t.Fatalf("expected 'idx_test', got %q", found.Name)
+	}
+}
+
+func TestTableInfoFindColumn(t *testing.T) {
+	tbl := &TableInfo{
+		Columns: []ColumnInfo{
+			{Name: "id"},
+			{Name: "name"},
+			{Name: "email"},
+		},
+	}
+	if idx := tbl.FindColumn("id"); idx != 0 {
+		t.Errorf("expected 0 for 'id', got %d", idx)
+	}
+	if idx := tbl.FindColumn("NAME"); idx != 1 {
+		t.Errorf("expected 1 for 'NAME', got %d", idx)
+	}
+	if idx := tbl.FindColumn("missing"); idx != -1 {
+		t.Errorf("expected -1 for 'missing', got %d", idx)
+	}
+}
+
+func TestTableInfoColumnCount(t *testing.T) {
+	tbl := &TableInfo{
+		Columns: []ColumnInfo{
+			{Name: "a"}, {Name: "b"}, {Name: "c"},
+		},
+	}
+	if cnt := tbl.ColumnCount(); cnt != 3 {
+		t.Errorf("expected 3, got %d", cnt)
+	}
+	if cnt := (*TableInfo)(nil).ColumnCount(); cnt != 0 {
+		t.Errorf("expected 0 for nil, got %d", cnt)
+	}
+}
+
+// =============================================================================
+// CAST compilation test
+// =============================================================================
+
+func TestCompileCastExpression(t *testing.T) {
+	bld := newBuild(nil)
+	reg := bld.b.AllocReg(1)
+	expr := &Expr{
+		Kind:     ExprCast,
+		Left:     &Expr{Kind: ExprLiteral, LiteralType: "string", StringValue: "123"},
+		CastType: "INTEGER",
+	}
+	if err := bld.compileExpr(expr, reg); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := bld.b.BuildProgram()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasCast := false
+	for _, instr := range prog.Instructions {
+		if instr.Op == vdbe.OpCast {
+			hasCast = true
+		}
+	}
+	if !hasCast {
+		t.Fatal("expected Cast instruction")
+	}
+}
+
+// =============================================================================
+// IS NULL fix - operand in Right field
+// =============================================================================
+
+func TestCompileIsNullWithRight(t *testing.T) {
+	bld := newBuild(helperSchema())
+	bld.addTableRef("users", "users", bld.schema.Tables["users"], 0)
+	reg := bld.b.AllocReg(1)
+	// Parser puts operand in Right for IS NULL
+	expr := &Expr{
+		Kind:  ExprIsNull,
+		Right: &Expr{Kind: ExprColumnRef, Name: "name"},
+	}
+	if err := bld.compileExpr(expr, reg); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := bld.b.BuildProgram()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasIsNull := false
+	for _, instr := range prog.Instructions {
+		if instr.Op == vdbe.OpIsNull {
+			hasIsNull = true
+		}
+	}
+	if !hasIsNull {
+		t.Fatal("expected IsNull instruction")
+	}
+}
+
+// =============================================================================
+// Edge case: BETWEEN in WHERE with outer AND
+// =============================================================================
+
+func TestBetweenInWhereOuterAnd(t *testing.T) {
+	sql := "SELECT * FROM t WHERE a BETWEEN 1 AND 100 AND b > 0"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where == nil {
+		t.Fatal("expected WHERE")
+	}
+	// Top should be AND (BETWEEN ... AND ... should not consume the outer AND)
+	if sel.Where.Op != "AND" {
+		t.Fatalf("expected AND at top, got %q", sel.Where.Op)
+	}
+}
+
+// =============================================================================
+// Edge case: multiple BETWEEN
+// =============================================================================
+
+func TestMultipleBetween(t *testing.T) {
+	sql := "SELECT * FROM t WHERE a BETWEEN 1 AND 10 AND b BETWEEN 20 AND 30"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.Where == nil {
+		t.Fatal("expected WHERE")
+	}
+	if sel.Where.Op != "AND" {
+		t.Fatalf("expected AND at top, got %q", sel.Where.Op)
+	}
+}
+
+// =============================================================================
+// Edge case: CAST in WHERE
+// =============================================================================
+
+func TestCastInWhere(t *testing.T) {
+	sql := "SELECT * FROM t WHERE CAST(a AS INTEGER) > 5"
+	parseOne(t, sql) // just ensure no error
+}
+
+// =============================================================================
+// Edge case: CASE in WHERE
+// =============================================================================
+
+func TestCaseInWhere(t *testing.T) {
+	sql := "SELECT * FROM t WHERE CASE WHEN a > 0 THEN 1 ELSE 0 END = 1"
+	parseOne(t, sql) // just ensure no error
+}
+
+// =============================================================================
+// Edge case: double NOT
+// =============================================================================
+
+func TestDoubleNot(t *testing.T) {
+	sql := "SELECT NOT NOT a FROM t"
+	stmt := parseOne(t, sql)
+	expr := stmt.SelectStmt.Columns[0].Expr
+	if expr.Kind != ExprUnaryOp || expr.Op != "NOT" {
+		t.Fatalf("expected outer NOT, got %v", expr)
+	}
+	if expr.Right == nil || expr.Right.Op != "NOT" {
+		t.Fatal("expected inner NOT")
+	}
+}
+
+// =============================================================================
+// Edge case: nested IN expressions
+// =============================================================================
+
+func TestNestedInExpression(t *testing.T) {
+	sql := "SELECT * FROM t WHERE a IN (1, 2) AND b IN (SELECT x FROM other)"
+	parseOne(t, sql) // just ensure no error
+}
+
+// =============================================================================
+// SELECT without FROM (complex constant expressions)
+// =============================================================================
+
+func TestSelectNoFromComplex(t *testing.T) {
+	sql := "SELECT 1 + 2 * 3, UPPER('hello'), CAST(3.14 AS INTEGER)"
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if len(sel.Columns) != 3 {
+		t.Fatalf("expected 3 columns, got %d", len(sel.Columns))
+	}
+}
+
+// =============================================================================
+// UPDATE with FROM (complex)
+// =============================================================================
+
+func TestUpdateFromComplex(t *testing.T) {
+	sql := "UPDATE orders SET total = s.total FROM staging s WHERE orders.id = s.id"
+	stmt := parseOne(t, sql)
+	upd := stmt.UpdateStmt
+	if upd.From == nil {
+		t.Fatal("expected FROM clause")
+	}
+	if len(upd.From.Tables) != 1 {
+		t.Fatalf("expected 1 table in FROM, got %d", len(upd.From.Tables))
+	}
+	if upd.From.Tables[0].Alias != "s" {
+		t.Fatalf("expected alias 's', got %q", upd.From.Tables[0].Alias)
+	}
+}
+
+// =============================================================================
+// SELECT with quoted identifiers
+// =============================================================================
+
+func TestQuotedIdentifiers(t *testing.T) {
+	sql := `SELECT "user"."id", "user"."name" FROM "user"`
+	stmt := parseOne(t, sql)
+	sel := stmt.SelectStmt
+	if sel.From.Tables[0].Name != "user" {
+		t.Fatalf("expected table 'user', got %q", sel.From.Tables[0].Name)
+	}
+}
+
+// =============================================================================
+// INSERT with RETURNING expression alias
+// =============================================================================
+
+func TestInsertReturningExpr(t *testing.T) {
+	sql := "INSERT INTO t VALUES (1) RETURNING id, UPPER(name) AS upper_name"
+	stmt := parseOne(t, sql)
+	ins := stmt.InsertStmt
+	if len(ins.Returning) != 2 {
+		t.Fatalf("expected 2 RETURNING columns, got %d", len(ins.Returning))
+	}
+	if ins.Returning[1].As != "upper_name" {
+		t.Fatalf("expected alias 'upper_name', got %q", ins.Returning[1].As)
+	}
+}
+
+// =============================================================================
+// INSERT with DEFAULT keyword value
+// =============================================================================
+
+func TestInsertDefaultKeyword(t *testing.T) {
+	sql := "INSERT INTO t (a, b) VALUES (1, DEFAULT)"
+	stmt := parseOne(t, sql)
+	ins := stmt.InsertStmt
+	if len(ins.Values) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(ins.Values))
+	}
+	if len(ins.Values[0]) != 2 {
+		t.Fatalf("expected 2 values, got %d", len(ins.Values[0]))
 	}
 }
