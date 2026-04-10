@@ -73,6 +73,7 @@ const (
 	OpIncrVacuum
 	OpInit
 	OpInitCoroutine
+	OpInteger
 	OpInsert
 	OpInt64
 	OpIntCmp
@@ -93,6 +94,7 @@ const (
 	OpNewRowid
 	OpNext
 	OpNoConflict
+	OpNoop
 	OpNot
 	OpNotNull
 	OpNotExists

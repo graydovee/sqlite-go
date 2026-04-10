@@ -59,7 +59,7 @@ func init() {
 
 // isIdChar returns true if c can appear in an identifier (after the first char).
 func isIdChar(c byte) bool {
-	return unicode.IsLetter(rune(c)) || c == '_' || c == '$' || (c >= 0x80)
+	return unicode.IsLetter(rune(c)) || c == '_' || c == '$' || (c >= 0x80) || (c >= '0' && c <= '9')
 }
 
 // isIdStart returns true if c can start an identifier.
