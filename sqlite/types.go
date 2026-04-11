@@ -168,3 +168,11 @@ type UpdateCallback func(action int, database, table string, rowid int64)
 
 // WALCallback is called when WAL is checkpointed.
 type WALCallback func(database string, pages int)
+
+// cteTable represents a CTE result set for query expansion.
+type cteTable struct {
+	Name    string
+	Columns []string
+	SQL     string
+	Rows    [][]interface{}
+}

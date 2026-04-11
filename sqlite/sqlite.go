@@ -26,6 +26,7 @@ type Database struct {
 
 	// Schema tracking (simplified: in-memory schema table)
 	tables map[string]*tableEntry
+	views  map[string]*viewEntry
 
 	// Connection state
 	lastInsertRowID int64
@@ -36,6 +37,9 @@ type Database struct {
 
 	// Transaction state
 	inTx bool
+
+	// CTE temporary data (populated during WITH query execution)
+	cteData map[string]*cteTable
 }
 
 // tableEntry stores metadata about a table.
@@ -43,6 +47,12 @@ type tableEntry struct {
 	name      string
 	rootPage  int
 	columns   []columnEntry
+}
+
+// viewEntry stores metadata about a view.
+type viewEntry struct {
+	name string
+	sql  string // The SELECT statement defining the view
 }
 
 // columnEntry stores metadata about a column.
@@ -64,6 +74,7 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 
 	db := &Database{
 		tables:     make(map[string]*tableEntry),
+		views:      make(map[string]*viewEntry),
 		autoCommit: true,
 	}
 
@@ -315,6 +326,10 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 	switch stmtType {
 	case "create_table":
 		return db.execCreateTable(filtered)
+	case "create_view":
+		return db.execCreateView(filtered)
+	case "drop_view":
+		return db.execDropView(filtered)
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
@@ -446,6 +461,104 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		columns:  columns,
 	}
 
+	return nil
+}
+
+// execCreateView handles CREATE VIEW statements.
+func (db *Database) execCreateView(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "create")
+	expectKeyword(tokens, &pos, "view")
+
+	ifNotExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "not")
+		expectKeyword(tokens, &pos, "exists")
+		ifNotExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected view name")
+	}
+	viewName := tokens[pos].Value
+	pos++
+
+	if ifNotExists && db.views[viewName] != nil {
+		return nil
+	}
+
+	if db.views[viewName] != nil {
+		return NewErrorf(Error, "view %s already exists", viewName)
+	}
+
+	// Skip AS keyword
+	if pos < len(tokens) && isKeyword(tokens[pos], "as") {
+		pos++
+	}
+
+	// Collect remaining tokens as the SELECT SQL
+	var parts []string
+	for pos < len(tokens) {
+		parts = append(parts, tokens[pos].Value)
+		pos++
+	}
+	selectSQL := strings.Join(parts, " ")
+
+	// Validate that the SELECT parses
+	stmts, err := compile.Parse(selectSQL)
+	if err != nil || len(stmts) == 0 {
+		return NewErrorf(Error, "invalid SELECT in CREATE VIEW: %s", selectSQL)
+	}
+
+	// Check that the view's SELECT references valid tables/views
+	sel := stmts[0]
+	if sel.SelectStmt != nil && sel.SelectStmt.From != nil {
+		for _, tref := range sel.SelectStmt.From.Tables {
+			if tref.Name != "" && tref.Subquery == nil {
+				name := strings.ToLower(tref.Name)
+				if db.tables[name] == nil && db.views[name] == nil {
+					return NewErrorf(Error, "no such table: %s", tref.Name)
+				}
+			}
+		}
+	}
+
+	db.views[viewName] = &viewEntry{
+		name: viewName,
+		sql:  selectSQL,
+	}
+
+	return nil
+}
+
+// execDropView handles DROP VIEW statements.
+func (db *Database) execDropView(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "drop")
+	expectKeyword(tokens, &pos, "view")
+
+	ifExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "exists")
+		ifExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected view name")
+	}
+	viewName := tokens[pos].Value
+	pos++
+
+	if db.views[viewName] == nil {
+		if ifExists {
+			return nil
+		}
+		return NewErrorf(Error, "no such view: %s", viewName)
+	}
+
+	delete(db.views, viewName)
 	return nil
 }
 
@@ -906,6 +1019,10 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	tbl, ok := db.tables[tableName]
 	if !ok {
+		// Check if it's a view
+		if v, vok := db.views[tableName]; vok {
+			return db.queryView(v, cols, args)
+		}
 		return nil, NewErrorf(Error, "no such table: %s", tableName)
 	}
 
@@ -1079,6 +1196,12 @@ type rawRow struct {
 	values []vdbe.Value
 }
 
+// cteTable holds materialized CTE results for query execution.
+type cteTable struct {
+	columns []columnEntry
+	rows    []rawRow
+}
+
 // aggInfo describes a parsed aggregate function.
 type aggInfo struct {
 	fn  string // "count", "sum", "avg", "min", "max"
@@ -1213,6 +1336,12 @@ func rowKey(values []*vdbe.Mem) string {
 		}
 	}
 	return sb.String()
+}
+
+// queryView executes a SELECT by expanding a view definition.
+func (db *Database) queryView(v *viewEntry, cols []selectCol, args []interface{}) (*ResultSet, error) {
+	// Re-execute the view's SELECT statement
+	return db.querySingle(v.sql, args)
 }
 
 // selectWithoutTable handles SELECT without a FROM clause.
@@ -2324,12 +2453,21 @@ func classifyStatement(tokens []compile.Token) string {
 			switch second {
 			case "table":
 				return "create_table"
+			case "view":
+				return "create_view"
 			case "index":
 				return "create_index"
 			}
 		}
 		return "create"
 	case "drop":
+		if len(tokens) > 1 {
+			second := strings.ToLower(tokens[1].Value)
+			switch second {
+			case "view":
+				return "drop_view"
+			}
+		}
 		return "drop"
 	case "begin":
 		return "begin"

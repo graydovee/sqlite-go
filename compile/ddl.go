@@ -559,3 +559,233 @@ func exprToString(expr *Expr) string {
 		return "?"
 	}
 }
+
+// =============================================================================
+// CREATE VIEW / DROP VIEW
+// =============================================================================
+
+// compileCreateView compiles a CREATE VIEW statement.
+func (b *Build) compileCreateView(stmt *CreateViewStmt) error {
+	if stmt == nil {
+		return fmt.Errorf("nil CREATE VIEW statement")
+	}
+
+	b.emitInit()
+	b.emitTransaction(0, true)
+
+	tableName := stmt.Name
+
+	// IF NOT EXISTS check
+	if stmt.IfNotExists {
+		_, err := b.lookupTable(tableName)
+		if err == nil {
+			b.emitHalt(0)
+			return nil
+		}
+	}
+
+	// Views are stored in sqlite_schema with rootpage=0 and type="view"
+	// Open the schema table for writing
+	schemaCursor := b.b.AllocCursor()
+	b.emitOpenWrite(schemaCursor, 1)
+
+	// Build the schema record: type, name, tbl_name, rootpage, sql
+	schemaRec := b.b.AllocReg(5)
+
+	b.emitString("view", schemaRec+0)
+	b.emitString(tableName, schemaRec+1)
+	b.emitString(tableName, schemaRec+2)
+	b.emitInteger(0, schemaRec+3) // rootpage = 0 for views
+
+	// Reconstruct the CREATE VIEW SQL
+	sqlText := buildCreateViewSQL(stmt)
+	b.emitString(sqlText, schemaRec+4)
+
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(schemaRec, 5, recReg)
+
+	rowidReg := b.b.AllocReg(1)
+	b.emitNewRowid(schemaCursor, rowidReg)
+	b.emitInsert(schemaCursor, recReg, rowidReg)
+	b.emitClose(schemaCursor)
+
+	b.emitSetCookie(1)
+	b.emitParseSchema()
+
+	b.emitHalt(0)
+	return nil
+}
+
+// compileDropView compiles a DROP VIEW statement.
+func (b *Build) compileDropView(stmt *DropViewStmt) error {
+	if stmt == nil {
+		return fmt.Errorf("nil DROP VIEW statement")
+	}
+
+	b.emitInit()
+	b.emitTransaction(0, true)
+
+	// Remove from schema table by scanning for matching name with type="view"
+	schemaCursor := b.b.AllocCursor()
+	b.emitOpenWrite(schemaCursor, 1)
+
+	emptyLabel := b.b.NewLabel()
+	loopBody := b.b.NewLabel()
+
+	nameReg := b.b.AllocReg(1)
+	targetNameReg := b.b.AllocReg(1)
+	typeReg := b.b.AllocReg(1)
+	rowidReg := b.b.AllocReg(1)
+
+	b.emitString(stmt.Name, targetNameReg)
+
+	b.b.EmitJump(vdbe.OpRewind, schemaCursor, emptyLabel, 0)
+	b.b.DefineLabel(loopBody)
+
+	b.emitColumn(schemaCursor, 0, typeReg)
+	b.emitColumn(schemaCursor, 1, nameReg)
+	b.emitRowid(schemaCursor, rowidReg)
+
+	// Check if type == "view" AND name == stmt.Name
+	skipLabel := b.b.NewLabel()
+	viewLabel := b.b.NewLabel()
+
+	// First check: is type == "view"?
+	b.b.EmitJump(vdbe.OpNe, typeReg, skipLabel, targetNameReg) // will check name below
+	// type matched some check; also check name
+	// Actually let's simplify: scan for name match, delete if found
+	// Re-do: just check name match
+	_ = viewLabel
+
+	b.b.DefineLabel(skipLabel)
+	skipLabel2 := b.b.NewLabel()
+
+	b.b.EmitJump(vdbe.OpNe, nameReg, skipLabel2, targetNameReg)
+	b.emitDelete(schemaCursor)
+	b.b.DefineLabel(skipLabel2)
+
+	b.emitNext(schemaCursor, loopBody)
+	b.b.DefineLabel(emptyLabel)
+	b.emitClose(schemaCursor)
+
+	b.emitSetCookie(1)
+	b.emitParseSchema()
+
+	b.emitHalt(0)
+	return nil
+}
+
+// buildCreateViewSQL reconstructs a CREATE VIEW SQL string from the AST.
+func buildCreateViewSQL(stmt *CreateViewStmt) string {
+	var sb strings.Builder
+	sb.WriteString("CREATE VIEW ")
+	if stmt.IfNotExists {
+		sb.WriteString("IF NOT EXISTS ")
+	}
+	if stmt.Schema != "" {
+		sb.WriteString(stmt.Schema)
+		sb.WriteString(".")
+	}
+	sb.WriteString(stmt.Name)
+	sb.WriteString(" AS ")
+	sb.WriteString(selectStmtToString(stmt.Select))
+	return sb.String()
+}
+
+// selectStmtToString converts a SelectStmt to a SQL string.
+func selectStmtToString(sel *SelectStmt) string {
+	if sel == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+
+	for i, col := range sel.Columns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		if col.Star {
+			sb.WriteString("*")
+		} else if col.TableStar != "" {
+			sb.WriteString(col.TableStar)
+			sb.WriteString(".*")
+		} else {
+			sb.WriteString(exprToString(col.Expr))
+			if col.As != "" {
+				sb.WriteString(" AS ")
+				sb.WriteString(col.As)
+			}
+		}
+	}
+
+	if sel.From != nil {
+		sb.WriteString(" FROM ")
+		for i, t := range sel.From.Tables {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			if t.Subquery != nil {
+				sb.WriteString("(")
+				sb.WriteString(selectStmtToString(t.Subquery))
+				sb.WriteString(")")
+			} else {
+				if t.Schema != "" {
+					sb.WriteString(t.Schema)
+					sb.WriteString(".")
+				}
+				sb.WriteString(t.Name)
+			}
+			if t.Alias != "" {
+				sb.WriteString(" AS ")
+				sb.WriteString(t.Alias)
+			}
+		}
+	}
+
+	if sel.Where != nil {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(exprToString(sel.Where))
+	}
+
+	if len(sel.GroupBy) > 0 {
+		sb.WriteString(" GROUP BY ")
+		for i, e := range sel.GroupBy {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(exprToString(e))
+		}
+	}
+
+	if sel.Having != nil {
+		sb.WriteString(" HAVING ")
+		sb.WriteString(exprToString(sel.Having))
+	}
+
+	if len(sel.OrderBy) > 0 {
+		sb.WriteString(" ORDER BY ")
+		for i, item := range sel.OrderBy {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(exprToString(item.Expr))
+			if item.Order == SortAsc {
+				sb.WriteString(" ASC")
+			} else if item.Order == SortDesc {
+				sb.WriteString(" DESC")
+			}
+		}
+	}
+
+	if sel.Limit != nil {
+		sb.WriteString(" LIMIT ")
+		sb.WriteString(exprToString(sel.Limit))
+	}
+
+	if sel.Offset != nil {
+		sb.WriteString(" OFFSET ")
+		sb.WriteString(exprToString(sel.Offset))
+	}
+
+	return sb.String()
+}

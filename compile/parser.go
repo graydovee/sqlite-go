@@ -1071,13 +1071,7 @@ func (p *Parser) parseCreate() *Statement {
 		return p.parseCreateIndex(false)
 	}
 	if p.isKw(KwView) {
-		// CREATE VIEW - parse minimally
-		p.advance()
-		p.parseQualifiedName() // view name
-		if p.matchKw(KwAs) {
-			p.parseSelectBody()
-		}
-		return &Statement{Type: StmtCreateView}
+		return p.parseCreateView()
 	}
 	if p.isKw(KwVirtual) {
 		// CREATE VIRTUAL TABLE - parse minimally
@@ -1567,10 +1561,7 @@ func (p *Parser) parseDrop() *Statement {
 		return p.parseDropIndex()
 	}
 	if p.isKw(KwView) {
-		p.advance()
-		p.parseIfExists()
-		p.parseQualifiedName()
-		return &Statement{Type: StmtDropView}
+		return p.parseDropView()
 	}
 	if p.isKw(KwTrigger) {
 		p.advance()
@@ -1607,6 +1598,54 @@ func (p *Parser) parseDropIndex() *Statement {
 	return &Statement{
 		Type:     StmtDropIndex,
 		DropIndex: stmt,
+	}
+}
+
+// =============================================================================
+// CREATE VIEW
+// =============================================================================
+
+func (p *Parser) parseCreateView() *Statement {
+	p.advance() // consume VIEW
+	stmt := &CreateViewStmt{}
+
+	// IF NOT EXISTS
+	if p.isKw(KwIf) {
+		p.advance()
+		p.expectKw(KwNot)
+		p.expectKw(KwExists)
+		stmt.IfNotExists = true
+	}
+
+	// View name
+	schema, name := p.parseQualifiedName()
+	stmt.Schema = schema
+	stmt.Name = name
+
+	// AS select-stmt
+	p.expectKw(KwAs)
+	stmt.Select = p.parseSelectBody()
+
+	return &Statement{
+		Type:        StmtCreateView,
+		CreateView:  stmt,
+	}
+}
+
+// =============================================================================
+// DROP VIEW
+// =============================================================================
+
+func (p *Parser) parseDropView() *Statement {
+	p.advance() // consume VIEW
+	stmt := &DropViewStmt{}
+	stmt.IfExists = p.parseIfExists()
+	schema, name := p.parseQualifiedName()
+	stmt.Schema = schema
+	stmt.Name = name
+	return &Statement{
+		Type:     StmtDropView,
+		DropView: stmt,
 	}
 }
 
@@ -2468,6 +2507,10 @@ func (p *Parser) parseWithOrSelect() *Statement {
 	if stmt != nil {
 		stmt.CTEs = ctes
 		stmt.Recursive = recursive
+		if stmt.SelectStmt != nil {
+			stmt.SelectStmt.CTEs = ctes
+			stmt.SelectStmt.Recursive = recursive
+		}
 	}
 	return stmt
 }

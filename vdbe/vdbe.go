@@ -92,6 +92,27 @@ type Deleter interface {
 	Delete(cursor interface{}) error
 }
 
+// Seeker is the interface for cursor seek operations.
+type Seeker interface {
+	Seek(key []byte, op int) (bool, error)
+}
+
+// CookieStore is the interface for database cookie (schema version) operations.
+type CookieStore interface {
+	GetCookie(id int) (int64, error)
+	SetCookie(id int, value int64) error
+}
+
+// BTreeCreator is the interface for creating new B-Tree structures.
+type BTreeCreator interface {
+	CreateBTree(flags int) (int, error)
+}
+
+// BTreeDestroyer is the interface for destroying B-Tree structures.
+type BTreeDestroyer interface {
+	DestroyBTree(rootPage int) error
+}
+
 // Program represents a compiled VDBE program.
 type Program struct {
 	Instructions []Instruction

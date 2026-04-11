@@ -173,6 +173,10 @@ type SelectStmt struct {
 
 	// Window definitions (parsed but not deeply analyzed yet)
 	Windows []*WindowDef
+
+	// CTE (WITH clause) definitions attached to this SELECT
+	CTEs      []*CTEDef
+	Recursive bool
 }
 
 // CompoundOp represents a compound select operator.

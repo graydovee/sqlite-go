@@ -166,6 +166,14 @@ func Compile(stmt *Statement, schema *Schema) (*Program, error) {
 		if err := bld.compileDropIndex(stmt.DropIndex); err != nil {
 			return nil, err
 		}
+	case StmtCreateView:
+		if err := bld.compileCreateView(stmt.CreateView); err != nil {
+			return nil, err
+		}
+	case StmtDropView:
+		if err := bld.compileDropView(stmt.DropView); err != nil {
+			return nil, err
+		}
 	case StmtBegin:
 		bld.compileBegin(stmt.BeginStmt)
 	case StmtCommit:

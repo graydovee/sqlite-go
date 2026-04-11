@@ -27,11 +27,14 @@ const (
 	OpClear
 	OpClose
 	OpCollSeq
+	OpCommit
 	OpColumn
 	OpCompare
 	OpConcat
 	OpCopy
 	OpCreateBTree
+	OpCreateIndex
+	OpCreateTable
 	OpCrossjoin
 	OpDecrJumpZero
 	OpDelete
@@ -125,6 +128,7 @@ const (
 	OpResultRow
 	OpReturn
 	OpRewind
+	OpRollback
 	OpRowCell
 	OpRowData
 	OpRowid
@@ -176,6 +180,7 @@ const (
 	OpVOpen
 	OpVRename
 	OpVUpdate
+	OpWriteCookie
 	OpYield
 )
 
