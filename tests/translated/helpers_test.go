@@ -35,6 +35,20 @@ func queryInt(t *testing.T, db *sqlite.Database, sql string, args ...interface{}
 	return rs.Row().ColumnInt(0)
 }
 
+// queryText executes a query and returns the first column as string.
+func queryText(t *testing.T, db *sqlite.Database, sql string, args ...interface{}) string {
+	t.Helper()
+	rs, err := db.Query(sql, args...)
+	if err != nil {
+		t.Fatalf("Query(%q): %v", sql, err)
+	}
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatalf("Query(%q): no rows", sql)
+	}
+	return rs.Row().ColumnText(0)
+}
+
 // queryFloat executes a query and returns the first column as float64.
 func queryFloat(t *testing.T, db *sqlite.Database, sql string) float64 {
 	t.Helper()

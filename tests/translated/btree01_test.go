@@ -1,4 +1,4 @@
-package translated
+package tests
 
 import (
 	"testing"
@@ -7,29 +7,8 @@ import (
 )
 
 // openTestDB opens an in-memory database for testing.
-func openTestDB(t *testing.T) *sqlite.Database {
-	t.Helper()
-	db, err := sqlite.OpenInMemory()
-	if err != nil {
-		t.Fatalf("OpenInMemory: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return db
-}
 
 // queryText executes a query and returns the first column as string.
-func queryText(t *testing.T, db *sqlite.Database, sql string) string {
-	t.Helper()
-	rs, err := db.Query(sql)
-	if err != nil {
-		t.Fatalf("Query(%q): %v", sql, err)
-	}
-	defer rs.Close()
-	if !rs.Next() {
-		t.Fatalf("Query(%q): no rows", sql)
-	}
-	return rs.Row().ColumnText(0)
-}
 
 // queryInt64 executes a query and returns the first column as int64.
 func queryInt64(t *testing.T, db *sqlite.Database, sql string) int64 {
