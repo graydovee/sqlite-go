@@ -174,12 +174,53 @@ func Compile(stmt *Statement, schema *Schema) (*Program, error) {
 		if err := bld.compileDropView(stmt.DropView); err != nil {
 			return nil, err
 		}
+	case StmtCreateTrigger:
+		if err := bld.compileCreateTrigger(stmt.CreateTrigger); err != nil {
+			return nil, err
+		}
+	case StmtDropTrigger:
+		if err := bld.compileDropTrigger(stmt.DropTrigger); err != nil {
+			return nil, err
+		}
+	case StmtAlterTable:
+		if err := bld.compileAlterTable(stmt.AlterTable); err != nil {
+			return nil, err
+		}
 	case StmtBegin:
 		bld.compileBegin(stmt.BeginStmt)
 	case StmtCommit:
 		bld.compileCommit()
 	case StmtRollback:
 		bld.compileRollback(stmt.RollbackStmt)
+	case StmtSavepoint:
+		bld.compileSavepoint(stmt.SavepointStmt)
+	case StmtRelease:
+		bld.compileRelease(stmt.ReleaseStmt)
+	case StmtPragma:
+		if err := bld.compilePragma(stmt.PragmaStmt); err != nil {
+			return nil, err
+		}
+	case StmtVacuum:
+		bld.compileVacuum(stmt.VacuumStmt)
+	case StmtAttach:
+		bld.compileAttach(stmt.AttachStmt)
+	case StmtDetach:
+		bld.compileDetach(stmt.DetachStmt)
+	case StmtAnalyze:
+		bld.compileAnalyze(stmt.AnalyzeStmt)
+	case StmtReindex:
+		bld.compileReindex(stmt.ReindexStmt)
+	case StmtExplain:
+		// EXPLAIN wraps another statement; the Explain flag is already set.
+		// For now, just return an empty program since EXPLAIN output
+		// is handled at the execution layer.
+		return &Program{
+			Instructions: []vdbe.Instruction{
+				{Op: vdbe.OpInit, P2: 1, Comment: "EXPLAIN"},
+				{Op: vdbe.OpHalt, Comment: "end EXPLAIN"},
+			},
+			NumRegs: 1,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported statement type: %v", stmt.Type)
 	}

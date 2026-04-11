@@ -416,23 +416,13 @@ func (b *Build) compileCoalesce(expr *Expr, targetReg int) error {
 
 	endLabel := b.b.NewLabel()
 	for i, arg := range expr.Args {
-		if i < len(expr.Args)-1 {
-			notNullLabel := b.b.NewLabel()
-			if err := b.compileExpr(arg, targetReg); err != nil {
-				return err
-			}
-			b.b.EmitJump(vdbe.OpNotNull, targetReg, notNullLabel, 0)
-			// Was null, try next argument
-			_ = b.b.NewLabel() // placeholder
-		} else {
-			// Last argument: always use it
-			if err := b.compileExpr(arg, targetReg); err != nil {
-				return err
-			}
+		if err := b.compileExpr(arg, targetReg); err != nil {
+			return err
 		}
-		// For non-last args, after check we go to end
+		// For non-last arguments, check if NOT NULL → done
 		if i < len(expr.Args)-1 {
-			// The notNullLabel check needs restructuring
+			b.b.EmitJump(vdbe.OpNotNull, targetReg, endLabel, 0)
+			// Was null, continue to next argument
 		}
 	}
 	b.b.DefineLabel(endLabel)

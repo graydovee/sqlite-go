@@ -55,9 +55,16 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 	var sorterCursor int
 	if needSorter {
 		sorterCursor = b.b.AllocCursor()
-		// Sorter columns = result columns + ORDER BY sort key
 		nSortCols := nResult
 		b.emitSorterOpen(sorterCursor, nSortCols)
+	}
+
+	// DISTINCT: use ephemeral table for deduplication
+	needDistinct := stmt.Distinct
+	var distinctCursor int
+	if needDistinct && !needSorter {
+		distinctCursor = b.b.AllocCursor()
+		b.emitOpenEphemeral(distinctCursor, nResult)
 	}
 
 	// Allocate result registers
@@ -105,9 +112,17 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 
 		// If we have a sorter, now sort and output
 		if needSorter {
-			if err := b.emitSortedOutput(sorterCursor, nResult); err != nil {
-				return err
+			if needDistinct {
+				if err := b.emitSortedDistinctOutput(sorterCursor, nResult); err != nil {
+					return err
+				}
+			} else {
+				if err := b.emitSortedOutput(sorterCursor, nResult); err != nil {
+					return err
+				}
 			}
+		} else if needDistinct {
+			b.emitClose(distinctCursor)
 		}
 	}
 
@@ -573,6 +588,17 @@ func (b *Build) emitSingleTableLoop(stmt *SelectStmt, resultBase int, resultCols
 	return nil
 }
 
+// emitDistinctCheck emits a deduplication check using an ephemeral table.
+// If the row already exists, jumps to skipLabel. Otherwise inserts and continues.
+func (b *Build) emitDistinctCheck(distinctCursor, resultBase, nResult int, skipLabel int) {
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(resultBase, nResult, recReg)
+	// If found, skip this row (it's a duplicate)
+	b.b.EmitJump(vdbe.OpFound, distinctCursor, skipLabel, recReg)
+	// Not found: insert into dedup table and continue
+	b.emitIdxInsert(distinctCursor, recReg)
+}
+
 // emitNestedLoopJoin emits nested loop join code.
 func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
 	needSorter bool, sorterCursor, orderByBase int, emptyLabel, loopEndLabel int) error {
@@ -665,6 +691,36 @@ func (b *Build) emitSortedOutput(sorterCursor, nResult int) error {
 	b.emitResultRow(dataReg, nResult)
 	b.emitSorterNext(sorterCursor, sortBody)
 	b.b.DefineLabel(sortEmpty)
+	return nil
+}
+
+// emitSortedDistinctOutput reads from a sorter and emits ResultRow, deduplicating.
+func (b *Build) emitSortedDistinctOutput(sorterCursor, nResult int) error {
+	sortEmpty := b.b.NewLabel()
+	sortBody := b.emitSorterSort(sorterCursor, sortEmpty)
+
+	// Open ephemeral table for dedup
+	distinctCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(distinctCursor, nResult)
+
+	loopEnd := b.b.NewLabel()
+	dataReg := b.b.AllocReg(nResult)
+
+	// Read row from sorter
+	b.emitColumn(sorterCursor, 0, dataReg)
+
+	// Dedup check
+	skipLabel := b.b.NewLabel()
+	b.emitDistinctCheck(distinctCursor, dataReg, nResult, skipLabel)
+	b.emitResultRow(dataReg, nResult)
+
+	b.b.DefineLabel(skipLabel)
+	b.emitSorterNext(sorterCursor, sortBody)
+	b.b.DefineLabel(loopEnd)
+	b.b.DefineLabel(sortEmpty)
+
+	b.emitClose(distinctCursor)
+	b.emitClose(sorterCursor)
 	return nil
 }
 

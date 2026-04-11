@@ -34,6 +34,13 @@ func (b *Build) compileUpdate(stmt *UpdateStmt) error {
 	// Open indexes for updating
 	indexCursors := b.openTableIndexes(tbl, true)
 
+	// Handle FROM clause (UPDATE ... FROM ...) - open additional tables
+	if stmt.From != nil {
+		if err := b.openFromTables(stmt.From, false); err != nil {
+			return err
+		}
+	}
+
 	nCols := len(tbl.Columns)
 
 	// Allocate registers for old values, new values, and rowid
@@ -41,6 +48,17 @@ func (b *Build) compileUpdate(stmt *UpdateStmt) error {
 	newBase := b.b.AllocReg(nCols)
 	rowidReg := b.b.AllocReg(1)
 	recReg := b.b.AllocReg(1)
+
+	// Handle RETURNING columns
+	var returningCols []*resultColumn
+	var returningBase int
+	if len(stmt.Returning) > 0 {
+		returningCols, err = b.expandResultColumns(stmt.Returning)
+		if err != nil {
+			return err
+		}
+		returningBase = b.b.AllocReg(len(returningCols))
+	}
 
 	// Determine which columns are being updated
 	updateCols := make([]bool, nCols)
@@ -88,14 +106,11 @@ func (b *Build) compileUpdate(stmt *UpdateStmt) error {
 			}
 		} else {
 			// Tuple SET: (a, b) = expr
-			// For now, assume the expr is a subquery or row value
 			for i, colName := range set.Columns {
 				idx := findColumnIndex(tbl, colName)
 				if idx < 0 {
 					return fmt.Errorf("no such column: %s", colName)
 				}
-				// This is simplified; proper tuple support would require
-				// expanding the RHS expression
 				_ = i
 				if err := b.compileExpr(set.Value, newBase+idx); err != nil {
 					return err
@@ -122,6 +137,17 @@ func (b *Build) compileUpdate(stmt *UpdateStmt) error {
 
 	// Insert new index entries
 	b.updateIndexes(indexCursors, newBase, nCols, rowidReg)
+
+	// Emit RETURNING after update
+	if len(stmt.Returning) > 0 {
+		// Use newBase for the updated values
+		for i, rc := range returningCols {
+			if err := b.compileExpr(rc.Expr, returningBase+i); err != nil {
+				return err
+			}
+		}
+		b.emitResultRow(returningBase, len(returningCols))
+	}
 
 	b.emitNext(cursor, loopBody)
 	b.b.DefineLabel(loopEndLabel)

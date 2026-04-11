@@ -118,22 +118,33 @@ type Statement struct {
 	Location string // file or context info (optional)
 
 	// Exactly one of the following will be set based on Type.
-	SelectStmt     *SelectStmt
-	InsertStmt     *InsertStmt
-	UpdateStmt     *UpdateStmt
-	DeleteStmt     *DeleteStmt
-	CreateTable    *CreateTableStmt
-	CreateIndex    *CreateIndexStmt
-	CreateView     *CreateViewStmt
-	DropTable      *DropTableStmt
-	DropIndex      *DropIndexStmt
-	DropView       *DropViewStmt
-	BeginStmt      *BeginStmt
-	CommitStmt     *CommitStmt
-	RollbackStmt   *RollbackStmt
-	Explain        bool   // true if EXPLAIN prefix
-	ExplainQuery   bool   // true if EXPLAIN QUERY PLAN
-	RawSQL         string // Original SQL text for the statement
+	SelectStmt      *SelectStmt
+	InsertStmt      *InsertStmt
+	UpdateStmt      *UpdateStmt
+	DeleteStmt      *DeleteStmt
+	CreateTable     *CreateTableStmt
+	CreateIndex     *CreateIndexStmt
+	CreateView      *CreateViewStmt
+	CreateTrigger   *CreateTriggerStmt
+	DropTable       *DropTableStmt
+	DropIndex       *DropIndexStmt
+	DropView        *DropViewStmt
+	DropTrigger     *DropTriggerStmt
+	AlterTable      *AlterTableStmt
+	BeginStmt       *BeginStmt
+	CommitStmt      *CommitStmt
+	RollbackStmt    *RollbackStmt
+	SavepointStmt   *SavepointStmt
+	ReleaseStmt     *ReleaseStmt
+	PragmaStmt      *PragmaStmt
+	VacuumStmt      *VacuumStmt
+	AttachStmt      *AttachStmt
+	DetachStmt      *DetachStmt
+	AnalyzeStmt     *AnalyzeStmt
+	ReindexStmt     *ReindexStmt
+	Explain         bool   // true if EXPLAIN prefix
+	ExplainQuery    bool   // true if EXPLAIN QUERY PLAN
+	RawSQL          string // Original SQL text for the statement
 
 	// CTE (WITH clause) definitions
 	CTEs      []*CTEDef
@@ -518,4 +529,143 @@ type DropViewStmt struct {
 	IfExists bool   // IF EXISTS
 	Schema   string // Schema name
 	Name     string // View name
+}
+
+// =============================================================================
+// CREATE TRIGGER / DROP TRIGGER
+// =============================================================================
+
+// TriggerTime specifies when a trigger fires.
+type TriggerTime int
+
+const (
+	TriggerBefore TriggerTime = iota
+	TriggerAfter
+	TriggerInstead
+)
+
+// TriggerEvent specifies what database event fires the trigger.
+type TriggerEvent int
+
+const (
+	TriggerDelete TriggerEvent = iota
+	TriggerInsert
+	TriggerUpdate
+)
+
+// CreateTriggerStmt represents a CREATE TRIGGER statement.
+type CreateTriggerStmt struct {
+	IfNotExists bool         // IF NOT EXISTS
+	Schema      string       // Schema name
+	Name        string       // Trigger name
+	Time        TriggerTime  // BEFORE, AFTER, or INSTEAD OF
+	Event       TriggerEvent // DELETE, INSERT, or UPDATE
+	Table       string       // Table name
+	When        *Expr        // WHEN condition (nil if none)
+	Columns     []string     // UPDATE OF columns (nil unless UPDATE OF)
+	ForEachRow  bool         // true for FOR EACH ROW
+	Body        []string     // Trigger body SQL statements
+}
+
+// DropTriggerStmt represents a DROP TRIGGER statement.
+type DropTriggerStmt struct {
+	IfExists bool   // IF EXISTS
+	Schema   string // Schema name
+	Name     string // Trigger name
+}
+
+// =============================================================================
+// ALTER TABLE
+// =============================================================================
+
+// AlterType identifies the type of ALTER TABLE operation.
+type AlterType int
+
+const (
+	AlterAddColumn    AlterType = iota
+	AlterRenameColumn           // RENAME COLUMN old TO new
+	AlterDropColumn
+	AlterRenameTable            // RENAME TO new_name
+)
+
+// AlterTableStmt represents an ALTER TABLE statement.
+type AlterTableStmt struct {
+	Schema  string     // Schema name
+	Table   string     // Table name
+	Type    AlterType  // What kind of alteration
+	Column  *ColumnDef // Column definition (for ADD COLUMN)
+	OldName string     // Old column name (for RENAME COLUMN)
+	NewName string     // New name (for RENAME COLUMN/TO)
+}
+
+// =============================================================================
+// SAVEPOINT / RELEASE
+// =============================================================================
+
+// SavepointStmt represents a SAVEPOINT statement.
+type SavepointStmt struct {
+	Name string // Savepoint name
+}
+
+// ReleaseStmt represents a RELEASE statement.
+type ReleaseStmt struct {
+	Name string // Savepoint name
+}
+
+// =============================================================================
+// PRAGMA
+// =============================================================================
+
+// PragmaStmt represents a PRAGMA statement.
+type PragmaStmt struct {
+	Schema string // Schema name (e.g., "main")
+	Name   string // Pragma name
+	Value  *Expr  // Value to set (nil for reading)
+}
+
+// =============================================================================
+// VACUUM
+// =============================================================================
+
+// VacuumStmt represents a VACUUM statement.
+type VacuumStmt struct {
+	Schema string // Optional schema name
+	Into   string // Optional INTO filename
+}
+
+// =============================================================================
+// ATTACH / DETACH
+// =============================================================================
+
+// AttachStmt represents an ATTACH DATABASE statement.
+type AttachStmt struct {
+	File   string // Database file path
+	Schema string // Schema alias name
+	Key    string // Optional encryption key
+}
+
+// DetachStmt represents a DETACH DATABASE statement.
+type DetachStmt struct {
+	Schema string // Schema alias name
+}
+
+// =============================================================================
+// ANALYZE
+// =============================================================================
+
+// AnalyzeStmt represents an ANALYZE statement.
+type AnalyzeStmt struct {
+	Schema string   // Schema name (optional)
+	Table  string   // Table name (optional)
+	Index  string   // Index name (optional)
+}
+
+// =============================================================================
+// REINDEX
+// =============================================================================
+
+// ReindexStmt represents a REINDEX statement.
+type ReindexStmt struct {
+	Schema string // Schema name (optional)
+	Table  string // Table or index name (optional)
 }

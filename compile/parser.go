@@ -261,12 +261,30 @@ func (p *Parser) parseStatement() *Statement {
 			return p.parseCreate()
 		case "drop":
 			return p.parseDrop()
+		case "alter":
+			return p.parseAlterTable()
 		case "begin":
 			return p.parseBegin()
 		case "commit", "end":
 			return p.parseCommit()
 		case "rollback":
 			return p.parseRollback()
+		case "savepoint":
+			return p.parseSavepoint()
+		case "release":
+			return p.parseRelease()
+		case "pragma":
+			return p.parsePragma()
+		case "vacuum":
+			return p.parseVacuum()
+		case "attach":
+			return p.parseAttach()
+		case "detach":
+			return p.parseDetach()
+		case "analyze":
+			return p.parseAnalyze()
+		case "reindex":
+			return p.parseReindex()
 		case "with":
 			return p.parseWithOrSelect()
 		case "explain":
@@ -1085,12 +1103,7 @@ func (p *Parser) parseCreate() *Statement {
 		return &Statement{Type: StmtCreateTable}
 	}
 	if p.isKw(KwTrigger) {
-		// CREATE TRIGGER - parse minimally
-		p.advance()
-		for !p.atEnd() && p.peek().Type != TokenSemi {
-			p.advance()
-		}
-		return &Statement{Type: StmtCreateTrigger}
+		return p.parseCreateTrigger()
 	}
 
 	p.errorf("expected TABLE, INDEX, UNIQUE, VIEW, TRIGGER, or VIRTUAL after CREATE")
@@ -1564,11 +1577,7 @@ func (p *Parser) parseDrop() *Statement {
 		return p.parseDropView()
 	}
 	if p.isKw(KwTrigger) {
-		p.advance()
-		ifExists := p.parseIfExists()
-		p.parseQualifiedName()
-		_ = ifExists
-		return &Statement{Type: StmtDropTrigger}
+		return p.parseDropTrigger()
 	}
 
 	p.errorf("expected TABLE, INDEX, VIEW, or TRIGGER after DROP")
@@ -1649,6 +1658,102 @@ func (p *Parser) parseDropView() *Statement {
 	}
 }
 
+// =============================================================================
+// CREATE TRIGGER / DROP TRIGGER
+// =============================================================================
+
+func (p *Parser) parseCreateTrigger() *Statement {
+	p.expectKw(KwTrigger)
+	stmt := &CreateTriggerStmt{}
+
+	// IF NOT EXISTS
+	if p.isKw(KwIf) {
+		p.advance()
+		p.expectKw(KwNot)
+		p.expectKw(KwExists)
+		stmt.IfNotExists = true
+	}
+
+	// Optional schema
+	schema, name := p.parseQualifiedName()
+	stmt.Schema = schema
+	stmt.Name = name
+
+	// BEFORE / AFTER / INSTEAD OF
+	if p.isKw(KwBefore) {
+		p.advance()
+		stmt.Time = TriggerBefore
+	} else if p.isKw(KwAfter) {
+		p.advance()
+		stmt.Time = TriggerAfter
+	} else if p.isKw(KwInstead) {
+		p.advance()
+		p.expectKw(KwOf)
+		stmt.Time = TriggerInstead
+	}
+
+	// DELETE / INSERT / UPDATE [OF]
+	if p.isKw(KwDelete) {
+		p.advance()
+		stmt.Event = TriggerDelete
+	} else if p.isKw(KwInsert) {
+		p.advance()
+		stmt.Event = TriggerInsert
+	} else if p.isKw(KwUpdate) {
+		p.advance()
+		stmt.Event = TriggerUpdate
+		if p.matchKw(KwOf) {
+			stmt.Columns = p.parseIdentList()
+		}
+	}
+
+	// ON table
+	p.expectKw(KwOn)
+	stmt.Table = p.parseName()
+
+	// FOR EACH ROW
+	if p.isKw(KwFor) {
+		p.advance()
+		p.matchKw(KwEach)
+		p.matchKw(KwRow)
+		stmt.ForEachRow = true
+	}
+
+	// WHEN condition
+	if p.isKw(KwWhen) {
+		p.advance()
+		stmt.When = p.parseExpr()
+	}
+
+	// BEGIN ... END body - collect body SQL
+	p.expectKw(KwBegin)
+	var bodyStmts []string
+	for !p.atEnd() && !p.isKw(KwEnd) {
+		tok := p.advance()
+		bodyStmts = append(bodyStmts, tok.Value)
+	}
+	stmt.Body = bodyStmts
+	p.matchKw(KwEnd)
+
+	return &Statement{
+		Type:          StmtCreateTrigger,
+		CreateTrigger: stmt,
+	}
+}
+
+func (p *Parser) parseDropTrigger() *Statement {
+	p.advance() // consume TRIGGER
+	stmt := &DropTriggerStmt{}
+	stmt.IfExists = p.parseIfExists()
+	schema, name := p.parseQualifiedName()
+	stmt.Schema = schema
+	stmt.Name = name
+	return &Statement{
+		Type:        StmtDropTrigger,
+		DropTrigger: stmt,
+	}
+}
+
 func (p *Parser) parseIfExists() bool {
 	if p.isKw(KwIf) {
 		p.advance()
@@ -1710,6 +1815,250 @@ func (p *Parser) parseRollback() *Statement {
 	return &Statement{
 		Type:         StmtRollback,
 		RollbackStmt: stmt,
+	}
+}
+
+// =============================================================================
+// SAVEPOINT / RELEASE
+// =============================================================================
+
+func (p *Parser) parseSavepoint() *Statement {
+	p.expectKw(KwSavepoint)
+	name := p.parseName()
+	return &Statement{
+		Type:          StmtSavepoint,
+		SavepointStmt: &SavepointStmt{Name: name},
+	}
+}
+
+func (p *Parser) parseRelease() *Statement {
+	p.expectKw(KwRelease)
+	p.matchKw(KwSavepoint) // optional SAVEPOINT keyword
+	name := p.parseName()
+	return &Statement{
+		Type:        StmtRelease,
+		ReleaseStmt: &ReleaseStmt{Name: name},
+	}
+}
+
+// =============================================================================
+// PRAGMA
+// =============================================================================
+
+func (p *Parser) parsePragma() *Statement {
+	p.expectKw(KwPragma)
+	stmt := &PragmaStmt{}
+
+	// Optional schema name
+	if p.peek().Type == TokenDot {
+		// No schema, just pragma name
+	} else if p.peek().Type == TokenID || p.peek().Type == TokenKeyword {
+		saved := p.pos
+		name := p.parseName()
+		if p.peek().Type == TokenDot {
+			p.advance()
+			stmt.Schema = name
+		} else {
+			p.pos = saved
+		}
+	}
+
+	stmt.Name = p.parseName()
+
+	// Check for = value or (value)
+	if p.peek().Type == TokenEq {
+		p.advance()
+		stmt.Value = p.parseExpr()
+	} else if p.peek().Type == TokenLParen {
+		p.advance()
+		stmt.Value = p.parseExpr()
+		p.expectType(TokenRParen)
+	}
+
+	return &Statement{
+		Type:       StmtPragma,
+		PragmaStmt: stmt,
+	}
+}
+
+// =============================================================================
+// VACUUM
+// =============================================================================
+
+func (p *Parser) parseVacuum() *Statement {
+	p.expectKw(KwVacuum)
+	stmt := &VacuumStmt{}
+
+	// Optional schema name
+	if !p.atEnd() && p.peek().Type != TokenSemi && !p.isKw(KwInto) {
+		stmt.Schema = p.parseName()
+	}
+
+	// Optional INTO filename
+	if p.matchKw(KwInto) {
+		stmt.Into = p.parseName()
+	}
+
+	return &Statement{
+		Type:       StmtVacuum,
+		VacuumStmt: stmt,
+	}
+}
+
+// =============================================================================
+// ATTACH / DETACH
+// =============================================================================
+
+func (p *Parser) parseAttach() *Statement {
+	p.expectKw(KwAttach)
+	p.matchKw(KwDatabase) // optional DATABASE keyword
+	stmt := &AttachStmt{}
+
+	// File path (as string literal or identifier)
+	if p.peek().Type == TokenString {
+		stmt.File = stripQuotes(p.advance().Value)
+	} else {
+		stmt.File = p.parseName()
+	}
+
+	p.expectKw(KwAs)
+
+	// Schema alias
+	stmt.Schema = p.parseName()
+
+	// Optional KEY
+	if p.matchKw(KwKey) {
+		if p.peek().Type == TokenString {
+			stmt.Key = stripQuotes(p.advance().Value)
+		} else {
+			stmt.Key = p.parseName()
+		}
+	}
+
+	return &Statement{
+		Type:       StmtAttach,
+		AttachStmt: stmt,
+	}
+}
+
+func (p *Parser) parseDetach() *Statement {
+	p.expectKw(KwDetach)
+	p.matchKw(KwDatabase) // optional DATABASE keyword
+	name := p.parseName()
+
+	return &Statement{
+		Type:       StmtDetach,
+		DetachStmt: &DetachStmt{Schema: name},
+	}
+}
+
+// =============================================================================
+// ANALYZE
+// =============================================================================
+
+func (p *Parser) parseAnalyze() *Statement {
+	p.expectKw(KwAnalyze)
+	stmt := &AnalyzeStmt{}
+
+	if !p.atEnd() && p.peek().Type != TokenSemi {
+		name := p.parseName()
+		if p.peek().Type == TokenDot {
+			p.advance()
+			stmt.Schema = name
+			if !p.atEnd() && p.peek().Type != TokenSemi {
+				stmt.Table = p.parseName()
+			}
+		} else {
+			stmt.Table = name
+		}
+	}
+
+	return &Statement{
+		Type:        StmtAnalyze,
+		AnalyzeStmt: stmt,
+	}
+}
+
+// =============================================================================
+// REINDEX
+// =============================================================================
+
+func (p *Parser) parseReindex() *Statement {
+	p.expectKw(KwReindex)
+	stmt := &ReindexStmt{}
+
+	if !p.atEnd() && p.peek().Type != TokenSemi {
+		name := p.parseName()
+		if p.peek().Type == TokenDot {
+			p.advance()
+			stmt.Schema = name
+			if !p.atEnd() && p.peek().Type != TokenSemi {
+				stmt.Table = p.parseName()
+			}
+		} else {
+			stmt.Table = name
+		}
+	}
+
+	return &Statement{
+		Type:        StmtReindex,
+		ReindexStmt: stmt,
+	}
+}
+
+// =============================================================================
+// ALTER TABLE
+// =============================================================================
+
+func (p *Parser) parseAlterTable() *Statement {
+	p.expectKw(KwAlter)
+	p.expectKw(KwTable)
+
+	stmt := &AlterTableStmt{}
+
+	// Parse qualified table name: [schema.]table
+	schema, name := p.parseQualifiedName()
+	stmt.Schema = schema
+	stmt.Table = name
+
+	if p.isKw(KwAdd) {
+		p.advance()
+		p.matchKw(KwColumn) // optional COLUMN keyword
+		stmt.Type = AlterAddColumn
+		stmt.Column = p.parseColumnDef()
+	} else if p.isKw(KwRename) {
+		p.advance()
+		if p.isKw(KwColumn) {
+			p.advance()
+			stmt.Type = AlterRenameColumn
+			stmt.OldName = p.parseName()
+			p.expectKw(KwTo)
+			stmt.NewName = p.parseName()
+		} else if p.isKw(KwTo) {
+			// ALTER TABLE x RENAME TO new_name
+			p.advance()
+			stmt.Type = AlterRenameTable
+			stmt.NewName = p.parseName()
+		} else {
+			// RENAME column_name TO new_name
+			stmt.Type = AlterRenameColumn
+			stmt.OldName = p.parseName()
+			p.expectKw(KwTo)
+			stmt.NewName = p.parseName()
+		}
+	} else if p.isKw(KwDrop) {
+		p.advance()
+		p.matchKw(KwColumn) // optional COLUMN keyword
+		stmt.Type = AlterDropColumn
+		stmt.OldName = p.parseName()
+	} else {
+		p.errorf("expected ADD, RENAME, or DROP after ALTER TABLE")
+		return nil
+	}
+
+	return &Statement{
+		Type:       StmtAlterTable,
+		AlterTable: stmt,
 	}
 }
 

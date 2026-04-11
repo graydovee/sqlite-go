@@ -64,6 +64,18 @@ func (b *Build) compileInsertValues(cursor int, tbl *TableInfo, indexCursors []i
 	rowidReg := b.b.AllocReg(1)
 	recReg := b.b.AllocReg(1)
 
+	// Handle RETURNING
+	var returningCols []*resultColumn
+	var returningBase int
+	if len(stmt.Returning) > 0 {
+		var err error
+		returningCols, err = b.expandResultColumns(stmt.Returning)
+		if err != nil {
+			return err
+		}
+		returningBase = b.b.AllocReg(len(returningCols))
+	}
+
 	for _, row := range stmt.Values {
 		// Generate a new rowid
 		b.emitNewRowid(cursor, rowidReg)
@@ -108,6 +120,16 @@ func (b *Build) compileInsertValues(cursor int, tbl *TableInfo, indexCursors []i
 
 		// Update indexes
 		b.updateIndexes(indexCursors, valueBase, nCols, rowidReg)
+
+		// Emit RETURNING
+		if len(stmt.Returning) > 0 {
+			for i, rc := range returningCols {
+				if err := b.compileExpr(rc.Expr, returningBase+i); err != nil {
+					return err
+				}
+			}
+			b.emitResultRow(returningBase, len(returningCols))
+		}
 	}
 
 	b.emitClose(cursor)

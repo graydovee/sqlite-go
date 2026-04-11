@@ -38,65 +38,71 @@ func (b *Build) compileDelete(stmt *DeleteStmt) error {
 	valueBase := b.b.AllocReg(nCols)
 	rowidReg := b.b.AllocReg(1)
 
-	if stmt.Where != nil {
-		// DELETE with WHERE: scan and delete matching rows
-		emptyLabel := b.b.NewLabel()
-		loopEndLabel := b.b.NewLabel()
-		loopBody := b.b.NewLabel()
-
-		b.b.EmitJump(vdbe.OpRewind, cursor, emptyLabel, 0)
-		b.b.DefineLabel(loopBody)
-
-		// Read the current rowid
-		b.emitRowid(cursor, rowidReg)
-
-		// Read current column values for index key building
-		for i := 0; i < nCols; i++ {
-			b.emitColumn(cursor, i, valueBase+i)
+	// Handle RETURNING columns
+	var returningCols []*resultColumn
+	var returningBase int
+	if len(stmt.Returning) > 0 {
+		returningCols, err = b.expandResultColumns(stmt.Returning)
+		if err != nil {
+			return err
 		}
+		returningBase = b.b.AllocReg(len(returningCols))
+	}
 
+	emptyLabel := b.b.NewLabel()
+	loopEndLabel := b.b.NewLabel()
+	loopBody := b.b.NewLabel()
+
+	b.b.EmitJump(vdbe.OpRewind, cursor, emptyLabel, 0)
+	b.b.DefineLabel(loopBody)
+
+	// Read the current rowid
+	b.emitRowid(cursor, rowidReg)
+
+	// Read current column values for index key building
+	for i := 0; i < nCols; i++ {
+		b.emitColumn(cursor, i, valueBase+i)
+	}
+
+	if stmt.Where != nil {
 		// Evaluate WHERE condition
 		skipDelete := b.b.NewLabel()
 		if err := b.compileCondition(stmt.Where, skipDelete, loopEndLabel, true); err != nil {
 			return err
 		}
 		b.b.DefineLabel(skipDelete)
-
-		// Delete from indexes
-		b.deleteFromIndexes(indexCursors, valueBase, nCols, rowidReg)
-
-		// Delete from the main table
-		b.emitDelete(cursor)
-
-		b.emitNext(cursor, loopBody)
-		b.b.DefineLabel(loopEndLabel)
-		b.b.DefineLabel(emptyLabel)
-	} else {
-		// DELETE without WHERE: delete all rows (truncate-like)
-		emptyLabel := b.b.NewLabel()
-		loopEndLabel := b.b.NewLabel()
-		loopBody := b.b.NewLabel()
-
-		b.b.EmitJump(vdbe.OpRewind, cursor, emptyLabel, 0)
-		b.b.DefineLabel(loopBody)
-
-		b.emitRowid(cursor, rowidReg)
-
-		// Read current columns for index cleanup
-		for i := 0; i < nCols; i++ {
-			b.emitColumn(cursor, i, valueBase+i)
-		}
-
-		// Delete from indexes
-		b.deleteFromIndexes(indexCursors, valueBase, nCols, rowidReg)
-
-		// Delete from the main table
-		b.emitDelete(cursor)
-
-		b.emitNext(cursor, loopBody)
-		b.b.DefineLabel(loopEndLabel)
-		b.b.DefineLabel(emptyLabel)
 	}
+
+	// Emit RETURNING before deleting (so we can still read the row)
+	if len(stmt.Returning) > 0 {
+		for i, rc := range returningCols {
+			if err := b.compileExpr(rc.Expr, returningBase+i); err != nil {
+				return err
+			}
+		}
+		b.emitResultRow(returningBase, len(returningCols))
+	}
+
+	// Delete from indexes
+	b.deleteFromIndexes(indexCursors, valueBase, nCols, rowidReg)
+
+	// Delete from the main table
+	b.emitDelete(cursor)
+
+	// Handle ORDER BY + LIMIT for DELETE (SQLite extension)
+	// For ORDER BY + LIMIT, we need a counter
+	if stmt.Limit != nil {
+		limitReg := b.b.AllocReg(1)
+		if err := b.compileExpr(stmt.Limit, limitReg); err != nil {
+			return err
+		}
+		b.b.EmitJump(vdbe.OpIfPos, limitReg, loopBody, 0)
+	} else {
+		b.emitNext(cursor, loopBody)
+	}
+
+	b.b.DefineLabel(loopEndLabel)
+	b.b.DefineLabel(emptyLabel)
 
 	// Close cursors
 	b.emitClose(cursor)
