@@ -712,6 +712,13 @@ func (b *BTreeImpl) insertDividerIntoParent(parentPage PageNumber, childIdx int,
 	binary.BigEndian.PutUint16(page.Data[off+5:off+7], uint16(newContentStart))
 	if childIdx >= numCells {
 		binary.BigEndian.PutUint32(page.Data[off+8:off+12], uint32(rightChild))
+	} else {
+		// The cell that was at childIdx is now at childIdx+1 (shifted right).
+		// Its leftChild still points to the old child; update it to the sibling.
+		nextPtr := int(binary.BigEndian.Uint16(page.Data[hsInt+(childIdx+1)*2 : hsInt+(childIdx+1)*2+2]))
+		if nextPtr > 0 && nextPtr+4 <= len(page.Data) {
+			binary.BigEndian.PutUint32(page.Data[nextPtr:nextPtr+4], uint32(rightChild))
+		}
 	}
 
 	b.pgr.MarkDirty(page)
@@ -742,6 +749,15 @@ func (b *BTreeImpl) splitInteriorPage(parentPage PageNumber, newChildIdx int, ne
 		allCells[newChildIdx] = newDividerCell
 	} else {
 		allCells = append(allCells, newDividerCell)
+	}
+
+	// The cell that was at newChildIdx is now at newChildIdx+1 (shifted right).
+	// Its leftChild still points to the old child page; update it to the sibling.
+	if newChildIdx < len(allCells)-1 {
+		oldCell := allCells[newChildIdx+1]
+		if len(oldCell) >= 4 {
+			binary.BigEndian.PutUint32(oldCell[0:4], uint32(newRightChild))
+		}
 	}
 
 	mid := b.findSplitPoint(allCells, PageTypeInteriorTable)

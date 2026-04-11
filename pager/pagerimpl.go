@@ -131,7 +131,14 @@ func (p *PagerImpl) Open() error {
 				p.pageSize = ps
 				p.cache = NewPCache(p.pageSize, p.cacheSize)
 			}
-			p.pageCount = int(size / int64(p.pageSize))
+			// Use page count from header (offset 28-31) when available,
+			// fall back to file-size calculation.
+			hdrPageCount := int(binary.BigEndian.Uint32(hdr[28:32]))
+			if hdrPageCount > 0 {
+				p.pageCount = hdrPageCount
+			} else {
+				p.pageCount = int(size / int64(p.pageSize))
+			}
 			p.changeCount = binary.BigEndian.Uint32(hdr[24:28])
 		} else {
 			p.pageCount = int(size / int64(p.pageSize))

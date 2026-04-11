@@ -527,7 +527,7 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
 			pos++ // skip (
 			for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
-				val, err := parseExprValue(tokens, &pos, args, &bindIdx)
+				val, err := parseInsertExprValue(tokens, &pos, args, &bindIdx)
 				if err != nil {
 					return err
 				}
@@ -711,13 +711,13 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 	// SET clause
 	expectKeyword(tokens, &pos, "set")
 
+
 	// Parse SET col = expr, ...
 	type setPair struct {
-		col   string
-		value interface{}
+		col      string
+		exprStr  string
 	}
 	var sets []setPair
-	bindIdx := 0
 	for pos < len(tokens) {
 		if isKeyword(tokens[pos], "where") {
 			break
@@ -727,17 +727,24 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenEq {
 			pos++
 		}
-		val, err := parseExprValue(tokens, &pos, args, &bindIdx)
-		if err != nil {
-			return err
+		// Collect expression tokens until comma or WHERE
+		var exprParts []string
+		for pos < len(tokens) && tokens[pos].Type != compile.TokenComma && !isKeyword(tokens[pos], "where") {
+			exprParts = append(exprParts, tokens[pos].Value)
+			pos++
 		}
-		sets = append(sets, setPair{col: colName, value: val})
+		sets = append(sets, setPair{col: colName, exprStr: strings.Join(exprParts, " ")})
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
 			pos++
 		}
 	}
 
-	// For now, update all rows (no WHERE support)
+	// Build column name list
+	colNames := make([]string, len(tbl.columns))
+	for i, col := range tbl.columns {
+		colNames[i] = col.name
+	}
+
 	// Collect all rows first, then apply updates to avoid cursor invalidation
 	type updateEntry struct {
 		rowid   int64
@@ -767,12 +774,13 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 			return err
 		}
 
-		// Apply sets
+		// Apply sets with per-row expression evaluation
 		for _, s := range sets {
+			evalVal := evalExprWithRow(s.exprStr, args, colNames, values)
 			for i, col := range tbl.columns {
 				if strings.EqualFold(col.name, s.col) {
 					if i < len(values) {
-						values[i] = interfaceToValue(s.value)
+						values[i] = memToValue(evalVal)
 					}
 				}
 			}
@@ -792,23 +800,23 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 	}
 
-	// Now apply all updates
-	var count int64
-	for _, upd := range updates {
-		keyBuf := make([]byte, 9)
-		keyLen := encodeVarintKey(keyBuf, upd.rowid)
 
-		if err := db.bt.Insert(cursor, keyBuf[:keyLen], upd.newData, btree.RowID(upd.rowid), btree.SeekFound); err != nil {
-			return err
+		// Now apply all updates
+		var count int64
+		for _, upd := range updates {
+			keyBuf := make([]byte, 9)
+			keyLen := encodeVarintKey(keyBuf, upd.rowid)
+
+			if err := db.bt.Insert(cursor, keyBuf[:keyLen], upd.newData, btree.RowID(upd.rowid), btree.SeekFound); err != nil {
+				return err
+			}
+			count++
 		}
-		count++
+
+		db.changes = count
+		db.totalChanges += count
+		return nil
 	}
-
-	db.changes = count
-	db.totalChanges += count
-	return nil
-}
-
 // querySingle executes a SELECT and collects results.
 func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, error) {
 	tokens := compile.Tokenize(sql)
@@ -825,7 +833,9 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	pos := 1 // skip SELECT
 
 	// Check DISTINCT
+	distinct := false
 	if pos < len(filtered) && isKeyword(filtered[pos], "distinct") {
+		distinct = true
 		pos++
 	}
 
@@ -845,8 +855,9 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		}
 
 		var exprParts []string
+			parenDepth := 0
 		for pos < len(filtered) &&
-			filtered[pos].Type != compile.TokenComma &&
+			(filtered[pos].Type != compile.TokenComma || parenDepth > 0) &&
 			!isKeyword(filtered[pos], "from") &&
 			!isKeyword(filtered[pos], "where") &&
 			!isKeyword(filtered[pos], "limit") &&
@@ -863,6 +874,12 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 					exprParts = nil
 				}
 				break
+			}
+			if filtered[pos].Type == compile.TokenLParen {
+				parenDepth++
+			}
+			if filtered[pos].Type == compile.TokenRParen {
+				parenDepth--
 			}
 			exprParts = append(exprParts, filtered[pos].Value)
 			pos++
@@ -892,18 +909,28 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		return nil, NewErrorf(Error, "no such table: %s", tableName)
 	}
 
+	// Parse WHERE clause
+	var whereExpr string
+	if pos < len(filtered) && isKeyword(filtered[pos], "where") {
+		pos++
+		var whereParts []string
+		for pos < len(filtered) && !isKeyword(filtered[pos], "limit") &&
+			!isKeyword(filtered[pos], "order") && !isKeyword(filtered[pos], "group") {
+			whereParts = append(whereParts, filtered[pos].Value)
+			pos++
+		}
+		whereExpr = db.resolveSubqueries(strings.Join(whereParts, " "), args)
+	}
+
 	// Determine output columns
 	var resultCols []ResultColumnInfo
-	var colIndices []int // which table columns map to each result column
-
 	for _, c := range cols {
 		if c.expr == "*" {
-			for i, col := range tbl.columns {
+			for _, col := range tbl.columns {
 				resultCols = append(resultCols, ResultColumnInfo{
 					Name: col.name,
 					Type: ColNull,
 				})
-				colIndices = append(colIndices, i)
 			}
 		} else {
 			name := c.as
@@ -914,16 +941,22 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 				Name: name,
 				Type: ColNull,
 			})
-			// Try to match column name
-			found := -1
-			for i, col := range tbl.columns {
-				if strings.EqualFold(col.name, c.expr) {
-					found = i
-					break
-				}
-			}
-			colIndices = append(colIndices, found)
 		}
+	}
+
+	// Detect aggregate functions in column expressions
+	hasAgg := false
+	for _, c := range cols {
+		if isAggregateExpr(c.expr) {
+			hasAgg = true
+			break
+		}
+	}
+
+	// Build column name list for row context
+	colNames := make([]string, len(tbl.columns))
+	for i, col := range tbl.columns {
+		colNames[i] = col.name
 	}
 
 	// Scan the table
@@ -933,7 +966,8 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	}
 	defer cursor.Close()
 
-	var rows []Row
+	var rawData []rawRow
+
 	hasRow, err := cursor.First()
 	if err != nil {
 		return nil, err
@@ -943,25 +977,80 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		if err != nil {
 			return nil, err
 		}
-
 		values, err := vdbe.ParseRecord(data)
 		if err != nil {
 			return nil, err
 		}
 
-		row := Row{cols: resultCols}
-		for _, idx := range colIndices {
-			if idx >= 0 && idx < len(values) {
-				row.values = append(row.values, vdbe.MemFromValue(values[idx]))
-			} else {
-				row.values = append(row.values, vdbe.NewMemNull())
+		// WHERE filtering
+		if whereExpr != "" {
+			wval := evalExprWithRow(whereExpr, args, colNames, values)
+			if !isTruthy(wval) {
+				hasRow, err = cursor.Next()
+				if err != nil {
+					return nil, err
+				}
+				continue
 			}
 		}
-		rows = append(rows, row)
 
+		rawData = append(rawData, rawRow{values: values})
 		hasRow, err = cursor.Next()
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	var rows []Row
+
+	if hasAgg {
+		// Compute aggregate results
+		row := Row{cols: resultCols}
+		for _, c := range cols {
+			if c.expr == "*" {
+				// count(*) — * in aggregate context
+				row.values = append(row.values, vdbe.NewMemInt(int64(len(rawData))))
+				continue
+			}
+			agg := parseAggregate(c.expr)
+			if agg != nil {
+				row.values = append(row.values, computeAggregate(agg, rawData, colNames))
+			} else {
+				if len(rawData) > 0 {
+					row.values = append(row.values, evalExprWithRow(c.expr, args, colNames, rawData[0].values))
+				} else {
+					row.values = append(row.values, vdbe.NewMemNull())
+				}
+			}
+		}
+		rows = []Row{row}
+	} else {
+		// Non-aggregate: evaluate expressions per row
+		seen := make(map[string]bool)
+		for _, rd := range rawData {
+			row := Row{cols: resultCols}
+			for _, c := range cols {
+				if c.expr == "*" {
+					for i := range tbl.columns {
+						if i < len(rd.values) {
+							row.values = append(row.values, vdbe.MemFromValue(rd.values[i]))
+						} else {
+							row.values = append(row.values, vdbe.NewMemNull())
+						}
+					}
+				} else {
+					val := evalExprWithRow(c.expr, args, colNames, rd.values)
+					row.values = append(row.values, val)
+				}
+			}
+			if distinct {
+				key := rowKey(row.values)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
+			rows = append(rows, row)
 		}
 	}
 
@@ -970,6 +1059,160 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	}
 
 	return newResultSet(rows, resultCols), nil
+}
+
+// isAggregateExpr checks if an expression is an aggregate function call.
+func isAggregateExpr(expr string) bool {
+	lower := strings.ToLower(strings.TrimSpace(expr))
+	// Normalize spaces between function name and paren: "count (" -> "count("
+	lower = strings.ReplaceAll(lower, " (", "(")
+	for _, fn := range []string{"count(", "sum(", "avg(", "min(", "max("} {
+		if strings.HasPrefix(lower, fn) {
+			return true
+		}
+	}
+	return false
+}
+
+// rawRow holds parsed record values for table scanning.
+type rawRow struct {
+	values []vdbe.Value
+}
+
+// aggInfo describes a parsed aggregate function.
+type aggInfo struct {
+	fn  string // "count", "sum", "avg", "min", "max"
+	arg string // "*" or column name or expression
+}
+
+// parseAggregate parses an aggregate expression like "count(*)" or "sum(val)".
+func parseAggregate(expr string) *aggInfo {
+	// Normalize spaces: "count ( * )" -> "count(*)"
+	normalized := strings.ReplaceAll(expr, " (", "(")
+	normalized = strings.ReplaceAll(normalized, "( ", "(")
+	normalized = strings.ReplaceAll(normalized, " )", ")")
+	normalized = strings.TrimSpace(normalized)
+	lower := strings.ToLower(normalized)
+	for _, fn := range []string{"count", "sum", "avg", "min", "max"} {
+		prefix := fn + "("
+		if strings.HasPrefix(lower, prefix) {
+			inner := strings.TrimSpace(normalized[len(prefix) : len(normalized)-1])
+			return &aggInfo{fn: fn, arg: inner}
+		}
+	}
+	return nil
+}
+
+// computeAggregate computes an aggregate over all rows.
+func computeAggregate(agg *aggInfo, rawData []rawRow, colNames []string) *vdbe.Mem {
+	switch agg.fn {
+	case "count":
+		if agg.arg == "*" {
+			return vdbe.NewMemInt(int64(len(rawData)))
+		}
+		count := int64(0)
+		for _, rd := range rawData {
+			val := evalExprWithRow(agg.arg, nil, colNames, rd.values)
+			if !isNull(val) {
+				count++
+			}
+		}
+		return vdbe.NewMemInt(count)
+
+	case "sum":
+		var sum int64
+		hasInt := true
+		var sumF float64
+		hasVal := false
+		for _, rd := range rawData {
+			val := evalExprWithRow(agg.arg, nil, colNames, rd.values)
+			if isNull(val) {
+				continue
+			}
+			hasVal = true
+			if val.Type == vdbe.MemFloat {
+				hasInt = false
+			}
+			if val.Type == vdbe.MemInt {
+				sum += val.IntVal
+				sumF += float64(val.IntVal)
+			} else {
+				sumF += val.FloatValue()
+			}
+		}
+		if !hasVal {
+			return vdbe.NewMemNull()
+		}
+		if hasInt {
+			return vdbe.NewMemInt(sum)
+		}
+		return vdbe.NewMemFloat(sumF)
+
+	case "avg":
+		var sum float64
+		count := int64(0)
+		for _, rd := range rawData {
+			val := evalExprWithRow(agg.arg, nil, colNames, rd.values)
+			if isNull(val) {
+				continue
+			}
+			sum += val.FloatValue()
+			count++
+		}
+		if count == 0 {
+			return vdbe.NewMemNull()
+		}
+		return vdbe.NewMemFloat(sum / float64(count))
+
+	case "min":
+		var result *vdbe.Mem
+		for _, rd := range rawData {
+			val := evalExprWithRow(agg.arg, nil, colNames, rd.values)
+			if isNull(val) {
+				continue
+			}
+			if result == nil || memCompare(val, result) < 0 {
+				result = val
+			}
+		}
+		if result == nil {
+			return vdbe.NewMemNull()
+		}
+		return result
+
+	case "max":
+		var result *vdbe.Mem
+		for _, rd := range rawData {
+			val := evalExprWithRow(agg.arg, nil, colNames, rd.values)
+			if isNull(val) {
+				continue
+			}
+			if result == nil || memCompare(val, result) > 0 {
+				result = val
+			}
+		}
+		if result == nil {
+			return vdbe.NewMemNull()
+		}
+		return result
+	}
+	return vdbe.NewMemNull()
+}
+
+// rowKey creates a string key for DISTINCT deduplication.
+func rowKey(values []*vdbe.Mem) string {
+	var sb strings.Builder
+	for i, v := range values {
+		if i > 0 {
+			sb.WriteByte(0)
+		}
+		if isNull(v) {
+			sb.WriteString("\\N")
+		} else {
+			sb.WriteString(v.StringValue())
+		}
+	}
+	return sb.String()
 }
 
 // selectWithoutTable handles SELECT without a FROM clause.
@@ -997,21 +1240,33 @@ func (db *Database) selectWithoutTable(cols []selectCol, args []interface{}) (*R
 	return newResultSet(rows, resultCols), nil
 }
 
-// evalSimpleExpr evaluates a simple expression (literal or arithmetic).
+// evalSimpleExpr evaluates a SQL expression string and returns a Mem value.
 func evalSimpleExpr(expr string, args []interface{}) *vdbe.Mem {
 	p := &exprParser{src: strings.TrimSpace(expr), args: args}
-	val := p.parseAddSub()
+	val := p.parseExpr()
 	if val != nil {
 		return val
 	}
 	return vdbe.NewMemStr(strings.TrimSpace(expr))
 }
 
-// exprParser is a simple recursive-descent expression parser.
+// evalExprWithRow evaluates a SQL expression in the context of a table row.
+func evalExprWithRow(expr string, args []interface{}, colNames []string, colValues []vdbe.Value) *vdbe.Mem {
+	p := &exprParser{src: strings.TrimSpace(expr), args: args, colNames: colNames, colValues: colValues}
+	val := p.parseExpr()
+	if val != nil {
+		return val
+	}
+	return vdbe.NewMemStr(strings.TrimSpace(expr))
+}
+
+// exprParser is a full recursive-descent SQL expression parser.
 type exprParser struct {
-	src  string
-	pos  int
-	args []interface{}
+	src       string
+	pos       int
+	args      []interface{}
+	colNames  []string
+	colValues []vdbe.Value
 }
 
 func (p *exprParser) peek() byte {
@@ -1027,7 +1282,316 @@ func (p *exprParser) skipSpaces() {
 	}
 }
 
-// parseAddSub handles + and - (lowest precedence).
+func (p *exprParser) remaining() string {
+	if p.pos >= len(p.src) {
+		return ""
+	}
+	return p.src[p.pos:]
+}
+
+func (p *exprParser) matchKeyword(kw string) bool {
+	p.skipSpaces()
+	rest := p.remaining()
+	if len(rest) < len(kw) {
+		return false
+	}
+	if !strings.EqualFold(rest[:len(kw)], kw) {
+		return false
+	}
+	// Ensure word boundary
+	after := len(kw)
+	if after < len(rest) {
+		c := rest[after]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			return false
+		}
+	}
+	p.pos += len(kw)
+	return true
+}
+
+func (p *exprParser) peekKeyword(kw string) bool {
+	saved := p.pos
+	result := p.matchKeyword(kw)
+	p.pos = saved
+	return result
+}
+
+func (p *exprParser) matchOp(op string) bool {
+	p.skipSpaces()
+	rest := p.remaining()
+	if len(rest) < len(op) {
+		return false
+	}
+	if rest[:len(op)] != op {
+		return false
+	}
+	p.pos += len(op)
+	return true
+}
+
+func (p *exprParser) peekOp(op string) bool {
+	saved := p.pos
+	result := p.matchOp(op)
+	p.pos = saved
+	return result
+}
+
+// parseExpr is the entry point.
+func (p *exprParser) parseExpr() *vdbe.Mem {
+	return p.parseOr()
+}
+
+// parseOr handles OR.
+func (p *exprParser) parseOr() *vdbe.Mem {
+	left := p.parseAnd()
+	for {
+		p.skipSpaces()
+		if p.matchKeyword("or") {
+			right := p.parseAnd()
+			if isNull(left) || isNull(right) {
+				if isTruthy(left) {
+					left = vdbe.NewMemInt(1)
+				} else if isTruthy(right) {
+					left = vdbe.NewMemInt(1)
+				} else {
+					left = vdbe.NewMemNull()
+				}
+			} else {
+				if isTruthy(left) || isTruthy(right) {
+					left = vdbe.NewMemInt(1)
+				} else {
+					left = vdbe.NewMemInt(0)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseAnd handles AND.
+func (p *exprParser) parseAnd() *vdbe.Mem {
+	left := p.parseNot()
+	for {
+		p.skipSpaces()
+		if p.matchKeyword("and") && !p.peekKeyword("between") {
+			// Check this isn't part of BETWEEN ... AND ...
+			right := p.parseNot()
+			if isNull(left) || isNull(right) {
+				if !isTruthy(left) {
+					left = vdbe.NewMemInt(0)
+				} else {
+					left = vdbe.NewMemNull()
+				}
+			} else {
+				if isTruthy(left) && isTruthy(right) {
+					left = vdbe.NewMemInt(1)
+				} else {
+					left = vdbe.NewMemInt(0)
+				}
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseNot handles NOT prefix.
+func (p *exprParser) parseNot() *vdbe.Mem {
+	p.skipSpaces()
+	if p.matchKeyword("not") {
+		val := p.parseNot()
+		if isNull(val) {
+			return vdbe.NewMemNull()
+		}
+		if isTruthy(val) {
+			return vdbe.NewMemInt(0)
+		}
+		return vdbe.NewMemInt(1)
+	}
+	return p.parseComparison()
+}
+
+// parseComparison handles =, !=, <, >, <=, >=, IS NULL, IN, BETWEEN, LIKE.
+func (p *exprParser) parseComparison() *vdbe.Mem {
+	left := p.parseConcat()
+	for {
+		p.skipSpaces()
+
+		// IS [NOT] NULL
+		if p.peekKeyword("is") {
+			p.matchKeyword("is")
+			p.skipSpaces()
+			neg := false
+			if p.matchKeyword("not") {
+				neg = true
+			}
+			if p.matchKeyword("null") {
+				if neg {
+					left = boolToInt(!isNull(left))
+				} else {
+					left = boolToInt(isNull(left))
+				}
+			}
+			continue
+		}
+
+		// Check for NOT prefix (for IN, BETWEEN, LIKE)
+		negate := false
+		saved := p.pos
+		if p.peekKeyword("not") {
+			p.matchKeyword("not")
+			if p.peekKeyword("in") || p.peekKeyword("between") || p.peekKeyword("like") {
+				negate = true
+			} else {
+				p.pos = saved
+				// NOT followed by something else - fall through to comparison ops
+			}
+		}
+
+		if negate || p.peekKeyword("in") {
+			// [NOT] IN (...)
+			if p.matchKeyword("in") {
+				p.skipSpaces()
+				if p.matchOp("(") {
+					var vals []*vdbe.Mem
+					for {
+						p.skipSpaces()
+						v := p.parseExpr()
+						vals = append(vals, v)
+						p.skipSpaces()
+						if !p.matchOp(",") {
+							break
+						}
+					}
+					p.matchOp(")")
+					found := false
+					if !isNull(left) {
+						for _, v := range vals {
+							if !isNull(v) && memEqual(left, v) {
+								found = true
+								break
+							}
+						}
+					}
+					if negate {
+						left = boolToInt(!found)
+					} else {
+						left = boolToInt(found)
+					}
+				}
+				continue
+			}
+		}
+
+		if negate || p.peekKeyword("between") {
+			// [NOT] BETWEEN low AND high
+			if p.matchKeyword("between") {
+				low := p.parseConcat()
+				p.skipSpaces()
+				p.matchKeyword("and")
+				high := p.parseConcat()
+				result := false
+				if !isNull(left) && !isNull(low) && !isNull(high) {
+					result = memCompare(left, low) >= 0 && memCompare(left, high) <= 0
+				}
+				if negate {
+					left = boolToInt(!result)
+				} else {
+					left = boolToInt(result)
+				}
+				continue
+			}
+		}
+
+		if negate || p.peekKeyword("like") {
+			// [NOT] LIKE
+			if p.matchKeyword("like") {
+				pattern := p.parseConcat()
+				match := likeMatch(memStr(left), memStr(pattern))
+				if negate {
+					left = boolToInt(!match)
+				} else {
+					left = boolToInt(match)
+				}
+				continue
+			}
+		}
+
+		// If NOT was consumed but nothing matched, restore and break
+		if negate {
+			p.pos = saved
+			break
+		}
+
+		// Comparison operators
+		var op string
+		if p.matchOp("!=") {
+			op = "!="
+		} else if p.matchOp("<>") {
+			op = "!="
+		} else if p.matchOp("<=") {
+			op = "<="
+		} else if p.matchOp(">=") {
+			op = ">="
+		} else if p.matchOp("==") {
+			op = "="
+		} else if p.matchOp("=") {
+			op = "="
+		} else if p.matchOp("<") {
+			op = "<"
+		} else if p.matchOp(">") {
+			op = ">"
+		}
+		if op != "" {
+			right := p.parseConcat()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				switch op {
+				case "=":
+					left = boolToInt(memEqual(left, right))
+				case "!=":
+					left = boolToInt(!memEqual(left, right))
+				case "<":
+					left = boolToInt(memCompare(left, right) < 0)
+				case ">":
+					left = boolToInt(memCompare(left, right) > 0)
+				case "<=":
+					left = boolToInt(memCompare(left, right) <= 0)
+				case ">=":
+					left = boolToInt(memCompare(left, right) >= 0)
+				}
+			}
+			continue
+		}
+
+		break
+	}
+	return left
+}
+func (p *exprParser) parseConcat() *vdbe.Mem {
+	left := p.parseAddSub()
+	for {
+		p.skipSpaces()
+		if p.matchOp("||") {
+			right := p.parseAddSub()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				left = vdbe.NewMemStr(memStr(left) + memStr(right))
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseAddSub handles + and -.
 func (p *exprParser) parseAddSub() *vdbe.Mem {
 	left := p.parseMulDivMod()
 	if left == nil {
@@ -1035,18 +1599,29 @@ func (p *exprParser) parseAddSub() *vdbe.Mem {
 	}
 	for {
 		p.skipSpaces()
+		var op byte
 		if p.peek() == '+' || p.peek() == '-' {
-			op := p.src[p.pos]
+			op = p.src[p.pos]
 			p.pos++
 			right := p.parseMulDivMod()
 			if right == nil {
 				return nil
 			}
-			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
 				if op == '+' {
 					left = vdbe.NewMemInt(left.IntVal + right.IntVal)
 				} else {
 					left = vdbe.NewMemInt(left.IntVal - right.IntVal)
+				}
+			} else if left.Type == vdbe.MemStr || right.Type == vdbe.MemStr {
+				// String + number: try numeric conversion
+				lf, rf := toFloat(left), toFloat(right)
+				if op == '+' {
+					left = vdbe.NewMemFloat(lf + rf)
+				} else {
+					left = vdbe.NewMemFloat(lf - rf)
 				}
 			} else {
 				lf, rf := left.FloatValue(), right.FloatValue()
@@ -1063,9 +1638,9 @@ func (p *exprParser) parseAddSub() *vdbe.Mem {
 	return left
 }
 
-// parseMulDivMod handles *, /, % (higher precedence).
+// parseMulDivMod handles *, /, %.
 func (p *exprParser) parseMulDivMod() *vdbe.Mem {
-	left := p.parseUnary()
+	left := p.parseBitwise()
 	if left == nil {
 		return nil
 	}
@@ -1073,14 +1648,15 @@ func (p *exprParser) parseMulDivMod() *vdbe.Mem {
 		p.skipSpaces()
 		ch := p.peek()
 		if ch == '*' || ch == '/' || ch == '%' {
-			op := ch
 			p.pos++
-			right := p.parseUnary()
+			right := p.parseBitwise()
 			if right == nil {
 				return nil
 			}
-			if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
-				switch op {
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else if left.Type == vdbe.MemInt && right.Type == vdbe.MemInt {
+				switch ch {
 				case '*':
 					left = vdbe.NewMemInt(left.IntVal * right.IntVal)
 				case '/':
@@ -1094,7 +1670,7 @@ func (p *exprParser) parseMulDivMod() *vdbe.Mem {
 				}
 			} else {
 				lf, rf := left.FloatValue(), right.FloatValue()
-				switch op {
+				switch ch {
 				case '*':
 					left = vdbe.NewMemFloat(lf * rf)
 				case '/':
@@ -1114,28 +1690,86 @@ func (p *exprParser) parseMulDivMod() *vdbe.Mem {
 	return left
 }
 
-// parseUnary handles unary + and -.
+// parseBitwise handles &, |, <<, >>.
+func (p *exprParser) parseBitwise() *vdbe.Mem {
+	left := p.parseUnary()
+	if left == nil {
+		return nil
+	}
+	for {
+		p.skipSpaces()
+		if p.matchOp("<<") {
+			right := p.parseUnary()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				left = vdbe.NewMemInt(left.IntVal << uint64(right.IntVal))
+			}
+		} else if p.matchOp(">>") {
+			right := p.parseUnary()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				left = vdbe.NewMemInt(left.IntVal >> uint64(right.IntVal))
+			}
+		} else if p.matchOp("&") {
+			right := p.parseUnary()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				left = vdbe.NewMemInt(left.IntVal & right.IntVal)
+			}
+		} else if !p.peekOp("||") && p.matchOp("|") {
+			right := p.parseUnary()
+			if isNull(left) || isNull(right) {
+				left = vdbe.NewMemNull()
+			} else {
+				left = vdbe.NewMemInt(left.IntVal | right.IntVal)
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+// parseUnary handles unary +, -, ~.
 func (p *exprParser) parseUnary() *vdbe.Mem {
 	p.skipSpaces()
 	if p.peek() == '-' {
 		p.pos++
 		val := p.parseUnary()
-		if val == nil {
-			return nil
+		if val == nil || isNull(val) {
+			return vdbe.NewMemNull()
 		}
 		if val.Type == vdbe.MemInt {
 			return vdbe.NewMemInt(-val.IntVal)
 		}
 		return vdbe.NewMemFloat(-val.FloatValue())
+		// Float value might be an overflow int (e.g. 9223372036854775808)
+		if val.Type == vdbe.MemFloat {
+			f := -val.FloatVal
+			if f == float64(int64(f)) && f >= float64(int64(-9223372036854775808)) && f <= float64(9223372036854775807) {
+				return vdbe.NewMemInt(int64(f))
+			}
+		}
 	}
 	if p.peek() == '+' {
 		p.pos++
 		return p.parseUnary()
 	}
+	if p.peek() == '~' {
+		p.pos++
+		val := p.parseUnary()
+		if val == nil || isNull(val) {
+			return vdbe.NewMemNull()
+		}
+		return vdbe.NewMemInt(^val.IntVal)
+	}
 	return p.parsePrimary()
 }
 
-// parsePrimary handles literals, parentheses, and bind variables.
+// parsePrimary handles literals, parens, function calls, CASE, column refs.
 func (p *exprParser) parsePrimary() *vdbe.Mem {
 	p.skipSpaces()
 	if p.pos >= len(p.src) {
@@ -1144,11 +1778,11 @@ func (p *exprParser) parsePrimary() *vdbe.Mem {
 
 	// Parenthesized expression
 	if p.src[p.pos] == '(' {
-		p.pos++ // skip '('
-		val := p.parseAddSub()
+		p.pos++
+		val := p.parseExpr()
 		p.skipSpaces()
 		if p.pos < len(p.src) && p.src[p.pos] == ')' {
-			p.pos++ // skip ')'
+			p.pos++
 		}
 		return val
 	}
@@ -1160,74 +1794,416 @@ func (p *exprParser) parsePrimary() *vdbe.Mem {
 		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
 			p.pos++
 		}
-		if idx, err := strconv.Atoi(p.src[start:p.pos]); err == nil && idx > 0 && idx <= len(p.args) {
+		idxStr := p.src[start:p.pos]
+		if idxStr == "" {
+			// Sequential ? - not supported in this context
+			return vdbe.NewMemNull()
+		}
+		if idx, err := strconv.Atoi(idxStr); err == nil && idx > 0 && idx <= len(p.args) {
 			return vdbe.MakeMem(p.args[idx-1])
 		}
-		return nil
+		return vdbe.NewMemNull()
 	}
 
 	// String literal
 	if p.src[p.pos] == '\'' {
 		p.pos++
-		start := p.pos
-		for p.pos < len(p.src) && p.src[p.pos] != '\'' {
+		var sb strings.Builder
+		for p.pos < len(p.src) {
+			if p.src[p.pos] == '\'' {
+				p.pos++
+				if p.pos < len(p.src) && p.src[p.pos] == '\'' {
+					sb.WriteByte('\'')
+					p.pos++
+					continue
+				}
+				break
+			}
+			sb.WriteByte(p.src[p.pos])
 			p.pos++
 		}
-		val := vdbe.NewMemStr(p.src[start:p.pos])
-		if p.pos < len(p.src) {
-			p.pos++ // skip closing quote
-		}
-		return val
+		return vdbe.NewMemStr(sb.String())
 	}
 
-	// Number (int or float)
-	start := p.pos
-	isFloat := false
-	if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
-		p.pos++
-	}
-	for p.pos < len(p.src) && ((p.src[p.pos] >= '0' && p.src[p.pos] <= '9') || p.src[p.pos] == '.') {
-		if p.src[p.pos] == '.' {
-			isFloat = true
-		}
-		p.pos++
-	}
-	// Handle scientific notation
-	if p.pos < len(p.src) && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
-		isFloat = true
-		p.pos++
-		if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
-			p.pos++
-		}
-		for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
-			p.pos++
-		}
-	}
-	numStr := p.src[start:p.pos]
-	if numStr == "" {
-		return nil
-	}
-	if isFloat {
-		if v, err := strconv.ParseFloat(numStr, 64); err == nil {
-			return vdbe.NewMemFloat(v)
-		}
-	} else {
-		if v, err := strconv.ParseInt(numStr, 10, 64); err == nil {
-			return vdbe.NewMemInt(v)
-		}
-		if v, err := strconv.ParseFloat(numStr, 64); err == nil {
-			return vdbe.NewMemFloat(v)
-		}
+	// CASE expression
+	if p.peekKeyword("case") {
+		return p.parseCase()
 	}
 
 	// NULL keyword
-	rest := p.src[start:]
-	if len(rest) >= 4 && strings.EqualFold(rest[:4], "null") {
-		p.pos = start + 4
+	if p.matchKeyword("null") {
 		return vdbe.NewMemNull()
 	}
 
-	return nil
+	// Number (int or float) - check before word parsing
+	if c := p.peek(); (c >= '0' && c <= '9') || (c == '.' && p.pos+1 < len(p.src) && p.src[p.pos+1] >= '0' && p.src[p.pos+1] <= '9') {
+		start := p.pos
+		isFloat := false
+		for p.pos < len(p.src) && ((p.src[p.pos] >= '0' && p.src[p.pos] <= '9') || p.src[p.pos] == '.') {
+			if p.src[p.pos] == '.' {
+				isFloat = true
+			}
+			p.pos++
+		}
+		if p.pos < len(p.src) && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
+			isFloat = true
+			p.pos++
+			if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
+				p.pos++
+			}
+			for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+				p.pos++
+			}
+		}
+		numStr := p.src[start:p.pos]
+		if isFloat {
+			if v, err := strconv.ParseFloat(numStr, 64); err == nil {
+				return vdbe.NewMemFloat(v)
+			}
+		} else {
+			if v, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+				return vdbe.NewMemInt(v)
+			}
+			if v, err := strconv.ParseFloat(numStr, 64); err == nil {
+				return vdbe.NewMemFloat(v)
+			}
+		}
+	}
+
+	// Function calls or identifiers: read a word
+	start := p.pos
+	for p.pos < len(p.src) {
+		c := p.src[p.pos]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9') {
+			p.pos++
+		} else {
+			break
+		}
+	}
+	word := p.src[start:p.pos]
+	if word == "" {
+		return nil
+	}
+
+	// Check if it's a function call (word followed by '(')
+	p.skipSpaces()
+	if p.pos < len(p.src) && p.src[p.pos] == '(' {
+		p.pos++ // skip '('
+		return p.evalFunction(strings.ToLower(word))
+	}
+
+	// Check column reference
+	if p.colNames != nil {
+		for i, name := range p.colNames {
+			if strings.EqualFold(name, word) {
+				if i < len(p.colValues) {
+					return vdbe.MemFromValue(p.colValues[i])
+				}
+			}
+		}
+	}
+
+	// Try as number (for pure digit words that didn't match above)
+	if v, err := strconv.ParseInt(word, 10, 64); err == nil {
+		return vdbe.NewMemInt(v)
+	}
+	if v, err := strconv.ParseFloat(word, 64); err == nil {
+		return vdbe.NewMemFloat(v)
+	}
+
+	return vdbe.NewMemStr(word)
+}
+
+// parseCase handles CASE expressions.
+func (p *exprParser) parseCase() *vdbe.Mem {
+	p.matchKeyword("case")
+	p.skipSpaces()
+
+	// Simple CASE or searched CASE?
+	// If next is WHEN, it's searched CASE. Otherwise simple CASE (has operand).
+	var operand *vdbe.Mem
+	if !p.peekKeyword("when") {
+		operand = p.parseExpr()
+	}
+
+	for p.matchKeyword("when") {
+		if operand != nil {
+			// Simple CASE: compare operand to WHEN value
+			val := p.parseExpr()
+			p.skipSpaces()
+			p.matchKeyword("then")
+			result := p.parseExpr()
+			if !isNull(operand) && !isNull(val) && memEqual(operand, val) {
+				// Skip remaining WHEN/ELSE
+				for !p.peekKeyword("end") {
+					// skip tokens
+					if p.matchKeyword("when") {
+						p.parseExpr()
+						p.skipSpaces()
+						p.matchKeyword("then")
+						p.parseExpr()
+					} else if p.matchKeyword("else") {
+						p.parseExpr()
+					} else {
+						p.pos++
+					}
+					p.skipSpaces()
+				}
+				p.matchKeyword("end")
+				return result
+			}
+		} else {
+			// Searched CASE: WHEN condition
+			cond := p.parseExpr()
+			p.skipSpaces()
+			p.matchKeyword("then")
+			result := p.parseExpr()
+			if isTruthy(cond) {
+				for !p.peekKeyword("end") {
+					if p.matchKeyword("when") {
+						p.parseExpr()
+						p.skipSpaces()
+						p.matchKeyword("then")
+						p.parseExpr()
+					} else if p.matchKeyword("else") {
+						p.parseExpr()
+					} else {
+						p.pos++
+					}
+					p.skipSpaces()
+				}
+				p.matchKeyword("end")
+				return result
+			}
+		}
+	}
+
+	// ELSE
+	p.skipSpaces()
+	if p.matchKeyword("else") {
+		result := p.parseExpr()
+		p.matchKeyword("end")
+		return result
+	}
+
+	p.matchKeyword("end")
+	return vdbe.NewMemNull()
+}
+
+// evalFunction evaluates a function call (the '(' is already consumed).
+func (p *exprParser) evalFunction(name string) *vdbe.Mem {
+	var args []*vdbe.Mem
+	for {
+		p.skipSpaces()
+		if p.pos < len(p.src) && p.src[p.pos] == ')' {
+			p.pos++
+			break
+		}
+		if p.peek() == 0 {
+			break
+		}
+		if p.peekOp("*") {
+			p.pos++
+			args = append(args, vdbe.NewMemInt(0))
+		} else {
+			arg := p.parseExpr()
+			args = append(args, arg)
+		}
+		p.skipSpaces()
+		if !p.matchOp(",") {
+			p.skipSpaces()
+			if p.pos < len(p.src) && p.src[p.pos] == ')' {
+				p.pos++
+				break
+			}
+		}
+	}
+
+	switch name {
+	case "typeof":
+		if len(args) > 0 {
+			return vdbe.NewMemStr(typeofMem(args[0]))
+		}
+	case "coalesce":
+		for _, a := range args {
+			if !isNull(a) {
+				return a
+			}
+		}
+		return vdbe.NewMemNull()
+	case "ifnull":
+		if len(args) >= 2 {
+			if !isNull(args[0]) {
+				return args[0]
+			}
+			return args[1]
+		}
+	case "nullif":
+		if len(args) >= 2 {
+			if !isNull(args[0]) && !isNull(args[1]) && memEqual(args[0], args[1]) {
+				return vdbe.NewMemNull()
+			}
+			return args[0]
+		}
+	case "abs":
+		if len(args) > 0 && !isNull(args[0]) {
+			if args[0].Type == vdbe.MemInt {
+				v := args[0].IntVal
+				if v < 0 {
+					v = -v
+				}
+				return vdbe.NewMemInt(v)
+			}
+			v := args[0].FloatValue()
+			if v < 0 {
+				v = -v
+			}
+			return vdbe.NewMemFloat(v)
+		}
+	case "upper":
+		if len(args) > 0 && !isNull(args[0]) {
+			return vdbe.NewMemStr(strings.ToUpper(memStr(args[0])))
+		}
+	case "lower":
+		if len(args) > 0 && !isNull(args[0]) {
+			return vdbe.NewMemStr(strings.ToLower(memStr(args[0])))
+		}
+	case "length":
+		if len(args) > 0 && !isNull(args[0]) {
+			return vdbe.NewMemInt(int64(len(memStr(args[0]))))
+		}
+	}
+	return vdbe.NewMemNull()
+}
+
+// --- Expression helper functions ---
+
+func isNull(m *vdbe.Mem) bool {
+	return m == nil || m.Type == vdbe.MemNull
+}
+
+func isTruthy(m *vdbe.Mem) bool {
+	if isNull(m) {
+		return false
+	}
+	switch m.Type {
+	case vdbe.MemInt:
+		return m.IntVal != 0
+	case vdbe.MemFloat:
+		return m.FloatVal != 0
+	case vdbe.MemStr:
+		return len(m.Bytes) > 0
+	}
+	return false
+}
+
+func memStr(m *vdbe.Mem) string {
+	if isNull(m) {
+		return ""
+	}
+	if m.Type == vdbe.MemStr {
+		return string(m.Bytes)
+	}
+	return m.StringValue()
+}
+
+func toFloat(m *vdbe.Mem) float64 {
+	if isNull(m) {
+		return 0
+	}
+	return m.FloatValue()
+}
+
+func boolToInt(b bool) *vdbe.Mem {
+	if b {
+		return vdbe.NewMemInt(1)
+	}
+	return vdbe.NewMemInt(0)
+}
+
+func typeofMem(m *vdbe.Mem) string {
+	if isNull(m) {
+		return "null"
+	}
+	switch m.Type {
+	case vdbe.MemInt:
+		return "integer"
+	case vdbe.MemFloat:
+		return "real"
+	case vdbe.MemStr:
+		return "text"
+	case vdbe.MemBlob:
+		return "blob"
+	}
+	return "null"
+}
+
+func memEqual(a, b *vdbe.Mem) bool {
+	if a.Type == vdbe.MemStr && b.Type == vdbe.MemStr {
+		return memStr(a) == memStr(b)
+	}
+	if a.Type == vdbe.MemStr || b.Type == vdbe.MemStr {
+		// Compare as strings
+		return memStr(a) == memStr(b)
+	}
+	return memCompare(a, b) == 0
+}
+
+func memCompare(a, b *vdbe.Mem) int {
+	if a.Type == vdbe.MemStr && b.Type == vdbe.MemStr {
+		sa, sb := memStr(a), memStr(b)
+		if sa < sb {
+			return -1
+		}
+		if sa > sb {
+			return 1
+		}
+		return 0
+	}
+	// Numeric comparison
+	fa, fb := toFloat(a), toFloat(b)
+	if fa < fb {
+		return -1
+	}
+	if fa > fb {
+		return 1
+	}
+	return 0
+}
+
+// likeMatch implements SQL LIKE pattern matching (% and _ wildcards).
+func likeMatch(input, pattern string) bool {
+	pi, pp := 0, 0
+	for pi < len(input) && pp < len(pattern) {
+		if pattern[pp] == '%' {
+			pp++
+			if pp == len(pattern) {
+				return true
+			}
+			for pi < len(input) {
+				if likeMatch(input[pi:], pattern[pp:]) {
+					return true
+				}
+				pi++
+			}
+			return likeMatch("", pattern[pp:])
+		}
+		if pattern[pp] == '_' {
+			pp++
+			pi++
+			continue
+		}
+		if strings.ToLower(string(input[pi])) == strings.ToLower(string(pattern[pp])) {
+			pp++
+			pi++
+		} else {
+			return false
+		}
+	}
+	for pp < len(pattern) && pattern[pp] == '%' {
+		pp++
+	}
+	return pi == len(input) && pp == len(pattern)
 }
 
 // compileStatement builds a VDBE program from tokenized SQL.
@@ -1365,6 +2341,83 @@ func classifyStatement(tokens []compile.Token) string {
 	return first
 }
 
+
+// parseInsertExprValue parses an expression value for INSERT/UPDATE.
+// It collects tokens until comma or close-paren, joins them, and evaluates.
+func parseInsertExprValue(tokens []compile.Token, pos *int, args []interface{}, bindIdx *int) (interface{}, error) {
+	if *pos >= len(tokens) {
+		return nil, fmt.Errorf("expected value")
+	}
+
+	// Collect tokens for this value expression
+	start := *pos
+	depth := 0
+	for *pos < len(tokens) {
+		t := tokens[*pos]
+		if t.Type == compile.TokenLParen {
+			depth++
+		}
+		if t.Type == compile.TokenRParen {
+			if depth == 0 {
+				break
+			}
+			depth--
+		}
+		if t.Type == compile.TokenComma && depth == 0 {
+			break
+		}
+		*pos++
+	}
+
+	// Build expression string from collected tokens
+	var parts []string
+	for i := start; i < *pos; i++ {
+		parts = append(parts, tokens[i].Value)
+	}
+	expr := strings.Join(parts, " ")
+
+	// Check if it's a simple bind variable (single ? token)
+	if tokens[start].Type == compile.TokenVariable && *pos-start == 1 {
+		t := tokens[start]
+		if len(t.Value) > 1 {
+			if idx, err := strconv.Atoi(t.Value[1:]); err == nil {
+				if idx > 0 && idx <= len(args) {
+					return args[idx-1], nil
+				}
+			}
+		}
+		if t.Value == "?" {
+			idx := *bindIdx
+			*bindIdx++
+			if idx < len(args) {
+				return args[idx], nil
+			}
+			return nil, nil
+		}
+		return nil, nil
+	}
+
+	// Check if it's a simple NULL keyword
+	if isKeyword(tokens[start], "null") && *pos-start == 1 {
+		return nil, nil
+	}
+
+	// Evaluate using the expression parser
+	val := evalSimpleExpr(expr, args)
+	switch val.Type {
+	case vdbe.MemNull:
+		return nil, nil
+	case vdbe.MemInt:
+		return val.IntVal, nil
+	case vdbe.MemFloat:
+		return val.FloatVal, nil
+	case vdbe.MemStr:
+		return string(val.Bytes), nil
+	case vdbe.MemBlob:
+		return val.Bytes, nil
+	}
+	return nil, nil
+}
 // parseExprValue parses a simple expression value from tokens.
 // bindIdx tracks the current position for sequential ? parameters (0-based, incremented per ?).
 func parseExprValue(tokens []compile.Token, pos *int, args []interface{}, bindIdx *int) (interface{}, error) {
@@ -1625,4 +2678,72 @@ func encodeVarintKey(buf []byte, rowid int64) int {
 	}
 	copy(buf, tmp[9-n:])
 	return n
+}
+
+// memToValue converts a *vdbe.Mem to a vdbe.Value.
+func memToValue(m *vdbe.Mem) vdbe.Value {
+	if m == nil || m.Type == vdbe.MemNull {
+		return vdbe.Value{Type: "null"}
+	}
+	switch m.Type {
+	case vdbe.MemInt:
+		return vdbe.Value{Type: "int", IntVal: m.IntVal}
+	case vdbe.MemFloat:
+		return vdbe.Value{Type: "float", FloatVal: m.FloatVal}
+	case vdbe.MemStr:
+		return vdbe.Value{Type: "text", Bytes: m.Bytes}
+	case vdbe.MemBlob:
+		return vdbe.Value{Type: "blob", Bytes: m.Bytes}
+	}
+	return vdbe.Value{Type: "null"}
+}
+
+// resolveSubqueries replaces ( SELECT ... ) subqueries with their scalar result.
+func (db *Database) resolveSubqueries(expr string, args []interface{}) string {
+	for {
+		// Find "( SELECT" pattern
+		idx := strings.Index(strings.ToLower(expr), "( select")
+		if idx < 0 {
+			idx = strings.Index(strings.ToLower(expr), "(select")
+		}
+		if idx < 0 {
+			break
+		}
+		// Find matching close paren
+		depth := 0
+		end := -1
+		for i := idx; i < len(expr); i++ {
+			if expr[i] == '(' {
+				depth++
+			}
+			if expr[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		if end < 0 {
+			break
+		}
+		subSQL := strings.TrimSpace(expr[idx+1 : end])
+		// Execute the subquery
+		rs, err := db.querySingle(subSQL, args)
+		if err != nil {
+			break
+		}
+		var result string
+		if rs.Next() {
+			row := rs.Row()
+			if row.ColumnIsNull(0) {
+				result = "NULL"
+			} else {
+				result = row.ColumnText(0)
+			}
+		}
+		rs.Close()
+		expr = expr[:idx] + result + expr[end+1:]
+	}
+	return expr
 }
