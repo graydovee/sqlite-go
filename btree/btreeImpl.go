@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 
@@ -456,15 +457,31 @@ func (b *BTreeImpl) insertCellIntoPage(pageNum PageNumber, cell []byte) error {
 	}
 
 	insertIdx := numCells
-	cellRowid := readCellRowid(cell, hdr.pageType)
-	for i := 0; i < numCells; i++ {
-		ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
-		if ptr == 0 || ptr >= len(page.Data) {
-			continue
+	if hdr.pageType == PageTypeLeafIndex {
+		_, n1 := ReadVarint(cell)
+		newPayload := cell[n1:]
+		for i := 0; i < numCells; i++ {
+			ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
+			if ptr == 0 || ptr >= len(page.Data) {
+				continue
+			}
+			_, n2 := ReadVarint(page.Data[ptr:])
+			if bytes.Compare(page.Data[ptr+n2:], newPayload) >= 0 {
+				insertIdx = i
+				break
+			}
 		}
-		if readCellRowid(page.Data[ptr:], hdr.pageType) >= cellRowid {
-			insertIdx = i
-			break
+	} else {
+		cellRowid := readCellRowid(cell, hdr.pageType)
+		for i := 0; i < numCells; i++ {
+			ptr := int(binary.BigEndian.Uint16(page.Data[hs+i*2 : hs+i*2+2]))
+			if ptr == 0 || ptr >= len(page.Data) {
+				continue
+			}
+			if readCellRowid(page.Data[ptr:], hdr.pageType) >= cellRowid {
+				insertIdx = i
+				break
+			}
 		}
 	}
 

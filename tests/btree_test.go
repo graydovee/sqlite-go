@@ -858,30 +858,52 @@ func TestBTreeRecordManyColumns(t *testing.T) {
 // --- Test: BTree on disk (file-backed) ---
 
 func TestBTreeFilePersistence(t *testing.T) {
-	bt, p := openTestBTreeFile(t)
 	dir := t.TempDir()
+	path := filepath.Join(dir, "btree_test.db")
 
-	rootPage, _ := bt.CreateBTree(btree.CreateTable)
-	bt.Begin(true)
-
-	for i := int64(1); i <= 100; i++ {
-		insertRow(t, bt, rootPage, btree.RowID(i),
-			btree.IntValue(i),
-			btree.TextValue(fmt.Sprintf("persist_%d", i)),
-		)
-	}
-	bt.Commit()
-	p.Close()
-
-	// Re-open and verify
+	// First session: create and populate the database
 	cfg := pager.PagerConfig{
 		VFS:         vfs.Find("unix"),
-		Path:        filepath.Join(dir, "btree_test.db"),
+		Path:        path,
 		PageSize:    4096,
 		CacheSize:   10,
 		JournalMode: pager.JournalMemory,
 	}
-	p2, err := pager.OpenPager(cfg)
+	p, err := pager.OpenPager(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	bt, err := btree.OpenBTreeConn(p).Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bti := bt.(*btree.BTreeImpl)
+
+	rootPage, _ := bti.CreateBTree(btree.CreateTable)
+	bti.Begin(true)
+
+	for i := int64(1); i <= 100; i++ {
+		insertRow(t, bti, rootPage, btree.RowID(i),
+			btree.IntValue(i),
+			btree.TextValue(fmt.Sprintf("persist_%d", i)),
+		)
+	}
+	bti.Commit()
+	p.Close()
+
+	// Re-open and verify
+	cfg2 := pager.PagerConfig{
+		VFS:         vfs.Find("unix"),
+		Path:        path,
+		PageSize:    4096,
+		CacheSize:   10,
+		JournalMode: pager.JournalMemory,
+	}
+	p2, err := pager.OpenPager(cfg2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -892,9 +914,9 @@ func TestBTreeFilePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bti := bt2.(*btree.BTreeImpl)
+	bti2 := bt2.(*btree.BTreeImpl)
 
-	count, _ := bti.Count(rootPage)
+	count, _ := bti2.Count(rootPage)
 	if count != 100 {
 		t.Errorf("after reopen: count=%d, want 100", count)
 	}
