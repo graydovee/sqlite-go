@@ -609,13 +609,42 @@ func (p *PagerImpl) writeDBHeader() {
 	}
 
 	hdr := make([]byte, 100)
-	// Read existing header
 	p.file.Read(hdr, 0)
 
-	// Update fields
-	binary.BigEndian.PutUint32(hdr[16:20], uint32(p.pageSize))
+	// Magic string
+	copy(hdr[0:16], []byte("SQLite format 3\x00"))
+
+	// Page size (uint16 at offset 16-17, 1 means 65536)
+	ps := uint16(p.pageSize)
+	if p.pageSize == 65536 {
+		ps = 1
+	}
+	binary.BigEndian.PutUint16(hdr[16:18], ps)
+
+	// File format versions
+	if p.journalMode == JournalWAL {
+		hdr[18] = 2
+		hdr[19] = 2
+	} else {
+		hdr[18] = 1
+		hdr[19] = 1
+	}
+
+	hdr[20] = 0  // reserved space
+	hdr[21] = 64 // max embedded payload fraction
+	hdr[22] = 32 // min embedded payload fraction
+	hdr[23] = 32 // leaf payload fraction
+
 	binary.BigEndian.PutUint32(hdr[24:28], p.changeCount)
 	binary.BigEndian.PutUint32(hdr[28:32], uint32(p.pageCount))
+	// freelist: already zero from make
+	// schema cookie: preserve existing or set to 0
+	if binary.BigEndian.Uint32(hdr[44:48]) == 0 {
+		binary.BigEndian.PutUint32(hdr[44:48], 4) // schema format
+	}
+	binary.BigEndian.PutUint32(hdr[56:60], 1) // UTF-8
+	binary.BigEndian.PutUint32(hdr[92:96], p.changeCount)
+	binary.BigEndian.PutUint32(hdr[96:100], 3046000) // SQLite version 3.46.0
 
 	p.file.Write(hdr, 0)
 }
