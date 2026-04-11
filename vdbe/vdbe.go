@@ -7,6 +7,7 @@ import (
 	"math"
 
 	"github.com/sqlite-go/sqlite-go/btree"
+	"github.com/sqlite-go/sqlite-go/encoding"
 )
 
 // ResultCode represents the result of VDBE execution.
@@ -25,12 +26,14 @@ const (
 
 // VdbeCursor wraps a BTree cursor for use by the VDBE.
 type VdbeCursor struct {
-	Cursor   interface{} // Will be btree.BTCursor at runtime
-	RootPage int
+	Cursor    interface{} // Will be btree.BTCursor at runtime
+	RootPage  int
 	Writeable bool
-	NullRow  bool
-	Ordered  bool
-	SeekHit  int // tracks seek hit count for IN-early-out optimization
+	NullRow   bool
+	Ordered   bool
+	SeekHit   int   // tracks seek hit count for IN-early-out optimization
+	SeqCount  int64 // Sequence counter for OpSequence
+	Pseudo    bool  // True for pseudo-cursors (OpOpenPseudo)
 }
 
 // ColumnInfo describes column metadata for a table.
@@ -139,8 +142,18 @@ type VDBE struct {
 	err      error
 	halt     bool
 	initialized bool
+	nChange  int64        // Change counter for OpResetCount
 	// Callbacks
 	resultRowFunc func(regs []Mem, startIdx, count int)
+}
+
+// AggFuncInfo carries aggregate function callbacks for VDBE opcodes.
+// P4 on OpAggStep/OpAggFinal/OpAggInverse holds a *AggFuncInfo.
+type AggFuncInfo struct {
+	Name     string
+	Step     func(state interface{}, args []*Mem)
+	Finalize func(state interface{}) *Mem
+	Inverse  func(state interface{}, args []*Mem)
 }
 
 // NewVDBE creates a new VDBE instance.
@@ -628,6 +641,163 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 
 		case OpOffset:
 			v.execOffset(pOp)
+		// --- Aggregate opcodes ---
+
+		case OpAggStep:
+			// P1 = register holding aggregate state
+			// P2 = number of arguments
+			// P3 = start register for arguments
+			// P4 = *AggFuncInfo
+			v.execAggStep(pOp)
+
+		case OpAggFinal:
+			// P1 = register holding aggregate state
+			// P2 = destination register for result
+			// P4 = *AggFuncInfo
+			v.execAggFinal(pOp)
+
+		case OpAggInverse:
+			// P1 = register holding aggregate state
+			// P2 = number of arguments
+			// P3 = start register for arguments
+			// P4 = *AggFuncInfo
+			v.execAggInverse(pOp)
+
+		case OpAggValue:
+			// P1 = register holding aggregate state
+			// P2 = destination register
+			if pOp.P1 < len(v.regs) && pOp.P2 < len(v.regs) && pOp.P1 != pOp.P2 {
+				src := &v.regs[pOp.P1]
+				dst := &v.regs[pOp.P2]
+				dst.Type = src.Type
+				dst.IntVal = src.IntVal
+				dst.FloatVal = src.FloatVal
+				dst.IsNull = src.IsNull
+				dst.IsRowID = src.IsRowID
+				dst.IsZero = src.IsZero
+				if src.Bytes != nil {
+					dst.Bytes = make([]byte, len(src.Bytes))
+					copy(dst.Bytes, src.Bytes)
+				} else {
+					dst.Bytes = nil
+				}
+			}
+
+		// --- Sort opcodes ---
+
+		case OpSorterOpen:
+			// P1 = cursor number
+			v.execSorterOpen(pOp)
+
+		case OpSorterInsert:
+			// P1 = cursor number
+			// P2 = register with sort key
+			// P3 = register with data
+			v.execSorterInsert(pOp)
+
+		case OpSorterSort:
+			// P1 = cursor number
+			// P2 = jump target if empty
+			v.execSorterSort(pOp, &nextPC)
+
+		case OpSorterNext:
+			// P1 = cursor number
+			// P2 = jump target if no more
+			v.execSorterNext(pOp, &nextPC)
+
+		case OpSorterData:
+			// P1 = cursor number
+			// P2 = destination register
+			v.execSorterData(pOp)
+
+		case OpSorterCompare:
+			// P1 = cursor number
+			// P2 = jump target if different
+			// P3 = register with comparison key
+			v.execSorterCompare(pOp, &nextPC)
+
+		case OpSort:
+			// P1 = cursor number - sort the sorter
+			v.execSort(pOp)
+
+		// --- Cursor opcodes ---
+
+		case OpNullRow:
+			// P1 = cursor number - set to null row
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				v.cursors[pOp.P1].NullRow = true
+			}
+
+		case OpOpenEphemeral:
+			// P1 = cursor number
+			// P2 = number of columns
+			v.execOpenEphemeral(pOp)
+
+		case OpOpenPseudo:
+			// P1 = cursor number
+			// P2 = content register
+			// P3 = number of fields
+			v.execOpenPseudo(pOp)
+
+		case OpOpenDup:
+			// P1 = source cursor
+			// P2 = destination cursor
+			v.execOpenDup(pOp)
+
+		case OpOpenAutoindex:
+			// P1 = cursor number
+			// P2 = number of columns
+			v.execOpenAutoindex(pOp)
+
+		case OpResetSorter:
+			// P1 = cursor number - reset the sorter
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				if sorter, ok := v.cursors[pOp.P1].Cursor.(*Sorter); ok {
+					sorter.Reset()
+				}
+			}
+
+		case OpResetCount:
+			// Reset the change counter
+			v.nChange = 0
+
+		case OpSequence:
+			// P1 = cursor number
+			// P2 = destination register
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				v.regs[pOp.P2].SetInt(v.cursors[pOp.P1].SeqCount)
+				v.cursors[pOp.P1].SeqCount++
+			} else {
+				v.regs[pOp.P2].SetInt(0)
+			}
+
+		case OpSequenceTest:
+			// P1 = cursor number
+			// P2 = jump target
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				if v.cursors[pOp.P1].SeqCount == 0 {
+					nextPC = pOp.P2
+				}
+			}
+
+		// --- RowSet opcodes ---
+
+		case OpRowSetAdd:
+			// P1 = register holding RowSet
+			// P2 = register with rowid value
+			v.execRowSetAdd(pOp)
+
+		case OpRowSetRead:
+			// P1 = register holding RowSet
+			// P2 = jump target if empty
+			// P3 = destination register for rowid
+			v.execRowSetRead(pOp, &nextPC)
+
+		case OpRowSetTest:
+			// P1 = register holding RowSet
+			// P2 = jump target
+			// P3 = register with rowid
+			v.execRowSetTest(pOp, &nextPC)
 
 		default:
 			// Unknown opcode — skip
@@ -1785,5 +1955,418 @@ func (v *VDBE) execOffset(pOp *Instruction) {
 	v.regs[pOp.P3].SetInt(0)
 }
 
-// Ensure binary is available for record operations.
-var _ = binary.BigEndian
+var _ = binary.BigEndian // ensure binary import used
+// --- Aggregate opcode implementations ---
+
+// execAggStep executes an aggregate step function.
+// P1 = register holding aggregate state (created on first call)
+// P2 = number of arguments
+// P3 = start register of arguments
+// P4 = *AggFuncInfo
+func (v *VDBE) execAggStep(pOp *Instruction) {
+	afi, ok := pOp.P4.(*AggFuncInfo)
+	if !ok || afi.Step == nil {
+		return
+	}
+
+	reg := &v.regs[pOp.P1]
+	if reg.Pointer == nil {
+		reg.Pointer = new(interface{})
+	}
+
+	// Collect arguments from registers P3..P3+P2-1
+	nArgs := pOp.P2
+	args := make([]*Mem, nArgs)
+	for i := 0; i < nArgs; i++ {
+		idx := pOp.P3 + i
+		if idx < len(v.regs) {
+			args[i] = &v.regs[idx]
+		} else {
+			args[i] = &Mem{Type: MemNull, IsNull: true}
+		}
+	}
+
+	afi.Step(reg.Pointer, args)
+}
+
+// execAggFinal finalizes an aggregate function.
+// P1 = register holding aggregate state
+// P2 = destination register for result
+// P4 = *AggFuncInfo
+func (v *VDBE) execAggFinal(pOp *Instruction) {
+	afi, ok := pOp.P4.(*AggFuncInfo)
+	if !ok {
+		return
+	}
+
+	reg := &v.regs[pOp.P1]
+	destIdx := pOp.P2
+	if destIdx == 0 {
+		destIdx = pOp.P1
+	}
+
+	if afi.Finalize != nil && reg.Pointer != nil {
+		result := afi.Finalize(reg.Pointer)
+		if result != nil {
+			v.regs[destIdx] = *result
+		} else {
+			v.regs[destIdx].SetNull()
+		}
+	} else {
+		v.regs[destIdx].SetNull()
+	}
+}
+
+// execAggInverse executes an aggregate inverse step (for window functions).
+// P1 = register holding aggregate state
+// P2 = number of arguments
+// P3 = start register of arguments
+// P4 = *AggFuncInfo
+func (v *VDBE) execAggInverse(pOp *Instruction) {
+	afi, ok := pOp.P4.(*AggFuncInfo)
+	if !ok || afi.Inverse == nil {
+		// If no inverse function, fall back to step
+		v.execAggStep(pOp)
+		return
+	}
+
+	reg := &v.regs[pOp.P1]
+	if reg.Pointer == nil {
+		reg.Pointer = new(interface{})
+	}
+
+	nArgs := pOp.P2
+	args := make([]*Mem, nArgs)
+	for i := 0; i < nArgs; i++ {
+		idx := pOp.P3 + i
+		if idx < len(v.regs) {
+			args[i] = &v.regs[idx]
+		} else {
+			args[i] = &Mem{Type: MemNull, IsNull: true}
+		}
+	}
+
+	afi.Inverse(reg.Pointer, args)
+}
+
+// --- Sort opcode implementations ---
+
+// execSorterOpen opens a sorter and stores it in cursor P1.
+func (v *VDBE) execSorterOpen(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) {
+		newCursors := make([]*VdbeCursor, cursorIdx+1)
+		copy(newCursors, v.cursors)
+		v.cursors = newCursors
+	}
+
+	var sorter *Sorter
+	if cmpFn, ok := pOp.P4.(func(a, b []byte) int); ok {
+		sorter = NewSorterWithCompare(cmpFn)
+	} else {
+		sorter = NewSorter()
+	}
+
+	v.cursors[cursorIdx] = &VdbeCursor{
+		Cursor:  sorter,
+		NullRow: true,
+		Ordered: true,
+	}
+}
+
+// execSorterInsert inserts a record into the sorter at cursor P1.
+func (v *VDBE) execSorterInsert(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok {
+		return
+	}
+
+	var key []byte
+	if pOp.P2 < len(v.regs) {
+		key = v.regs[pOp.P2].BlobValue()
+		if key == nil {
+			key = v.regs[pOp.P2].Bytes
+		}
+	}
+
+	var data []byte
+	if pOp.P3 < len(v.regs) {
+		data = v.regs[pOp.P3].BlobValue()
+		if data == nil {
+			data = v.regs[pOp.P3].Bytes
+		}
+	}
+
+	if key == nil {
+		key = []byte{}
+	}
+	if data == nil {
+		data = []byte{}
+	}
+
+	sorter.Insert(key, data)
+}
+
+// execSorterSort sorts the sorter at cursor P1.
+// Jumps to P2 if the sorter is empty.
+func (v *VDBE) execSorterSort(pOp *Instruction, nextPC *int) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		*nextPC = pOp.P2
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok {
+		*nextPC = pOp.P2
+		return
+	}
+
+	if sorter.Count() == 0 {
+		*nextPC = pOp.P2
+		return
+	}
+
+	sorter.Sort()
+	sorter.Rewind()
+	v.cursors[cursorIdx].NullRow = false
+}
+
+// execSorterNext advances to the next sorted record.
+// Jumps to P2 if no more records.
+func (v *VDBE) execSorterNext(pOp *Instruction, nextPC *int) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		*nextPC = pOp.P2
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok || !sorter.Next() {
+		*nextPC = pOp.P2
+		return
+	}
+
+	v.cursors[cursorIdx].NullRow = false
+}
+
+// execSorterData reads data from the current sorter entry.
+func (v *VDBE) execSorterData(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	destIdx := pOp.P2
+
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		v.regs[destIdx].SetNull()
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok {
+		v.regs[destIdx].SetNull()
+		return
+	}
+
+	data := sorter.Data()
+	if data == nil {
+		v.regs[destIdx].SetNull()
+		return
+	}
+	v.regs[destIdx].SetBlob(data)
+}
+
+// execSorterCompare compares the current sorter key with a register value.
+// Jumps to P2 if they differ.
+func (v *VDBE) execSorterCompare(pOp *Instruction, nextPC *int) {
+	cursorIdx := pOp.P1
+	cmpRegIdx := pOp.P3
+
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		*nextPC = pOp.P2
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok {
+		*nextPC = pOp.P2
+		return
+	}
+
+	sorterKey := sorter.Key()
+	if sorterKey == nil || cmpRegIdx >= len(v.regs) {
+		*nextPC = pOp.P2
+		return
+	}
+
+	cmpVal := v.regs[cmpRegIdx].BlobValue()
+	if cmpVal == nil {
+		cmpVal = v.regs[cmpRegIdx].Bytes
+	}
+
+	if cmpVal == nil || CompareRecord(sorterKey, cmpVal) != 0 {
+		*nextPC = pOp.P2
+	}
+}
+
+// execSort sorts the sorter at cursor P1 (legacy sort opcode).
+func (v *VDBE) execSort(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+		return
+	}
+
+	sorter, ok := v.cursors[cursorIdx].Cursor.(*Sorter)
+	if !ok {
+		return
+	}
+
+	sorter.Sort()
+	sorter.Rewind()
+	v.cursors[cursorIdx].NullRow = false
+}
+
+// --- Cursor opcode implementations ---
+
+// execOpenEphemeral opens an ephemeral table cursor.
+func (v *VDBE) execOpenEphemeral(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) {
+		newCursors := make([]*VdbeCursor, cursorIdx+1)
+		copy(newCursors, v.cursors)
+		v.cursors = newCursors
+	}
+
+	sorter := NewSorter()
+	v.cursors[cursorIdx] = &VdbeCursor{
+		Cursor:  sorter,
+		NullRow: true,
+		Ordered: true,
+	}
+}
+
+// execOpenPseudo opens a pseudo-cursor that reads from a register.
+func (v *VDBE) execOpenPseudo(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) {
+		newCursors := make([]*VdbeCursor, cursorIdx+1)
+		copy(newCursors, v.cursors)
+		v.cursors = newCursors
+	}
+
+	v.cursors[cursorIdx] = &VdbeCursor{
+		Cursor:   nil,
+		NullRow:  true,
+		Pseudo:   true,
+		RootPage: pOp.P2, // reuse RootPage to store content register index
+	}
+}
+
+// execOpenDup duplicates cursor P1 into cursor P2.
+func (v *VDBE) execOpenDup(pOp *Instruction) {
+	srcIdx := pOp.P1
+	dstIdx := pOp.P2
+
+	if srcIdx >= len(v.cursors) || v.cursors[srcIdx] == nil {
+		return
+	}
+
+	if dstIdx >= len(v.cursors) {
+		newCursors := make([]*VdbeCursor, dstIdx+1)
+		copy(newCursors, v.cursors)
+		v.cursors = newCursors
+	}
+
+	src := v.cursors[srcIdx]
+	v.cursors[dstIdx] = &VdbeCursor{
+		RootPage:  src.RootPage,
+		Writeable: src.Writeable,
+		NullRow:   src.NullRow,
+		Ordered:   src.Ordered,
+		Pseudo:    src.Pseudo,
+		SeqCount:  src.SeqCount,
+	}
+	v.cursors[dstIdx].Cursor = src.Cursor
+}
+
+// execOpenAutoindex opens an automatic index cursor.
+func (v *VDBE) execOpenAutoindex(pOp *Instruction) {
+	cursorIdx := pOp.P1
+	if cursorIdx >= len(v.cursors) {
+		newCursors := make([]*VdbeCursor, cursorIdx+1)
+		copy(newCursors, v.cursors)
+		v.cursors = newCursors
+	}
+
+	sorter := NewSorter()
+	v.cursors[cursorIdx] = &VdbeCursor{
+		Cursor:  sorter,
+		NullRow: true,
+		Ordered: true,
+	}
+}
+
+// --- RowSet opcode implementations ---
+
+// execRowSetAdd adds a rowid to a RowSet stored in register P1.
+func (v *VDBE) execRowSetAdd(pOp *Instruction) {
+	reg := &v.regs[pOp.P1]
+	if reg.Pointer == nil {
+		reg.Pointer = encoding.NewRowSet()
+	}
+
+	rs, ok := reg.Pointer.(*encoding.RowSet)
+	if !ok {
+		rs = encoding.NewRowSet()
+		reg.Pointer = rs
+	}
+
+	rowid := v.regs[pOp.P2].IntValue()
+	rs.Insert(rowid)
+}
+
+// execRowSetRead reads the next rowid from a RowSet in register P1.
+// Jumps to P2 if the RowSet is empty.
+func (v *VDBE) execRowSetRead(pOp *Instruction, nextPC *int) {
+	reg := &v.regs[pOp.P1]
+	if reg.Pointer == nil {
+		*nextPC = pOp.P2
+		return
+	}
+
+	rs, ok := reg.Pointer.(*encoding.RowSet)
+	if !ok {
+		*nextPC = pOp.P2
+		return
+	}
+
+	rowid, found := rs.Next()
+	if !found {
+		*nextPC = pOp.P2
+		return
+	}
+
+	v.regs[pOp.P3].SetInt(rowid)
+}
+
+// execRowSetTest tests if a rowid is in the RowSet stored in register P1.
+// Jumps to P2 if the rowid is already present.
+func (v *VDBE) execRowSetTest(pOp *Instruction, nextPC *int) {
+	reg := &v.regs[pOp.P1]
+	if reg.Pointer == nil {
+		return
+	}
+
+	rs, ok := reg.Pointer.(*encoding.RowSet)
+	if !ok {
+		return
+	}
+
+	rowid := v.regs[pOp.P3].IntValue()
+	if rs.Test(rowid) {
+		*nextPC = pOp.P2
+	}
+}

@@ -14,6 +14,8 @@ type Mem struct {
 	FloatVal float64
 	// Variable-length
 	Bytes []byte
+	// Pointer holds an arbitrary Go value for aggregate context, RowSet, etc.
+	Pointer interface{}
 	// Flags
 	IsNull    bool
 	IsRowID   bool
@@ -256,10 +258,21 @@ func (m *Mem) Copy() *Mem {
 		IsNull:   m.IsNull,
 		IsRowID:  m.IsRowID,
 		IsZero:   m.IsZero,
+		Pointer:  m.Pointer, // shared reference is intentional for aggregate state
 	}
 	if m.Bytes != nil {
 		cp.Bytes = make([]byte, len(m.Bytes))
 		copy(cp.Bytes, m.Bytes)
 	}
 	return cp
+}
+
+// SetPointer sets the memory cell to hold an arbitrary Go pointer value.
+func (m *Mem) SetPointer(val interface{}) {
+	m.Type = MemNull
+	m.IsNull = true
+	m.Pointer = val
+	m.Bytes = nil
+	m.IntVal = 0
+	m.FloatVal = 0
 }
