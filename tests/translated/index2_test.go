@@ -53,7 +53,7 @@ func TestIndex2_1_1(t *testing.T) {
 // Expected: success
 func TestIndex2_1_2(t *testing.T) {
 	db := openTestDB(t)
-	execSQL(t, db, createTable1000Cols())
+	execSQLArgs(t, db, createTable1000Cols())
 
 	err := db.Exec(insertRow1000Vals(0))
 	if err != nil {
@@ -66,8 +66,8 @@ func TestIndex2_1_2(t *testing.T) {
 // Expected: c123 → 123
 func TestIndex2_1_3(t *testing.T) {
 	db := openTestDB(t)
-	execSQL(t, db, createTable1000Cols())
-	execSQL(t, db, insertRow1000Vals(0))
+	execSQLArgs(t, db, createTable1000Cols())
+	execSQLArgs(t, db, insertRow1000Vals(0))
 
 	got := queryText(t, db, "SELECT c123 FROM t1")
 	if got != "123" {
