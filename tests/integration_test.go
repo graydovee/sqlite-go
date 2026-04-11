@@ -373,7 +373,6 @@ func TestSelectStringLiteral(t *testing.T) {
 }
 
 func TestSelectNullLiteral(t *testing.T) {
-	t.Skip("TODO: needs fix - tracked for full feature parity")
 	db := openTestDB(t)
 
 	rs, err := db.Query("SELECT NULL")

@@ -1,6 +1,7 @@
 package pager
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -120,10 +121,17 @@ func (p *PagerImpl) Open() error {
 	}
 	if size > 0 {
 		p.pageCount = int(size / int64(p.pageSize))
-		// Read change counter from header (offset 24)
+		// Read database header to get page size and other fields
 		hdr := make([]byte, 100)
 		if err := f.Read(hdr, 0); err == nil {
-			p.pageSize = int(binary.BigEndian.Uint32(hdr[16:20]))
+			// Page size: uint16 big-endian at offset 16-17; value 1 means 65536
+			ps := int(binary.BigEndian.Uint16(hdr[16:18]))
+			if ps == 1 {
+				ps = 65536
+			}
+			if ps >= 512 {
+				p.pageSize = ps
+			}
 			if p.pageSize < 512 || p.pageSize > 65536 {
 				p.pageSize = 4096
 			}
@@ -603,19 +611,68 @@ func (p *PagerImpl) BackupInit(dest Pager) (Backup, error) {
 }
 
 // writeDBHeader writes key fields to the database file header.
+// The header is exactly 100 bytes matching the C SQLite file format.
 func (p *PagerImpl) writeDBHeader() {
 	if p.isMemory || p.file == nil {
 		return
 	}
 
 	hdr := make([]byte, 100)
-	// Read existing header
+	// Read existing header (preserves metadata written by btree layer)
 	p.file.Read(hdr, 0)
 
-	// Update fields
-	binary.BigEndian.PutUint32(hdr[16:20], uint32(p.pageSize))
+	// Check if this is a new database (no magic string yet)
+	magic := []byte("SQLite format 3\x00")
+	if !bytes.Equal(hdr[0:16], magic) {
+		copy(hdr[0:16], magic)
+		if p.journalMode == JournalWAL {
+			hdr[18] = 2
+			hdr[19] = 2
+		} else {
+			hdr[18] = 1
+			hdr[19] = 1
+		}
+		hdr[20] = 0  // Bytes of unused space at end of each page
+		hdr[21] = 64 // Max embedded payload fraction (MUST be 64)
+		hdr[22] = 32 // Min embedded payload fraction (MUST be 32)
+		hdr[23] = 32 // Leaf payload fraction (MUST be 32)
+		for i := 72; i < 92; i++ {
+			hdr[i] = 0
+		}
+	}
+
+	// Page size: uint16 big-endian at offset 16-17; value 1 means 65536
+	ps := p.pageSize
+	if ps == 65536 {
+		ps = 1
+	}
+	binary.BigEndian.PutUint16(hdr[16:18], uint16(ps))
+
+	// File change counter (offset 24-27)
 	binary.BigEndian.PutUint32(hdr[24:28], p.changeCount)
+
+	// Database size in pages (offset 28-31)
 	binary.BigEndian.PutUint32(hdr[28:32], uint32(p.pageCount))
+
+	// Freelist fields (offset 32-39)
+	binary.BigEndian.PutUint32(hdr[32:36], 0)
+	binary.BigEndian.PutUint32(hdr[36:40], 0)
+
+	// Text encoding (offset 56-59): must be 1, 2, or 3
+	if enc := binary.BigEndian.Uint32(hdr[56:60]); enc == 0 || enc > 3 {
+		binary.BigEndian.PutUint32(hdr[56:60], 1) // UTF-8
+	}
+
+	// Schema format number (offset 44-47): 4 is current
+	if sf := binary.BigEndian.Uint32(hdr[44:48]); sf == 0 {
+		binary.BigEndian.PutUint32(hdr[44:48], 4)
+	}
+
+	// Version-valid-for (offset 92-95)
+	binary.BigEndian.PutUint32(hdr[92:96], p.changeCount)
+
+	// SQLite version number (offset 96-99)
+	binary.BigEndian.PutUint32(hdr[96:100], 3045000)
 
 	p.file.Write(hdr, 0)
 }
