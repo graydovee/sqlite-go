@@ -56,8 +56,9 @@ func ReadVarint(buf []byte) (int64, int) {
 		return 0, 0
 	}
 
+	// SQLite varint: bytes 1-8 use 7 bits each (MSB=continuation), byte 9 uses 8 bits.
 	var v uint64
-	for i := 0; i < 9 && i < len(buf); i++ {
+	for i := 0; i < 8 && i < len(buf); i++ {
 		v = (v << 7) | uint64(buf[i]&0x7f)
 		if buf[i]&0x80 == 0 {
 			return int64(v), i + 1
