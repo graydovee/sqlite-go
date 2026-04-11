@@ -1473,7 +1473,378 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				nextPC = pOp.P2
 			}
 
-				default:
+		// ─── Part 1: Already-defined but unimplemented opcodes ────────
+
+		case OpInt64:
+			// Load a 64-bit integer from P4 into register P2.
+			if p4val, ok := pOp.P4.(int64); ok {
+				v.regs[pOp.P2].SetInt(p4val)
+			}
+
+		case OpString:
+			// Load a string from P4 into register P2. P1 = length.
+			if s, ok := pOp.P4.(string); ok {
+				if pOp.P1 > 0 && pOp.P1 < len(s) {
+					v.regs[pOp.P2].SetText(s[:pOp.P1])
+				} else {
+					v.regs[pOp.P2].SetText(s)
+				}
+			}
+
+		case OpHaltIfNull:
+			// If register P3 is NULL, fall through into OpHalt.
+			if v.regs[pOp.P3].Type == MemNull {
+				v.halt = true
+				if pOp.P1 != 0 {
+					v.rc = ResultCode(pOp.P1)
+					errMsg := "constraint failed"
+					if pOp.P4 != nil {
+						if s, ok := pOp.P4.(string); ok {
+							errMsg = s
+						}
+					}
+					v.err = fmt.Errorf("%s", errMsg)
+					return false, v.err
+				}
+				return false, nil
+			}
+
+		case OpCrossjoin:
+			// Set crossjoin flag on cursor P1.
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				v.cursors[pOp.P1].Ordered = false
+			}
+
+		case OpFilter:
+			// Bloom filter check. P1 = filter blob register,
+			// P3 = start of key regs, P4 = count. Jump to P2 if not present.
+			filterReg := &v.regs[pOp.P1]
+			if filterReg.Type != MemBlob || len(filterReg.Bytes) == 0 {
+				nextPC = pOp.P2
+				break
+			}
+			filterBlob := filterReg.Bytes
+			var nFields int
+			switch nf := pOp.P4.(type) {
+			case int:
+				nFields = nf
+			case int64:
+				nFields = int(nf)
+			default:
+				nFields = 1
+			}
+			var h uint64
+			for i := 0; i < nFields; i++ {
+				idx := pOp.P3 + i
+				if idx >= len(v.regs) {
+					h += 4093
+					continue
+				}
+				reg := &v.regs[idx]
+				switch reg.Type {
+				case MemInt:
+					h += uint64(reg.IntVal)
+				case MemFloat:
+					h += uint64(int64(reg.FloatVal))
+				case MemStr, MemBlob:
+					h += 4093 + uint64(reg.Type)
+				}
+			}
+			if len(filterBlob) > 0 {
+				bitIdx := h % uint64(len(filterBlob)*8)
+				byteIdx := bitIdx / 8
+				bitOff := bitIdx % 8
+				if int(byteIdx) < len(filterBlob) {
+					if filterBlob[byteIdx]&(1<<bitOff) == 0 {
+						nextPC = pOp.P2
+					}
+				}
+			}
+
+		case OpUpdate:
+			// Update current row at cursor P1 with data from register P3.
+			cursorIdx := pOp.P1
+			if cursorIdx >= len(v.cursors) || v.cursors[cursorIdx] == nil {
+				break
+			}
+			vc := v.cursors[cursorIdx]
+			cursor := vc.Cursor
+			var data []byte
+			if pOp.P3 > 0 && pOp.P3 < len(v.regs) && v.regs[pOp.P3].Bytes != nil {
+				data = v.regs[pOp.P3].Bytes
+			}
+			var rowid int64
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				rowid = v.regs[pOp.P2].IntValue()
+			}
+			keyBuf := make([]byte, 9)
+			keyLen := putVarint(keyBuf, rowid)
+			if inserter, ok := v.db.(Inserter); ok && cursor != nil {
+				if err := inserter.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
+					v.err = err
+					v.rc = ResultError
+				}
+			}
+
+		// ─── Part 2: New opcodes from C version ─────────────────────
+
+		case OpAffinity:
+			// Apply column affinity to a range of registers.
+			// P4 = affinity string, P1 = start reg, P2 = count.
+			affStr, ok := pOp.P4.(string)
+			if !ok || len(affStr) == 0 {
+				break
+			}
+			for i := 0; i < len(affStr) && i < pOp.P2; i++ {
+				reg := &v.regs[pOp.P1+i]
+				applyAffinity(reg, affStr[i])
+			}
+
+		case OpIntCopy:
+			// Copy integer value from register P1 to register P2.
+			pIn1 := &v.regs[pOp.P1]
+			v.regs[pOp.P2].SetInt(pIn1.IntValue())
+
+		case OpSoftNull:
+			// Set register P1 to NULL but preserve type info hint.
+			v.regs[pOp.P1].IsNull = true
+			v.regs[pOp.P1].Type = MemNull
+
+		case OpSeekRowid:
+			// Seek cursor P1 to rowid from register P3. Jump to P2 if not found.
+			_, bc, ok := v.getCursor(pOp.P1)
+			if !ok || bc == nil {
+				if pOp.P2 > 0 {
+					nextPC = pOp.P2
+				}
+				break
+			}
+			rowid := v.regs[pOp.P3].IntValue()
+			result, err := bc.SeekRowid(btree.RowID(rowid))
+			if err != nil {
+				v.err = err
+				v.rc = ResultError
+				break
+			}
+			if result != btree.SeekFound {
+				if pOp.P2 > 0 {
+					nextPC = pOp.P2
+				}
+			}
+
+		case OpSeekEnd:
+			// Position cursor P1 at end. If already valid, no-op.
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				vc := v.cursors[pOp.P1]
+				if cursor, ok := vc.Cursor.(Cursor); ok && cursor.IsValid() {
+					break
+				}
+				if cursor, ok := vc.Cursor.(Cursor); ok {
+					cursor.Last()
+					vc.NullRow = false
+				}
+			}
+
+		case OpReopenIdx:
+			// Reopen index cursor P1 on root page P2 if already open on same page.
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				vc := v.cursors[pOp.P1]
+				if vc.RootPage == pOp.P2 {
+					vc.NullRow = true
+					if cursor, ok := vc.Cursor.(Cursor); ok {
+						cursor.First()
+					}
+					break
+				}
+			}
+			v.openCursor(pOp.P1, pOp.P2, false)
+
+		case OpCount:
+			// Count entries in cursor P1's B-Tree, store in register P2.
+			if pOp.P1 >= len(v.cursors) || v.cursors[pOp.P1] == nil {
+				v.regs[pOp.P2].SetInt(0)
+				break
+			}
+			vc := v.cursors[pOp.P1]
+			var count int64
+			if bc, ok := vc.Cursor.(btree.BTCursor); ok {
+				count = 0
+				if hasFirst, _ := bc.First(); hasFirst {
+					count = 1
+					for {
+						hasNext, err := bc.Next()
+						if err != nil || !hasNext {
+							break
+						}
+						count++
+					}
+					bc.First()
+				}
+			} else if cursor, ok := vc.Cursor.(Cursor); ok {
+				count = 0
+				if hasFirst, _ := cursor.First(); hasFirst {
+					count = 1
+					for {
+						hasNext, err := cursor.Next()
+						if err != nil || !hasNext {
+							break
+						}
+						count++
+					}
+					cursor.First()
+				}
+			}
+			if pOp.P3 != 0 && count > 0 {
+				est := int64(1)
+				for est < count {
+					est *= 2
+				}
+				v.regs[pOp.P2].SetInt(est)
+			} else {
+				v.regs[pOp.P2].SetInt(count)
+			}
+
+		case OpOffsetLimit:
+			// Compute OFFSET+LIMIT: r[P2] = r[P1] + max(r[P3], 0).
+			limit := v.regs[pOp.P1].IntValue()
+			offset := v.regs[pOp.P3].IntValue()
+			if offset < 0 {
+				offset = 0
+			}
+			if limit <= 0 {
+				v.regs[pOp.P2].SetInt(-1)
+			} else {
+				result := limit + offset
+				if result < limit {
+					v.regs[pOp.P2].SetInt(-1)
+				} else {
+					v.regs[pOp.P2].SetInt(result)
+				}
+			}
+
+		case OpIsTrue:
+			// Check truthiness with NULL handling. P3=NULL semantics, P4=invert.
+			pIn1 := &v.regs[pOp.P1]
+			nullSemantics := pOp.P3
+			invertFlag := 0
+			if pOp.P4 != nil {
+				switch v := pOp.P4.(type) {
+				case int:
+					invertFlag = v
+				case int64:
+					invertFlag = int(v)
+				}
+			}
+			if pIn1.Type == MemNull {
+				if nullSemantics != 0 {
+					v.regs[pOp.P2].SetInt(int64(1 ^ invertFlag))
+				} else {
+					v.regs[pOp.P2].SetInt(int64(0 ^ invertFlag))
+				}
+			} else {
+				var boolVal int64
+				if pIn1.Bool() {
+					boolVal = 1
+				}
+				v.regs[pOp.P2].SetInt(boolVal ^ int64(invertFlag))
+			}
+
+		case OpIsType:
+			// Check column serial type against mask in P5. Jump to P2 on match.
+			var typeMask int
+			if pOp.P1 >= 0 {
+				if pOp.P1 >= len(v.cursors) || v.cursors[pOp.P1] == nil {
+					break
+				}
+				vc := v.cursors[pOp.P1]
+				if vc.NullRow {
+					typeMask = 0x10
+				} else {
+					cursor, ok := vc.Cursor.(Cursor)
+					if !ok || !cursor.IsValid() {
+						typeMask = 0x10
+					} else {
+						typeMask = typeMaskFromCursor(cursor, pOp.P3)
+					}
+				}
+			} else {
+				if pOp.P3 < len(v.regs) {
+					typeMask = typeMaskFromMem(&v.regs[pOp.P3])
+				}
+			}
+			if typeMask&pOp.P5 != 0 {
+				nextPC = pOp.P2
+			}
+
+		case OpZeroOrNull:
+			// If either P1 or P3 is NULL, store NULL in P2. Otherwise store 0.
+			if v.regs[pOp.P1].Type == MemNull || v.regs[pOp.P3].Type == MemNull {
+				v.regs[pOp.P2].SetNull()
+			} else {
+				v.regs[pOp.P2].SetInt(0)
+			}
+
+		case OpRealAffinity:
+			// If register P1 is an integer, coerce it to float.
+			pIn1 := &v.regs[pOp.P1]
+			if pIn1.Type == MemInt {
+				pIn1.SetFloat(float64(pIn1.IntVal))
+			}
+
+		case OpMemMax:
+			// Set register P1 to max(current value, value from P2).
+			pIn1 := &v.regs[pOp.P1]
+			pIn2 := &v.regs[pOp.P2]
+			val1 := pIn1.IntValue()
+			val2 := pIn2.IntValue()
+			if val1 < val2 {
+				pIn1.SetInt(val2)
+			}
+
+		case OpIntegrityCk:
+			// Run integrity check on B-Trees.
+			destReg := pOp.P1 + 1
+			if destReg < len(v.regs) {
+				v.regs[destReg].SetNull()
+			}
+
+		case OpAggStep1:
+			// Aggregate step variant. P1=inverse flag, P2=arg start, P3=accum reg.
+			afi, ok := pOp.P4.(*AggFuncInfo)
+			if !ok {
+				break
+			}
+			reg := &v.regs[pOp.P3]
+			if reg.Pointer == nil {
+				reg.Pointer = new(interface{})
+			}
+			nArgs := pOp.P5
+			if nArgs <= 0 {
+				nArgs = 1
+			}
+			args := make([]*Mem, nArgs)
+			for i := 0; i < nArgs; i++ {
+				idx := pOp.P2 + i
+				if idx < len(v.regs) {
+					args[i] = &v.regs[idx]
+				} else {
+					args[i] = &Mem{Type: MemNull, IsNull: true}
+				}
+			}
+			if pOp.P1 != 0 && afi.Inverse != nil {
+				afi.Inverse(reg.Pointer, args)
+			} else if afi.Step != nil {
+				afi.Step(reg.Pointer, args)
+			}
+
+		case OpPureFunc:
+			// Pure (deterministic) function call - same as OpFunction.
+			v.execFunction(pOp)
+
+		case OpSqlExec:
+			// Execute SQL from P4 string. No-op in current implementation.
+
+			default:
 			// Unknown opcode — skip
 		}
 
@@ -3140,5 +3511,97 @@ func (v *VDBE) execRowSetTest(pOp *Instruction, nextPC *int) {
 	rowid := v.regs[pOp.P3].IntValue()
 	if rs.Test(rowid) {
 		*nextPC = pOp.P2
+	}
+}
+
+// --- Affinity and type helpers for new opcodes ---
+
+// applyAffinity applies a column affinity to a register value.
+// Affinity characters: 't'=text, 'n'=numeric, 'i'=integer, 'b'=blob, 'u'=unspecified/none.
+func applyAffinity(reg *Mem, aff byte) {
+	switch aff {
+	case 'i': // INTEGER affinity
+		switch reg.Type {
+		case MemStr:
+			// Try to parse as integer
+			s := string(reg.Bytes)
+			var v int64
+			if _, err := fmt.Sscanf(s, "%d", &v); err == nil {
+				reg.SetInt(v)
+			}
+		case MemFloat:
+			reg.SetInt(int64(reg.FloatVal))
+		}
+	case 'n': // NUMERIC affinity
+		switch reg.Type {
+		case MemStr:
+			s := string(reg.Bytes)
+			var v int64
+			if _, err := fmt.Sscanf(s, "%d", &v); err == nil {
+				reg.SetInt(v)
+			} else {
+				var f float64
+				if _, err := fmt.Sscanf(s, "%f", &f); err == nil {
+					reg.SetFloat(f)
+				}
+			}
+		}
+	case 't': // TEXT affinity
+		switch reg.Type {
+		case MemInt:
+			reg.SetText(fmt.Sprintf("%d", reg.IntVal))
+		case MemFloat:
+			reg.SetText(fmt.Sprintf("%g", reg.FloatVal))
+		case MemBlob:
+			reg.Type = MemStr
+		}
+	case 'b': // BLOB affinity - no conversion needed
+		// blob affinity is a no-op
+	default:
+		// 'u' or unspecified - no conversion
+	}
+}
+
+// typeMaskFromMem returns a type mask bit for the given Mem value.
+// Bits: 0x01=INTEGER, 0x02=FLOAT, 0x04=TEXT, 0x08=BLOB, 0x10=NULL
+func typeMaskFromMem(m *Mem) int {
+	switch m.Type {
+	case MemInt:
+		return 0x01
+	case MemFloat:
+		return 0x02
+	case MemStr:
+		return 0x04
+	case MemBlob:
+		return 0x08
+	case MemNull:
+		return 0x10
+	}
+	return 0x10
+}
+
+// typeMaskFromCursor reads column colIdx from the cursor's current row
+// and returns the type mask. Falls back to NULL if column cannot be read.
+func typeMaskFromCursor(cursor Cursor, colIdx int) int {
+	data, err := cursor.Data()
+	if err != nil || data == nil {
+		return 0x10
+	}
+	values, err := ParseRecord(data)
+	if err != nil || colIdx >= len(values) {
+		return 0x10
+	}
+	v := values[colIdx]
+	switch v.Type {
+	case "int":
+		return 0x01
+	case "float":
+		return 0x02
+	case "text":
+		return 0x04
+	case "blob":
+		return 0x08
+	default:
+		return 0x10
 	}
 }

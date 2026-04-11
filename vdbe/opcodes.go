@@ -11,9 +11,11 @@ const (
 	OpAbortable      Opcode = iota
 	OpAdd
 	OpAddImm
+	OpAffinity
 	OpAggFinal
 	OpAggInverse
 	OpAggStep
+	OpAggStep1
 	OpAggValue
 	OpAnd
 	OpAutoCommit
@@ -32,6 +34,7 @@ const (
 	OpCompare
 	OpConcat
 	OpCopy
+	OpCount
 	OpCreateBTree
 	OpCreateIndex
 	OpCreateTable
@@ -76,12 +79,16 @@ const (
 	OpIncrVacuum
 	OpInit
 	OpInitCoroutine
+	OpIntCopy
 	OpInteger
 	OpInsert
 	OpInt64
 	OpIntCmp
+	OpIntegrityCk
 	OpInterrupt
 	OpIsNull
+	OpIsTrue
+	OpIsType
 	OpJournalMode
 	OpJump
 	OpLast
@@ -90,6 +97,7 @@ const (
 	OpLt
 	OpMakeRecord
 	OpMaxPgcnt
+	OpMemMax
 	OpMove
 	OpMul
 	OpMustBeInt
@@ -105,6 +113,7 @@ const (
 	OpNull
 	OpNullRow
 	OpOffset
+	OpOffsetLimit
 	OpOnce
 	OpOpenAutoindex
 	OpOpenDup
@@ -119,8 +128,11 @@ const (
 	OpPermutation
 	OpPrev
 	OpProgram
+	OpPureFunc
 	OpReadCookie
 	OpReal
+	OpRealAffinity
+	OpReopenIdx
 	OpRelease
 	OpRemainder
 	OpResetCount
@@ -138,17 +150,20 @@ const (
 	OpSavepoint
 	OpSCopy
 	OpSeek
+	OpSeekEnd
 	OpSeekGE
 	OpSeekGT
 	OpSeekHit
 	OpSeekLE
 	OpSeekLT
+	OpSeekRowid
 	OpSeekScan
 	OpSequence
 	OpSequenceTest
 	OpSetCookie
 	OpShiftLeft
 	OpShiftRight
+	OpSoftNull
 	OpSort
 	OpSorterCompare
 	OpSorterData
@@ -156,6 +171,7 @@ const (
 	OpSorterNext
 	OpSorterOpen
 	OpSorterSort
+	OpSqlExec
 	OpString
 	OpString8
 	OpSubtract
@@ -182,6 +198,7 @@ const (
 	OpVUpdate
 	OpWriteCookie
 	OpYield
+	OpZeroOrNull
 )
 
 // Instruction represents a single VDBE instruction.
