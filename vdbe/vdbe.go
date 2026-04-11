@@ -170,6 +170,13 @@ type VDBE struct {
 	onceFlags   map[int]bool  // Once opcode: maps instruction PC to executed flag
 	// Callbacks
 	resultRowFunc func(regs []Mem, startIdx, count int)
+	// Foreign key constraint counters
+	fkConstraint int // immediate FK constraint counter
+	deferredCons int // deferred FK constraint counter
+	// Statement expiration flag
+	expired bool
+	// Permutation array set by OpPermutation, used by OpCompare
+	permReg []int
 }
 
 // AggFuncInfo carries aggregate function callbacks for VDBE opcodes.
@@ -179,6 +186,11 @@ type AggFuncInfo struct {
 	Step     func(state interface{}, args []*Mem)
 	Finalize func(state interface{}) *Mem
 	Inverse  func(state interface{}, args []*Mem)
+}
+
+// FunctionCaller is the interface for calling registered SQL functions.
+type FunctionCaller interface {
+	CallFunction(name string, args []*Mem) *Mem
 }
 
 // NewVDBE creates a new VDBE instance.
@@ -1154,7 +1166,314 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				locker.UnlockTable(pOp.P1, pOp.P2)
 			}
 
-		default:
+		case OpFunction:
+			v.execFunction(pOp)
+
+		// OpCompare compares two vectors of registers.
+		// P1/P2 are starting registers, P3 is the count.
+		// The comparison result is stored in v.lastCompare for use by OpJump.
+		case OpCompare:
+			v.execCompare(pOp)
+
+		// OpConcat concatenates strings from registers P1 and P2 into P3.
+		// Result is NULL if either input is NULL. P3 = P2 || P1.
+		case OpConcat:
+			pIn1 := &v.regs[pOp.P1]
+			pIn2 := &v.regs[pOp.P2]
+			pOut := &v.regs[pOp.P3]
+			if pIn1.Type == MemNull || pIn2.Type == MemNull {
+				pOut.SetNull()
+			} else {
+				s2 := pIn2.TextValue()
+				s1 := pIn1.TextValue()
+				pOut.SetText(s2 + s1)
+			}
+
+		// OpAnd performs three-valued logical AND.
+		// P1 and P2 are input registers, P3 is output.
+		// 0=false, 1=true, 2=null. AND truth table:
+		// {0,0,0, 0,1,2, 0,2,2}
+		case OpAnd:
+			v1 := boolValue(&v.regs[pOp.P1])
+			v2 := boolValue(&v.regs[pOp.P2])
+			andLogic := [9]int{0, 0, 0, 0, 1, 2, 0, 2, 2}
+			result := andLogic[v1*3+v2]
+			pOut := &v.regs[pOp.P3]
+			if result == 2 {
+				pOut.SetNull()
+			} else {
+				pOut.SetInt(int64(result))
+			}
+
+		// OpOr performs three-valued logical OR.
+		// P1 and P2 are input registers, P3 is output.
+		// OR truth table: {0,1,2, 1,1,1, 2,1,2}
+		case OpOr:
+			v1 := boolValue(&v.regs[pOp.P1])
+			v2 := boolValue(&v.regs[pOp.P2])
+			orLogic := [9]int{0, 1, 2, 1, 1, 1, 2, 1, 2}
+			result := orLogic[v1*3+v2]
+			pOut := &v.regs[pOp.P3]
+			if result == 2 {
+				pOut.SetNull()
+			} else {
+				pOut.SetInt(int64(result))
+			}
+
+		// OpCollSeq sets the collation sequence. P4 holds collation info.
+		// If P1 is non-zero, set register P1 to 0.
+		// Mostly a no-op in this implementation.
+		case OpCollSeq:
+			if pOp.P1 != 0 && pOp.P1 < len(v.regs) {
+				v.regs[pOp.P1].SetInt(0)
+			}
+
+		// OpCommit commits the current transaction.
+		case OpCommit:
+			if v.db != nil {
+				if err := v.db.Commit(); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		// OpRollback rolls back the current transaction.
+		case OpRollback:
+			if v.db != nil {
+				if err := v.db.Rollback(); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		// OpSavepoint manages savepoints.
+		// P1: 0=BEGIN, 1=RELEASE, 2=ROLLBACK. P4 is the savepoint name.
+		case OpSavepoint:
+			if v.db != nil {
+				switch pOp.P1 {
+				case 0: // BEGIN
+					v.db.BeginTransaction(false)
+				case 1: // RELEASE
+					v.db.Commit()
+				case 2: // ROLLBACK
+					v.db.Rollback()
+				}
+			}
+
+		// OpRelease releases a savepoint.
+		case OpRelease:
+			if v.db != nil {
+				v.db.Commit()
+			}
+
+		// OpCheckpoint checkpoints the database.
+		// P1 is db index, P2 is mode, P3 is output register.
+		case OpCheckpoint:
+			if pOp.P3 > 0 && pOp.P3 < len(v.regs) {
+				v.regs[pOp.P3].SetInt(0)
+			}
+
+		// OpVacuum vacuums the database.
+		case OpVacuum:
+			// Vacuum is a no-op in this implementation
+
+		// OpIncrVacuum performs incremental vacuum.
+		// P1 is db index, P2 is jump target if vacuum is done.
+		case OpIncrVacuum:
+			nextPC = pOp.P2
+
+		// OpJournalMode changes or queries the journal mode.
+		// P1 is db, P2 is output register, P3 is new mode.
+		case OpJournalMode:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetText("memory")
+			}
+
+		// OpMaxPgcnt sets/queries the maximum page count.
+		// P1 is db, P2 is output register, P3 is new max (0 to query).
+		case OpMaxPgcnt:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetInt(0)
+			}
+
+		// OpPagecount returns the current page count.
+		// P1 is db, P2 is output register.
+		case OpPagecount:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetInt(0)
+			}
+
+		// OpReadCookie reads a schema cookie value.
+		// P1 is db index, P2 is output register, P3 is cookie id.
+		case OpReadCookie:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				var cookieVal int64
+				if cs, ok := v.db.(CookieStore); ok && v.db != nil {
+					val, err := cs.GetCookie(pOp.P3)
+					if err == nil {
+						cookieVal = val
+					}
+				}
+				v.regs[pOp.P2].SetInt(cookieVal)
+			}
+
+		// OpSetCookie writes a cookie value.
+		// P1 is db, P2 is cookie id, P3 is value.
+		case OpSetCookie:
+			if cs, ok := v.db.(CookieStore); ok && v.db != nil {
+				cs.SetCookie(pOp.P2, int64(pOp.P3))
+			}
+
+		// OpWriteCookie writes a cookie value (alias for SetCookie).
+		case OpWriteCookie:
+			if cs, ok := v.db.(CookieStore); ok && v.db != nil {
+				cs.SetCookie(pOp.P2, int64(pOp.P3))
+			}
+
+		// OpLoadAnalysis loads analysis data for the database.
+		case OpLoadAnalysis:
+			// Analysis loading is a no-op in this implementation
+
+		// OpExpire expires prepared statements.
+		// P1=0 expires all; P1=1 expires current. P2 controls immediate vs deferred.
+		case OpExpire:
+			if pOp.P1 != 0 {
+				v.expired = true
+			}
+
+		// OpExplain outputs the explain text. No-op in execution.
+		case OpExplain:
+			// No-op during execution
+
+		// OpTrace outputs trace information. No-op.
+		case OpTrace:
+			// No-op
+
+		// OpNoop does nothing.
+		case OpNoop:
+			// Intentionally empty
+
+		// OpInterrupt checks for an interrupt condition.
+		case OpInterrupt:
+			// No-op in this implementation
+
+		// OpProgram executes a sub-program (trigger).
+		// P4 is the sub-program, P3 is the register for frame data.
+		case OpProgram:
+			// Sub-program execution (triggers) not yet fully implemented.
+
+		// OpParam copies a parameter from the parent frame.
+		// P1 is offset into parent frame, P2 is output register.
+		case OpParam:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetNull()
+			}
+
+		// OpPermutation sets a column permutation for the next OpCompare.
+		// P4 is an int array describing the permutation.
+		case OpPermutation:
+			if perm, ok := pOp.P4.([]int); ok {
+				v.permReg = perm
+			}
+
+		// --- Virtual Table Opcodes (stubs) ---
+
+		// OpVBegin begins a virtual table transaction.
+		case OpVBegin:
+			// Stub: virtual table transactions not yet implemented
+
+		// OpVCreate creates a virtual table.
+		case OpVCreate:
+			// Stub: virtual table creation not yet implemented
+
+		// OpVDestroy destroys a virtual table.
+		case OpVDestroy:
+			// Stub: virtual table destruction not yet implemented
+
+		// OpVOpen opens a virtual table cursor.
+		case OpVOpen:
+			// Stub: virtual table cursors not yet implemented
+
+		// OpVFilter filters a virtual table result set.
+		// P1 is cursor, P2 is jump target if empty.
+		case OpVFilter:
+			nextPC = pOp.P2
+
+		// OpVColumn reads a column from a virtual table.
+		// P1 is cursor, P2 is column index, P3 is output register.
+		case OpVColumn:
+			if pOp.P3 > 0 && pOp.P3 < len(v.regs) {
+				v.regs[pOp.P3].SetNull()
+			}
+
+		// OpVNext advances to the next row in a virtual table.
+		// P1 is cursor, P2 is jump target if more rows.
+		case OpVNext:
+			nextPC = pOp.P2
+
+		// OpVRename renames a virtual table.
+		case OpVRename:
+			// Stub: virtual table rename not yet implemented
+
+		// OpVUpdate updates a row in a virtual table.
+		case OpVUpdate:
+			// Stub: virtual table update not yet implemented
+
+		// OpVCheck checks virtual table integrity.
+		case OpVCheck:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetNull()
+			}
+
+		// OpVIn handles virtual table IN constraint.
+		case OpVIn:
+			if pOp.P2 > 0 && pOp.P2 < len(v.regs) {
+				v.regs[pOp.P2].SetNull()
+			}
+
+		// --- Type Check and Maintenance Opcodes ---
+
+		// OpTypeCheck validates register types against a schema.
+		case OpTypeCheck:
+			// Type checking is a no-op in this implementation
+
+		// OpTrim trims the database file size.
+		case OpTrim:
+			// Database trimming is a no-op in this implementation
+
+		// OpAbortable checks if the current operation can be aborted.
+		case OpAbortable:
+			// Debug assertion opcode, no-op in this implementation
+
+		// OpFkCheck checks for immediate foreign key constraints.
+		case OpFkCheck:
+			// FK checking is a no-op in this implementation
+
+		// OpFkCounter increments a foreign key constraint counter.
+		// P1: 0=statement counter, 1=deferred counter. P2 is increment.
+		case OpFkCounter:
+			if pOp.P1 != 0 {
+				v.deferredCons += pOp.P2
+			} else {
+				v.fkConstraint += pOp.P2
+			}
+
+		// OpFkIfZero jumps to P2 if the FK counter is zero.
+		// P1: 0=statement counter, 1=deferred counter.
+		case OpFkIfZero:
+			var counter int
+			if pOp.P1 != 0 {
+				counter = v.deferredCons
+			} else {
+				counter = v.fkConstraint
+			}
+			if counter == 0 {
+				nextPC = pOp.P2
+			}
+
+				default:
 			// Unknown opcode — skip
 		}
 
@@ -2313,6 +2632,100 @@ func (v *VDBE) execOffset(pOp *Instruction) {
 	// This is rarely used (SQLITE_ENABLE_OFFSET_SQL_FUNC).
 	v.regs[pOp.P3].SetInt(0)
 }
+
+func boolValue(m *Mem) int {
+	if m.Type == MemNull {
+		return 2
+	}
+	if m.Bool() {
+		return 1
+	}
+	return 0
+}
+
+// execFunction implements OpFunction: invokes a registered SQL function.
+// P4 is a FuncInfo, P2 is the start of argument registers, P3 is the output register.
+func (v *VDBE) execFunction(pOp *Instruction) {
+	fi, ok := pOp.P4.(*FuncInfo)
+	if !ok || fi == nil {
+		v.regs[pOp.P3].SetNull()
+		return
+	}
+
+	// Collect arguments from registers starting at P2
+	argCount := fi.ArgCount
+	if argCount < 0 {
+		// Variable args: P5 contains the actual count
+		argCount = pOp.P5
+	}
+	if argCount < 0 {
+		argCount = 0
+	}
+
+	args := make([]*Mem, argCount)
+	for i := 0; i < argCount; i++ {
+		idx := pOp.P2 + i
+		if idx < len(v.regs) {
+			args[i] = &v.regs[idx]
+		} else {
+			args[i] = &Mem{Type: MemNull, IsNull: true}
+		}
+	}
+
+	// Try to look up and invoke the function via FunctionCaller interface
+	if fc, ok := v.db.(FunctionCaller); ok {
+		result := fc.CallFunction(fi.Name, args)
+		if result != nil {
+			v.regs[pOp.P3] = *result
+		} else {
+			v.regs[pOp.P3].SetNull()
+		}
+	} else {
+		// No function registry available; result is null
+		v.regs[pOp.P3].SetNull()
+	}
+}
+
+// execCompare implements OpCompare: compares two vectors of registers
+// and stores the result in v.lastCompare for subsequent OpJump.
+// P1 and P2 are starting register indices, P3 is the vector length.
+func (v *VDBE) execCompare(pOp *Instruction) {
+	n := pOp.P3
+	if n <= 0 {
+		v.lastCompare = 0
+		return
+	}
+
+	p1 := pOp.P1
+	p2 := pOp.P2
+
+	for i := 0; i < n; i++ {
+		var idx1, idx2 int
+		if v.permReg != nil && i < len(v.permReg) {
+			idx1 = p1 + v.permReg[i]
+			idx2 = p2 + v.permReg[i]
+		} else {
+			idx1 = p1 + i
+			idx2 = p2 + i
+		}
+
+		if idx1 >= len(v.regs) || idx2 >= len(v.regs) {
+			continue
+		}
+
+		v.lastCompare = MemCompare(&v.regs[idx1], &v.regs[idx2])
+		if v.lastCompare != 0 {
+			// Clear permutation after use
+			v.permReg = nil
+			return
+		}
+	}
+
+	v.lastCompare = 0
+	v.permReg = nil
+}
+
+// Ensure binary is available for record operations.
 
 var _ = binary.BigEndian // ensure binary import used
 // --- Aggregate opcode implementations ---
