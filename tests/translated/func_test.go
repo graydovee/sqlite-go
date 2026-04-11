@@ -52,35 +52,7 @@ func setupT1Numeric(t *testing.T, db *sqlite.Database) {
 	execOrFail(t, db, "INSERT INTO t1 VALUES (3, -2.0, -5.0)")
 }
 
-// queryStrings runs a query and collects the first column of every row as strings.
-func queryStrings(t *testing.T, db *sqlite.Database, sql string) []string {
-	t.Helper()
-	rs, err := db.Query(sql)
-	if err != nil {
-		t.Fatalf("Query(%q): %v", sql, err)
-	}
-	defer rs.Close()
-	var result []string
-	for rs.Next() {
-		result = append(result, rs.Row().ColumnText(0))
-	}
-	return result
-}
 
-// queryInts runs a query and collects the first column of every row as int64.
-func queryInts(t *testing.T, db *sqlite.Database, sql string) []int64 {
-	t.Helper()
-	rs, err := db.Query(sql)
-	if err != nil {
-		t.Fatalf("Query(%q): %v", sql, err)
-	}
-	defer rs.Close()
-	var result []int64
-	for rs.Next() {
-		result = append(result, rs.Row().ColumnInt(0))
-	}
-	return result
-}
 
 // queryFloats runs a query and collects the first column of every row as float64.
 func queryFloats(t *testing.T, db *sqlite.Database, sql string) []float64 {
