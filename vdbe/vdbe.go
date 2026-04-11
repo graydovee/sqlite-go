@@ -119,6 +119,29 @@ type BTreeDestroyer interface {
 	DestroyBTree(rootPage int) error
 }
 
+// SchemaChanger handles in-memory schema modifications (drop table/index/trigger).
+type SchemaChanger interface {
+	DropTable(dbID int, name string) error
+	DropIndex(dbID int, name string) error
+	DropTrigger(dbID int, name string) error
+}
+
+// TableClearer clears all rows from a B-Tree table.
+type TableClearer interface {
+	ClearTable(rootPage int) (int64, error)
+}
+
+// SchemaParser parses schema from internal tables.
+type SchemaParser interface {
+	ParseSchema(dbID int, sql string) error
+}
+
+// TableLocker handles table locking operations.
+type TableLocker interface {
+	LockTable(dbID int, rootPage int, write bool) error
+	UnlockTable(dbID int, rootPage int)
+}
+
 // Program represents a compiled VDBE program.
 type Program struct {
 	Instructions []Instruction
@@ -143,6 +166,8 @@ type VDBE struct {
 	halt     bool
 	initialized bool
 	nChange  int64        // Change counter for OpResetCount
+	lastCompare int           // Result of last comparison (-1, 0, +1)
+	onceFlags   map[int]bool  // Once opcode: maps instruction PC to executed flag
 	// Callbacks
 	resultRowFunc func(regs []Mem, startIdx, count int)
 }
@@ -780,6 +805,192 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				}
 			}
 
+		// ─── Flow Control Opcodes ──────────────────────────────────────
+
+		case OpJump:
+			// Three-way jump based on last comparison result
+			if v.lastCompare < 0 {
+				nextPC = pOp.P1
+			} else if v.lastCompare == 0 {
+				nextPC = pOp.P2
+			} else {
+				nextPC = pOp.P3
+			}
+
+		case OpYield:
+			// Swap PC with value in register P1 (coroutine yield/resume)
+			pIn1 := &v.regs[pOp.P1]
+			pcDest := int(pIn1.IntVal)
+			pIn1.SetInt(int64(v.pc))
+			nextPC = pcDest + 1
+
+		case OpInitCoroutine:
+			// Initialize coroutine register with entry point
+			v.regs[pOp.P1].SetInt(int64(pOp.P3 - 1))
+			if pOp.P2 != 0 {
+				nextPC = pOp.P2
+			}
+
+		case OpEndCoroutine:
+			// End a coroutine — jump to caller's Yield P2 target
+			pIn1 := &v.regs[pOp.P1]
+			callerPC := int(pIn1.IntVal)
+			if callerPC >= 0 && callerPC < nOp {
+				callerOp := &aOp[callerPC]
+				pIn1.SetInt(int64(v.pc - 1))
+				nextPC = callerOp.P2
+			}
+
+		case OpElseEq:
+			// Jump if last comparison was equal (else-equal optimization)
+			if v.lastCompare == 0 {
+				nextPC = pOp.P2
+			}
+
+		case OpOnce:
+			// Execute only once — jump to P2 on subsequent visits
+			if v.onceFlags == nil {
+				v.onceFlags = make(map[int]bool)
+			}
+			if v.onceFlags[v.pc] {
+				nextPC = pOp.P2
+			} else {
+				v.onceFlags[v.pc] = true
+			}
+
+		case OpBeginSubrtn:
+			// Begin subroutine — set output register to NULL
+			v.regs[pOp.P2].SetNull()
+
+		case OpIntCmp:
+			// Compare two integer registers, store result for OpJump
+			a := v.regs[pOp.P1].IntValue()
+			b := v.regs[pOp.P3].IntValue()
+			if a < b {
+				v.lastCompare = -1
+			} else if a > b {
+				v.lastCompare = 1
+			} else {
+				v.lastCompare = 0
+			}
+
+		// ─── Type/Value Opcodes ───────────────────────────────────
+
+		case OpMustBeInt:
+			// Ensure register P1 is an integer; jump to P2 or error if not
+			pIn1 := &v.regs[pOp.P1]
+			if pIn1.Type == MemInt {
+				break
+			}
+			coerced := false
+			switch pIn1.Type {
+			case MemFloat:
+				iv := int64(pIn1.FloatVal)
+				if float64(iv) == pIn1.FloatVal {
+					pIn1.SetInt(iv)
+					coerced = true
+				}
+			case MemStr:
+				if f, ok := tryParseFloat(pIn1); ok {
+					iv := int64(f)
+					if f == float64(iv) {
+						pIn1.SetInt(iv)
+						coerced = true
+					}
+				}
+			}
+			if !coerced {
+				if pOp.P2 == 0 {
+					v.rc = ResultError
+					v.err = fmt.Errorf("datatype mismatch")
+					return false, v.err
+				}
+				nextPC = pOp.P2
+			}
+
+		case OpCast:
+			// Cast register P1 to the affinity specified by P2
+			pIn1 := &v.regs[pOp.P1]
+			switch pOp.P2 {
+			case 0x41: // 'A' - BLOB
+				if pIn1.Type == MemStr {
+					pIn1.Type = MemBlob
+				} else if pIn1.Type == MemInt || pIn1.Type == MemFloat {
+					pIn1.SetBlob(nil)
+				}
+			case 0x42: // 'B' - TEXT
+				switch pIn1.Type {
+				case MemInt:
+					pIn1.SetText(pIn1.StringValue())
+				case MemFloat:
+					pIn1.SetText(pIn1.StringValue())
+				case MemBlob:
+					pIn1.Type = MemStr
+				}
+			case 0x43: // 'C' - NUMERIC
+				if pIn1.Type == MemStr {
+					if f, ok := tryParseFloat(pIn1); ok {
+						if f == float64(int64(f)) {
+							pIn1.SetInt(int64(f))
+						} else {
+							pIn1.SetFloat(f)
+						}
+					}
+				}
+			case 0x44: // 'D' - INTEGER
+				switch pIn1.Type {
+				case MemFloat:
+					pIn1.SetInt(int64(pIn1.FloatVal))
+				case MemStr:
+					if f, ok := tryParseFloat(pIn1); ok {
+						pIn1.SetInt(int64(f))
+					}
+				}
+			case 0x45: // 'E' - REAL
+				switch pIn1.Type {
+				case MemInt:
+					pIn1.SetFloat(float64(pIn1.IntVal))
+				case MemStr:
+					if f, ok := tryParseFloat(pIn1); ok {
+						pIn1.SetFloat(f)
+					}
+				}
+			}
+
+		case OpAddImm:
+			// Add immediate value P2 to register P1 (as integer)
+			pIn1 := &v.regs[pOp.P1]
+			pIn1.SetInt(pIn1.IntValue() + int64(pOp.P2))
+
+		case OpDecrJumpZero:
+			// Decrement register P1 and jump to P2 if it becomes zero
+			pIn1 := &v.regs[pOp.P1]
+			if pIn1.IntVal > math.MinInt64 {
+				pIn1.SetInt(pIn1.IntVal - 1)
+			}
+			if pIn1.IntVal == 0 {
+				nextPC = pOp.P2
+			}
+
+		case OpIfPos:
+			// Jump to P2 if register P1 > 0; subtract P3 from P1
+			pIn1 := &v.regs[pOp.P1]
+			if pIn1.IntVal > 0 {
+				pIn1.SetInt(pIn1.IntVal - int64(pOp.P3))
+				nextPC = pOp.P2
+			}
+
+		case OpIfNullRow:
+			// Jump to P2 if cursor P1 is on a null row; set reg[P3] to NULL
+			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+				if v.cursors[pOp.P1].NullRow {
+					if pOp.P3 > 0 && pOp.P3 < len(v.regs) {
+						v.regs[pOp.P3].SetNull()
+					}
+					nextPC = pOp.P2
+				}
+			}
+
 		// --- RowSet opcodes ---
 
 		case OpRowSetAdd:
@@ -798,6 +1009,150 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			// P2 = jump target
 			// P3 = register with rowid
 			v.execRowSetTest(pOp, &nextPC)
+		case OpIfNotOpen:
+			// Jump to P2 if cursor P1 is not open
+			if pOp.P1 >= len(v.cursors) || v.cursors[pOp.P1] == nil {
+				nextPC = pOp.P2
+			}
+
+		case OpIsNull:
+			// Jump to P2 if register P1 is NULL
+			if v.regs[pOp.P1].Type == MemNull {
+				nextPC = pOp.P2
+			}
+
+		case OpNotNull:
+			// Jump to P2 if register P1 is not NULL
+			if v.regs[pOp.P1].Type != MemNull {
+				nextPC = pOp.P2
+			}
+
+		// ─── DDL Opcodes ───────────────────────────────────────
+
+		case OpCreateBTree:
+			// Create a new B-Tree and store root page in reg[P2]
+			if creator, ok := v.db.(BTreeCreator); ok {
+				rootPage, err := creator.CreateBTree(pOp.P3)
+				if err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+				v.regs[pOp.P2].SetInt(int64(rootPage))
+			}
+
+		case OpCreateTable:
+			// Create a new table B-Tree (integer key)
+			if creator, ok := v.db.(BTreeCreator); ok {
+				rootPage, err := creator.CreateBTree(1) // BTREE_INTKEY
+				if err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+				v.regs[pOp.P2].SetInt(int64(rootPage))
+			}
+
+		case OpCreateIndex:
+			// Create a new index B-Tree (blob key)
+			if creator, ok := v.db.(BTreeCreator); ok {
+				rootPage, err := creator.CreateBTree(2) // BTREE_BLOBKEY
+				if err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+				v.regs[pOp.P2].SetInt(int64(rootPage))
+			}
+
+		case OpDestroy:
+			// Destroy a B-Tree rooted at page P1
+			if destroyer, ok := v.db.(BTreeDestroyer); ok {
+				if err := destroyer.DestroyBTree(pOp.P1); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+				v.regs[pOp.P2].SetInt(0) // iMoved (auto-vacuum, simplified)
+			}
+
+		case OpDropTable:
+			// Drop table named P4 from database P1
+			if sc, ok := v.db.(SchemaChanger); ok {
+				name, _ := pOp.P4.(string)
+				if err := sc.DropTable(pOp.P1, name); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		case OpDropIndex:
+			// Drop index named P4 from database P1
+			if sc, ok := v.db.(SchemaChanger); ok {
+				name, _ := pOp.P4.(string)
+				if err := sc.DropIndex(pOp.P1, name); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		case OpDropTrigger:
+			// Drop trigger named P4 from database P1
+			if sc, ok := v.db.(SchemaChanger); ok {
+				name, _ := pOp.P4.(string)
+				if err := sc.DropTrigger(pOp.P1, name); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		case OpClear:
+			// Clear all rows from table at root page P1
+			if clearer, ok := v.db.(TableClearer); ok {
+				nChange, err := clearer.ClearTable(pOp.P1)
+				if err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+				if pOp.P3 > 0 && pOp.P3 < len(v.regs) {
+					v.regs[pOp.P3].SetInt(v.regs[pOp.P3].IntValue() + nChange)
+				}
+			}
+
+		case OpParseSchema:
+			// Parse schema from internal table
+			if parser, ok := v.db.(SchemaParser); ok {
+				sql := ""
+				if s, ok := pOp.P4.(string); ok {
+					sql = s
+				}
+				if err := parser.ParseSchema(pOp.P1, sql); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		case OpTableLock:
+			// Lock table at root page P2 in database P1
+			if locker, ok := v.db.(TableLocker); ok {
+				write := pOp.P3 != 0
+				if err := locker.LockTable(pOp.P1, pOp.P2, write); err != nil {
+					v.rc = ResultError
+					v.err = err
+					return false, v.err
+				}
+			}
+
+		case OpTableUnlock:
+			// Unlock table in database P1
+			if locker, ok := v.db.(TableLocker); ok {
+				locker.UnlockTable(pOp.P1, pOp.P2)
+			}
 
 		default:
 			// Unknown opcode — skip
@@ -816,6 +1171,8 @@ func (v *VDBE) reset() {
 	v.err = nil
 	v.halt = false
 	v.initialized = false
+	v.lastCompare = 0
+	v.onceFlags = nil
 
 	if v.nMem > 0 {
 		v.regs = make([]Mem, v.nMem+1) // 1-indexed for clarity
@@ -880,6 +1237,7 @@ func (v *VDBE) compare(pOp *Instruction, cmpOp int) bool {
 		if cmpOp == 1 && pOp.P5 != 0 {
 			// Ne with NULL-equal flag: NULL == NULL
 			if pIn1.Type == MemNull && pIn3.Type == MemNull {
+				v.lastCompare = 0
 				return true
 			}
 		}
@@ -887,6 +1245,7 @@ func (v *VDBE) compare(pOp *Instruction, cmpOp int) bool {
 	}
 
 	cmp := MemCompare(pIn1, pIn3)
+	v.lastCompare = cmp
 
 	switch cmpOp {
 	case 0: // Eq
