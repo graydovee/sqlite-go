@@ -119,15 +119,22 @@ func (p *PagerImpl) Open() error {
 		return err
 	}
 	if size > 0 {
-		p.pageCount = int(size / int64(p.pageSize))
-		// Read change counter from header (offset 24)
+		// Read all header fields from existing database
 		hdr := make([]byte, 100)
 		if err := f.Read(hdr, 0); err == nil {
-			p.pageSize = int(binary.BigEndian.Uint32(hdr[16:20]))
-			if p.pageSize < 512 || p.pageSize > 65536 {
-				p.pageSize = 4096
+			// Page size: uint16 at offset 16-17, value 1 means 65536
+			ps := int(binary.BigEndian.Uint16(hdr[16:18]))
+			if ps == 1 {
+				ps = 65536
 			}
+			if ps >= 512 && ps <= 65536 {
+				p.pageSize = ps
+				p.cache = NewPCache(p.pageSize, p.cacheSize)
+			}
+			p.pageCount = int(size / int64(p.pageSize))
 			p.changeCount = binary.BigEndian.Uint32(hdr[24:28])
+		} else {
+			p.pageCount = int(size / int64(p.pageSize))
 		}
 	}
 
@@ -145,7 +152,7 @@ func (p *PagerImpl) Close() error {
 	defer p.mu.Unlock()
 
 	if p.inTx {
-		p.Rollback()
+		p.rollbackInternal()
 	}
 
 	if p.wal != nil {
@@ -154,6 +161,25 @@ func (p *PagerImpl) Close() error {
 			p.walMxFrame = 0
 		}
 		p.wal.Close()
+	}
+
+	// Flush all dirty pages to disk before closing
+	if p.file != nil && !p.isMemory {
+		dirty := p.cache.DirtyPages()
+		for _, page := range dirty {
+			offset := int64(page.PageNum-1) * int64(p.pageSize)
+			if err := p.file.Write(page.Data, offset); err != nil {
+				return fmt.Errorf("flush page %d on close: %w", page.PageNum, err)
+			}
+			page.Dirty = false
+		}
+		p.cache.ClearDirty()
+
+		p.writeDBHeader()
+
+		if err := p.file.Sync(vfs.SyncFull); err != nil {
+			return fmt.Errorf("sync on close: %w", err)
+		}
 	}
 
 	p.cache.DiscardAll()
@@ -434,6 +460,12 @@ func (p *PagerImpl) Commit() error {
 func (p *PagerImpl) Rollback() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.rollbackInternal()
+}
+
+// rollbackInternal performs rollback without acquiring the lock.
+// Must be called with p.mu held.
+func (p *PagerImpl) rollbackInternal() error {
 
 	if !p.inTx {
 		return nil
@@ -602,49 +634,87 @@ func (p *PagerImpl) BackupInit(dest Pager) (Backup, error) {
 	return nil, fmt.Errorf("backup not yet implemented")
 }
 
-// writeDBHeader writes key fields to the database file header.
+// writeDBHeader writes the complete 100-byte SQLite header to the database file.
 func (p *PagerImpl) writeDBHeader() {
 	if p.isMemory || p.file == nil {
 		return
 	}
 
 	hdr := make([]byte, 100)
+	// Read existing header to preserve fields we don't explicitly set (e.g. schema cookie,
+	// freelist trunk page, user version, application ID).  Read failure is fine — the
+	// zero-initialized buffer gives correct defaults for a new database.
 	p.file.Read(hdr, 0)
 
-	// Magic string
-	copy(hdr[0:16], []byte("SQLite format 3\x00"))
+	// Offset 0-15: Magic string
+	copy(hdr[0:], "SQLite format 3\x00")
 
-	// Page size (uint16 at offset 16-17, 1 means 65536)
-	ps := uint16(p.pageSize)
+	// Offset 16-17: Page size (big-endian uint16, value 1 means 65536)
+	psVal := uint16(p.pageSize)
 	if p.pageSize == 65536 {
-		ps = 1
+		psVal = 1
 	}
-	binary.BigEndian.PutUint16(hdr[16:18], ps)
+	binary.BigEndian.PutUint16(hdr[16:18], psVal)
 
-	// File format versions
+	// Offset 18: File format write version (1=legacy journal, 2=WAL)
 	if p.journalMode == JournalWAL {
 		hdr[18] = 2
-		hdr[19] = 2
 	} else {
 		hdr[18] = 1
-		hdr[19] = 1
 	}
+	// Offset 19: File format read version (same as write version)
+	hdr[19] = hdr[18]
 
-	hdr[20] = 0  // reserved space
-	hdr[21] = 64 // max embedded payload fraction
-	hdr[22] = 32 // min embedded payload fraction
-	hdr[23] = 32 // leaf payload fraction
+	// Offset 20: Reserved space at end of each page
+	hdr[20] = 0
+	// Offset 21: Max embedded payload fraction (MUST be 64)
+	hdr[21] = 64
+	// Offset 22: Min embedded payload fraction (MUST be 32)
+	hdr[22] = 32
+	// Offset 23: Leaf payload fraction (MUST be 32)
+	hdr[23] = 32
 
+	// Offset 24-27: File change counter
 	binary.BigEndian.PutUint32(hdr[24:28], p.changeCount)
+	// Offset 28-31: Size of the database file in pages
 	binary.BigEndian.PutUint32(hdr[28:32], uint32(p.pageCount))
-	// freelist: already zero from make
-	// schema cookie: preserve existing or set to 0
-	if binary.BigEndian.Uint32(hdr[44:48]) == 0 {
-		binary.BigEndian.PutUint32(hdr[44:48], 4) // schema format
+
+	// Offset 32-35: First freelist trunk page (0 = none)
+	binary.BigEndian.PutUint32(hdr[32:36], 0)
+	// Offset 36-39: Total freelist pages
+	binary.BigEndian.PutUint32(hdr[36:40], uint32(len(p.freeList)))
+
+	// Offset 40-43: Schema cookie (preserve existing)
+	if binary.BigEndian.Uint32(hdr[40:44]) == 0 && p.changeCount > 0 {
+		// First write after creating the DB: initialise schema cookie
+		binary.BigEndian.PutUint32(hdr[40:44], 0)
 	}
-	binary.BigEndian.PutUint32(hdr[56:60], 1) // UTF-8
+
+	// Offset 44-47: Schema format number (4 = current)
+	if binary.BigEndian.Uint32(hdr[44:48]) == 0 {
+		binary.BigEndian.PutUint32(hdr[44:48], 4)
+	}
+
+	// Offset 48-51: Default page cache size (0)
+	binary.BigEndian.PutUint32(hdr[48:52], 0)
+	// Offset 52-55: Largest root b-tree page number (auto-vacuum, 0 = none)
+	binary.BigEndian.PutUint32(hdr[52:56], 0)
+	// Offset 56-59: Text encoding (1 = UTF-8)
+	binary.BigEndian.PutUint32(hdr[56:60], 1)
+	// Offset 60-63: User version
+	binary.BigEndian.PutUint32(hdr[60:64], 0)
+	// Offset 64-67: Incremental vacuum (0 = not incremental)
+	binary.BigEndian.PutUint32(hdr[64:68], 0)
+	// Offset 68-71: Application ID
+	binary.BigEndian.PutUint32(hdr[68:72], 0)
+	// Offset 72-91: Reserved for expansion (must be zero)
+	for i := 72; i < 92; i++ {
+		hdr[i] = 0
+	}
+	// Offset 92-95: Version-valid-for number
 	binary.BigEndian.PutUint32(hdr[92:96], p.changeCount)
-	binary.BigEndian.PutUint32(hdr[96:100], 3046000) // SQLite version 3.46.0
+	// Offset 96-99: SQLite version number (3.46.0)
+	binary.BigEndian.PutUint32(hdr[96:100], 3046000)
 
 	p.file.Write(hdr, 0)
 }
