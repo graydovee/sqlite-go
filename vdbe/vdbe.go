@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+
+	"github.com/sqlite-go/sqlite-go/btree"
 )
 
 // ResultCode represents the result of VDBE execution.
@@ -28,6 +30,7 @@ type VdbeCursor struct {
 	Writeable bool
 	NullRow  bool
 	Ordered  bool
+	SeekHit  int // tracks seek hit count for IN-early-out optimization
 }
 
 // ColumnInfo describes column metadata for a table.
@@ -239,8 +242,6 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				return false, v.err
 			}
 			return false, nil
-
-		case OpNoConflict:
 
 		case OpAutoCommit:
 			if v.db != nil {
@@ -531,6 +532,102 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			}
 			v.pc = nextPC
 			return true, nil
+
+		// ─── Index Opcodes ──────────────────────────────────────────────────
+
+		case OpIdxInsert:
+			v.execIdxInsert(pOp)
+
+		case OpIdxDelete:
+			v.execIdxDelete(pOp)
+
+		case OpIdxRowid:
+			v.execIdxRowid(pOp)
+
+		// ─── Seek Opcodes ───────────────────────────────────────────────────
+
+		case OpSeek:
+			nextPC = v.execSeek(pOp, nextPC)
+
+		case OpSeekGE:
+			nextPC = v.execSeekCmp(pOp, nextPC, false, false) // >=
+
+		case OpSeekGT:
+			nextPC = v.execSeekCmp(pOp, nextPC, true, false) // >
+
+		case OpSeekLE:
+			nextPC = v.execSeekCmp(pOp, nextPC, false, true) // <=
+
+		case OpSeekLT:
+			nextPC = v.execSeekCmp(pOp, nextPC, true, true) // <
+
+		case OpSeekScan:
+			// SeekScan is an optimization hint for IN loops.
+			// Scan forward at most P1 entries; if found, jump to P2.
+			nextPC = v.execSeekScan(pOp, nextPC)
+
+		case OpSeekHit:
+			// Update the seekHit counter for cursor P1 within bounds [P2, P3].
+			v.execSeekHit(pOp)
+
+		// ─── Index Comparison Opcodes ───────────────────────────────────────
+
+		case OpIdxLT:
+			if v.execIdxCompare(pOp, -1) { // index_key < reg_key
+				nextPC = pOp.P2
+			}
+
+		case OpIdxLE:
+			if v.execIdxCompare(pOp, 0) { // index_key <= reg_key
+				nextPC = pOp.P2
+			}
+
+		case OpIdxGT:
+			if v.execIdxCompare(pOp, 1) { // index_key > reg_key
+				nextPC = pOp.P2
+			}
+
+		case OpIdxGE:
+			if v.execIdxCompare(pOp, 2) { // index_key >= reg_key
+				nextPC = pOp.P2
+			}
+
+		// ─── Found / NotFound Opcodes ───────────────────────────────────────
+
+		case OpFound:
+			if v.execFound(pOp) {
+				nextPC = pOp.P2
+			}
+
+		case OpNotFound:
+			if !v.execFound(pOp) {
+				nextPC = pOp.P2
+			}
+
+		case OpNoConflict:
+			if !v.execConflict(pOp) {
+				nextPC = pOp.P2
+			}
+
+		case OpNotExists:
+			nextPC = v.execNotExists(pOp, nextPC)
+
+		case OpUnique:
+			nextPC = v.execUnique(pOp, nextPC)
+
+		// ─── Row Data Opcodes ──────────────────────────────────────────────
+
+		case OpRowid:
+			v.execRowid(pOp)
+
+		case OpRowData:
+			v.execRowData(pOp)
+
+		case OpRowCell:
+			v.execRowCell(pOp)
+
+		case OpOffset:
+			v.execOffset(pOp)
 
 		default:
 			// Unknown opcode — skip
@@ -858,6 +955,834 @@ func decodeVarint(buf []byte) (int64, int) {
 		return int64(v), 9
 	}
 	return int64(v), len(buf)
+}
+
+// ─── Index Opcode Helpers ────────────────────────────────────────────────────
+
+// getCursor retrieves the VdbeCursor and btree.BTCursor for the given index.
+func (v *VDBE) getCursor(idx int) (*VdbeCursor, btree.BTCursor, bool) {
+	if idx >= len(v.cursors) || v.cursors[idx] == nil {
+		return nil, nil, false
+	}
+	vc := v.cursors[idx]
+	bc, ok := vc.Cursor.(btree.BTCursor)
+	if !ok {
+		return vc, nil, false
+	}
+	return vc, bc, true
+}
+
+// execIdxInsert inserts a record into an index B-Tree.
+// P1 = cursor, P2 = key register (blob), P3 = rowid register (for append hint).
+func (v *VDBE) execIdxInsert(pOp *Instruction) {
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		return
+	}
+
+	// The key is a blob (record) from register P2
+	keyReg := &v.regs[pOp.P2]
+	var key []byte
+	if keyReg.Type == MemBlob || keyReg.Type == MemStr {
+		key = keyReg.Bytes
+	} else {
+		key = keyReg.BlobValue()
+	}
+	if key == nil {
+		key = []byte{}
+	}
+
+	// For index inserts, we use the Inserter interface on db
+	if inserter, ok := v.db.(Inserter); ok {
+		if err := inserter.Insert(vc.Cursor, key, nil, 0, 0); err != nil {
+			v.err = err
+			v.rc = ResultError
+		}
+	}
+}
+
+// execIdxDelete deletes an entry from an index B-Tree.
+// P1 = cursor, P2 = key register base, P3 = number of key fields.
+func (v *VDBE) execIdxDelete(pOp *Instruction) {
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		return
+	}
+
+	// Build the key from registers P2..P2+P3-1, or use a blob key
+	var key []byte
+	if pOp.P3 > 0 {
+		rb := NewRecordBuilder()
+		for i := 0; i < pOp.P3; i++ {
+			reg := &v.regs[pOp.P2+i]
+			switch reg.Type {
+			case MemNull:
+				rb.AddNull()
+			case MemInt:
+				rb.AddInt(reg.IntVal)
+			case MemFloat:
+				rb.AddFloat(reg.FloatVal)
+			case MemStr:
+				rb.AddText(string(reg.Bytes))
+			case MemBlob:
+				rb.AddBlob(reg.Bytes)
+			}
+		}
+		key = rb.Build()
+	} else {
+		keyReg := &v.regs[pOp.P2]
+		key = keyReg.BlobValue()
+	}
+
+	if key == nil {
+		return
+	}
+
+	// Seek to the key
+	_, err := bc.Seek(key)
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return
+	}
+
+	// Delete at current position
+	if deleter, ok := v.db.(Deleter); ok && bc.IsValid() {
+		if err := deleter.Delete(vc.Cursor); err != nil {
+			v.err = err
+			v.rc = ResultError
+		}
+	}
+}
+
+// execIdxRowid extracts the rowid from an index cursor's current entry.
+// P1 = cursor, P2 = destination register.
+// The rowid is the last varint in the index key.
+func (v *VDBE) execIdxRowid(pOp *Instruction) {
+	destReg := pOp.P2
+
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if vc.NullRow || !bc.IsValid() {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	// For index cursors, the key contains the index record.
+	// The rowid is typically the last field in the index key record.
+	key := bc.Key()
+	if key == nil || len(key) == 0 {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	// Parse the record to get the last field (which should be the rowid)
+	values, err := ParseRecord(key)
+	if err != nil || len(values) == 0 {
+		// Fallback: try to read as raw varint at end of key
+		// The last varint in the key is often the rowid
+		rowid := extractRowidFromIndexKey(key)
+		if rowid != 0 {
+			v.regs[destReg].SetInt(rowid)
+		} else {
+			v.regs[destReg].SetNull()
+		}
+		return
+	}
+
+	lastVal := values[len(values)-1]
+	switch lastVal.Type {
+	case "int":
+		v.regs[destReg].SetInt(lastVal.IntVal)
+	default:
+		v.regs[destReg].SetNull()
+	}
+}
+
+// extractRowidFromIndexKey tries to extract a rowid from the end of an index key.
+func extractRowidFromIndexKey(key []byte) int64 {
+	if len(key) == 0 {
+		return 0
+	}
+	// Parse the record header to find the last field
+	headerSize, n := readVarint(key)
+	if n == 0 || int(headerSize) > len(key) {
+		return 0
+	}
+	// Parse serial types to find the last field's position
+	pos := n
+	var lastSerialType int64
+	lastSerialTypePos := n
+	for pos < int(headerSize) {
+		lastSerialTypePos = pos
+		st, sn := readVarint(key[pos:])
+		if sn == 0 {
+			break
+		}
+		lastSerialType = st
+		pos += sn
+	}
+	// Calculate the body position of the last field by summing sizes of all fields
+	bodyPos := int(headerSize)
+	serialPos := n
+	for serialPos < lastSerialTypePos {
+		st, sn := readVarint(key[serialPos:])
+		if sn == 0 {
+			break
+		}
+		bodyPos += serialTypeSize(st)
+		serialPos += sn
+	}
+	// Decode the last field based on its serial type
+	if bodyPos < len(key) {
+		sz := serialTypeSize(lastSerialType)
+		if bodyPos+sz <= len(key) {
+			val := decodeValueFrom(key[bodyPos:bodyPos+sz], lastSerialType)
+			if val.Type == "int" {
+				return val.IntVal
+			}
+		}
+	}
+	return 0
+}
+
+// ─── Seek Opcode Helpers ─────────────────────────────────────────────────────
+
+// execSeek positions a cursor at an exact key match.
+// P1 = cursor, P2 = jump target, P3 = key register.
+// For table cursors, the key is a rowid.
+func (v *VDBE) execSeek(pOp *Instruction, nextPC int) int {
+	_, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		if pOp.P2 > 0 {
+			return pOp.P2
+		}
+		return nextPC
+	}
+
+	keyReg := &v.regs[pOp.P3]
+
+	// For table cursors, use SeekRowid with integer key
+	rowid := keyReg.IntValue()
+	result, err := bc.SeekRowid(btree.RowID(rowid))
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return nextPC
+	}
+
+	if result != btree.SeekFound {
+		if pOp.P2 > 0 {
+			return pOp.P2
+		}
+	}
+	return nextPC
+}
+
+// execSeekCmp handles SeekGE, SeekGT, SeekLE, SeekLT.
+// strict=true means > or < (not >= or <=).
+// reverse=true means LE or LT (seeking backwards).
+func (v *VDBE) execSeekCmp(pOp *Instruction, nextPC int, strict, reverse bool) int {
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		if pOp.P2 > 0 {
+			return pOp.P2
+		}
+		return nextPC
+	}
+	_ = vc
+
+	keyReg := &v.regs[pOp.P3]
+
+	// Try as a record/blob key first (for index cursors)
+	var key []byte
+	if keyReg.Type == MemBlob || keyReg.Type == MemStr {
+		key = keyReg.Bytes
+	} else {
+		// Build a key from the register value
+		rb := NewRecordBuilder()
+		switch keyReg.Type {
+		case MemNull:
+			rb.AddNull()
+		case MemInt:
+			rb.AddInt(keyReg.IntVal)
+		case MemFloat:
+			rb.AddFloat(keyReg.FloatVal)
+		case MemStr:
+			rb.AddText(string(keyReg.Bytes))
+		default:
+			rb.AddInt(keyReg.IntValue())
+		}
+		key = rb.Build()
+	}
+
+	result, err := bc.Seek(key)
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return nextPC
+	}
+
+	// Adjust based on the seek comparison type
+	switch {
+	case !strict && !reverse: // SeekGE: >=
+		// Cursor is positioned at or after the key. If not found exactly,
+		// we may need to check if cursor is valid.
+		if result == btree.SeekNotFound && !bc.IsValid() {
+			if pOp.P2 > 0 {
+				return pOp.P2
+			}
+		}
+	case strict && !reverse: // SeekGT: >
+		// If we found the exact key, advance past it
+		if result == btree.SeekFound {
+			hasNext, err := bc.Next()
+			if err != nil {
+				v.err = err
+				v.rc = ResultError
+				return nextPC
+			}
+			if !hasNext {
+				if pOp.P2 > 0 {
+					return pOp.P2
+				}
+			}
+		}
+	case !strict && reverse: // SeekLE: <=
+		// If cursor is past the key, go back one
+		if result == btree.SeekNotFound {
+			// Cursor is at first entry > key, so go back to get <=
+			hasPrev, err := bc.Prev()
+			if err != nil {
+				v.err = err
+				v.rc = ResultError
+				return nextPC
+			}
+			if !hasPrev {
+				if pOp.P2 > 0 {
+					return pOp.P2
+				}
+			}
+		}
+	case strict && reverse: // SeekLT: <
+		// Cursor is at first entry >= key, so always go back one
+		if result == btree.SeekFound {
+			hasPrev, err := bc.Prev()
+			if err != nil {
+				v.err = err
+				v.rc = ResultError
+				return nextPC
+			}
+			if !hasPrev {
+				if pOp.P2 > 0 {
+					return pOp.P2
+				}
+			}
+		} else {
+			// NotFound means cursor is at first > key
+			hasPrev, err := bc.Prev()
+			if err != nil {
+				v.err = err
+				v.rc = ResultError
+				return nextPC
+			}
+			if !hasPrev {
+				if pOp.P2 > 0 {
+					return pOp.P2
+				}
+			}
+		}
+	}
+
+	return nextPC
+}
+
+// execSeekScan implements the SeekScan optimization for IN loops.
+// P1 = max scan steps, P2 = jump target if found.
+func (v *VDBE) execSeekScan(pOp *Instruction, nextPC int) int {
+	// Look at the next instruction to get cursor info
+	// This is a simplified implementation: scan forward at most P1 steps
+	// from the current cursor position
+	maxSteps := pOp.P1
+	if maxSteps <= 0 {
+		maxSteps = 1
+	}
+
+	// Use the cursor from the next instruction (the SeekGE/SeekGT that follows)
+	// For now, just continue to next instruction (the real SeekGE/SeekGT)
+	return nextPC
+}
+
+// execSeekHit updates the seekHit counter for a cursor.
+// P1 = cursor, P2 = lower bound, P3 = upper bound.
+func (v *VDBE) execSeekHit(pOp *Instruction) {
+	if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
+		vc := v.cursors[pOp.P1]
+		if pOp.P3 > 0 {
+			vc.SeekHit = pOp.P3
+		} else if pOp.P2 > 0 {
+			vc.SeekHit = pOp.P2
+		}
+	}
+}
+
+// ─── Index Comparison Helper ─────────────────────────────────────────────────
+
+// execIdxCompare compares the current index entry with registers.
+// mode: -1=LT, 0=LE, 1=GT, 2=GE
+// Returns true if the comparison condition is satisfied.
+func (v *VDBE) execIdxCompare(pOp *Instruction, mode int) bool {
+	_, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil || !bc.IsValid() {
+		return false
+	}
+
+	// Get the current index key
+	idxKey := bc.Key()
+	if idxKey == nil {
+		return false
+	}
+
+	// Build comparison key from registers P3..P3+numFields-1
+	numFields := pOp.P4
+	if numFields == nil {
+		if pOp.P5 > 0 {
+			numFields = pOp.P5
+		} else {
+			numFields = 1
+		}
+	}
+
+	var nFields int
+	switch nf := numFields.(type) {
+	case int:
+		nFields = nf
+	case int64:
+		nFields = int(nf)
+	default:
+		nFields = 1
+	}
+
+	rb := NewRecordBuilder()
+	for i := 0; i < nFields; i++ {
+		regIdx := pOp.P3 + i
+		if regIdx >= len(v.regs) {
+			rb.AddNull()
+			continue
+		}
+		reg := &v.regs[regIdx]
+		switch reg.Type {
+		case MemNull:
+			rb.AddNull()
+		case MemInt:
+			rb.AddInt(reg.IntVal)
+		case MemFloat:
+			rb.AddFloat(reg.FloatVal)
+		case MemStr:
+			rb.AddText(string(reg.Bytes))
+		case MemBlob:
+			rb.AddBlob(reg.Bytes)
+		}
+	}
+	cmpKey := rb.Build()
+
+	// Compare index key with comparison key
+	cmp := compareRecordKeys(idxKey, cmpKey)
+
+	switch mode {
+	case -1: // LT
+		return cmp < 0
+	case 0: // LE
+		return cmp <= 0
+	case 1: // GT
+		return cmp > 0
+	case 2: // GE
+		return cmp >= 0
+	}
+	return false
+}
+
+// compareRecordKeys compares two record-encoded keys field by field.
+func compareRecordKeys(a, b []byte) int {
+	valsA, errA := ParseRecord(a)
+	valsB, errB := ParseRecord(b)
+	if errA != nil || errB != nil {
+		// Fallback to byte comparison
+		return bytesCompare(a, b)
+	}
+
+	minLen := len(valsA)
+	if len(valsB) < minLen {
+		minLen = len(valsB)
+	}
+
+	for i := 0; i < minLen; i++ {
+		cmp := compareValues(valsA[i], valsB[i])
+		if cmp != 0 {
+			return cmp
+		}
+	}
+
+	if len(valsA) < len(valsB) {
+		return -1
+	}
+	if len(valsA) > len(valsB) {
+		return 1
+	}
+	return 0
+}
+
+// bytesCompare provides simple byte-level comparison.
+func bytesCompare(a, b []byte) int {
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	for i := 0; i < minLen; i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+// ─── Found / NotFound / Conflict Helpers ─────────────────────────────────────
+
+// execFound checks if a key exists in the cursor's B-Tree.
+// P1 = cursor, P2 = jump target, P3 = key register, P4 = num fields.
+// Returns true if found.
+func (v *VDBE) execFound(pOp *Instruction) bool {
+	_, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		return false
+	}
+
+	// If P4 is 0 or nil, use blob key from P3
+	if pOp.P4 == nil {
+		keyReg := &v.regs[pOp.P3]
+		var key []byte
+		if keyReg.Type == MemBlob || keyReg.Type == MemStr {
+			key = keyReg.Bytes
+		} else {
+			key = keyReg.BlobValue()
+		}
+		if key == nil {
+			return false
+		}
+		result, err := bc.Seek(key)
+		if err != nil {
+			return false
+		}
+		return result == btree.SeekFound
+	}
+
+	// Build record key from registers
+	var nFields int
+	switch nf := pOp.P4.(type) {
+	case int:
+		nFields = nf
+	case int64:
+		nFields = int(nf)
+	default:
+		nFields = 1
+	}
+
+	rb := NewRecordBuilder()
+	for i := 0; i < nFields; i++ {
+		regIdx := pOp.P3 + i
+		if regIdx >= len(v.regs) {
+			rb.AddNull()
+			continue
+		}
+		reg := &v.regs[regIdx]
+		switch reg.Type {
+		case MemNull:
+			rb.AddNull()
+		case MemInt:
+			rb.AddInt(reg.IntVal)
+		case MemFloat:
+			rb.AddFloat(reg.FloatVal)
+		case MemStr:
+			rb.AddText(string(reg.Bytes))
+		case MemBlob:
+			rb.AddBlob(reg.Bytes)
+		}
+	}
+	key := rb.Build()
+
+	result, err := bc.Seek(key)
+	if err != nil {
+		return false
+	}
+	return result == btree.SeekFound
+}
+
+// execConflict checks for a unique constraint conflict on an index.
+// P1 = cursor, P2 = jump target, P3 = key register, P4 = num fields.
+// Returns true if there IS a conflict (key exists and no NULLs in key).
+// Returns false if no conflict (key not found or NULL in key).
+func (v *VDBE) execConflict(pOp *Instruction) bool {
+	// Check if any key field is NULL — NULLs never conflict
+	var nFields int
+	switch nf := pOp.P4.(type) {
+	case int:
+		nFields = nf
+	case int64:
+		nFields = int(nf)
+	default:
+		nFields = 1
+	}
+
+	for i := 0; i < nFields; i++ {
+		regIdx := pOp.P3 + i
+		if regIdx < len(v.regs) && v.regs[regIdx].Type == MemNull {
+			return false // NULL fields means no conflict
+		}
+	}
+
+	// Check if key exists
+	return v.execFound(pOp)
+}
+
+// execNotExists checks if a row with a given rowid does NOT exist.
+// P1 = cursor (table), P2 = jump target, P3 = rowid register.
+// Returns P2 if the row does not exist.
+func (v *VDBE) execNotExists(pOp *Instruction, nextPC int) int {
+	_, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		if pOp.P2 > 0 {
+			return pOp.P2
+		}
+		return nextPC
+	}
+
+	rowid := v.regs[pOp.P3].IntValue()
+	result, err := bc.SeekRowid(btree.RowID(rowid))
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return nextPC
+	}
+
+	if result != btree.SeekFound {
+		return pOp.P2
+	}
+	return nextPC
+}
+
+// execUnique checks for a unique constraint violation on an index.
+// P1 = cursor, P2 = jump target (constraint error handler).
+// Similar to NotFound but used specifically for UNIQUE constraints.
+func (v *VDBE) execUnique(pOp *Instruction, nextPC int) int {
+	_, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		return nextPC
+	}
+
+	// Build key from P3 registers with P4 field count
+	keyReg := &v.regs[pOp.P3]
+	var key []byte
+
+	var nFields int
+	switch nf := pOp.P4.(type) {
+	case int:
+		nFields = nf
+	case int64:
+		nFields = int(nf)
+	default:
+		nFields = 0
+	}
+
+	if nFields > 0 {
+		rb := NewRecordBuilder()
+		for i := 0; i < nFields; i++ {
+			regIdx := pOp.P3 + i
+			if regIdx >= len(v.regs) {
+				rb.AddNull()
+				continue
+			}
+			reg := &v.regs[regIdx]
+			switch reg.Type {
+			case MemNull:
+				rb.AddNull()
+			case MemInt:
+				rb.AddInt(reg.IntVal)
+			case MemFloat:
+				rb.AddFloat(reg.FloatVal)
+			case MemStr:
+				rb.AddText(string(reg.Bytes))
+			case MemBlob:
+				rb.AddBlob(reg.Bytes)
+			}
+		}
+		key = rb.Build()
+	} else {
+		if keyReg.Type == MemBlob || keyReg.Type == MemStr {
+			key = keyReg.Bytes
+		} else {
+			key = keyReg.BlobValue()
+		}
+	}
+
+	if key == nil {
+		return nextPC
+	}
+
+	result, err := bc.Seek(key)
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return nextPC
+	}
+
+	// If found, there's a unique constraint violation
+	if result == btree.SeekFound {
+		if pOp.P2 > 0 {
+			return pOp.P2
+		}
+		v.err = fmt.Errorf("UNIQUE constraint failed")
+		v.rc = ResultError
+	}
+	return nextPC
+}
+
+// ─── Row Data Helpers ────────────────────────────────────────────────────────
+
+// execRowid gets the rowid from the cursor at P1 and stores it in register P2.
+func (v *VDBE) execRowid(pOp *Instruction) {
+	destReg := pOp.P2
+
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if vc.NullRow {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if !bc.IsValid() {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	rowid := bc.RowID()
+	v.regs[destReg].SetInt(int64(rowid))
+	v.regs[destReg].IsRowID = true
+}
+
+// execRowData reads the complete row data from the cursor at P1 into register P2.
+func (v *VDBE) execRowData(pOp *Instruction) {
+	destReg := pOp.P2
+
+	vc, bc, ok := v.getCursor(pOp.P1)
+	if !ok || bc == nil {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if vc.NullRow {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if !bc.IsValid() {
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	data, err := bc.Data()
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		v.regs[destReg].SetNull()
+		return
+	}
+
+	if data == nil {
+		// For index cursors, use the key instead
+		key := bc.Key()
+		if key != nil {
+			v.regs[destReg].SetBlob(key)
+		} else {
+			v.regs[destReg].SetNull()
+		}
+		return
+	}
+
+	v.regs[destReg].SetBlob(data)
+}
+
+// execRowCell transfers a row from source cursor (P2) to prepare for insert
+// on destination cursor (P1). P3 provides the rowid for intkey tables.
+func (v *VDBE) execRowCell(pOp *Instruction) {
+	// This opcode reads the current row from the source cursor (P2)
+	// and prepares it for insertion via the next OpInsert/OpIdxInsert
+	// with OPFLAG_PREFORMAT.
+	dstIdx := pOp.P1
+	srcIdx := pOp.P2
+	rowidReg := pOp.P3
+
+	_, srcBc, ok := v.getCursor(srcIdx)
+	if !ok || srcBc == nil || !srcBc.IsValid() {
+		return
+	}
+
+	// Read source data
+	data, err := srcBc.Data()
+	if err != nil {
+		v.err = err
+		v.rc = ResultError
+		return
+	}
+
+	key := srcBc.Key()
+
+	// Get rowid
+	var rowid int64
+	if rowidReg > 0 && rowidReg < len(v.regs) {
+		rowid = v.regs[rowidReg].IntValue()
+	} else {
+		rowid = int64(srcBc.RowID())
+	}
+
+	// Store in destination cursor's context using registers
+	// The next OpInsert will read from the same registers
+	if dstIdx < len(v.cursors) {
+		// Find a free register to store data
+		// Convention: store key in rowidReg and data in rowidReg+1
+		if rowidReg > 0 && rowidReg+1 < len(v.regs) {
+			if data != nil {
+				v.regs[rowidReg+1].SetBlob(data)
+			} else if key != nil {
+				v.regs[rowidReg+1].SetBlob(key)
+			}
+			v.regs[rowidReg].SetInt(rowid)
+		}
+	}
+}
+
+// execOffset reads a column value at a specific offset.
+// P1 = cursor, P3 = destination register.
+func (v *VDBE) execOffset(pOp *Instruction) {
+	// Simplified: return the byte offset of the current row.
+	// This is rarely used (SQLITE_ENABLE_OFFSET_SQL_FUNC).
+	v.regs[pOp.P3].SetInt(0)
 }
 
 // Ensure binary is available for record operations.
