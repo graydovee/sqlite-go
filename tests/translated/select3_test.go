@@ -185,7 +185,7 @@ func TestSelect3GroupBy(t *testing.T) {
 
 	t.Run("2.10 - GROUP BY 0 out of range", func(t *testing.T) {
 		t.Skip("feature not yet implemented: GROUP BY")
-		err := catchSQL(t, db, "SELECT log, count(*) FROM t1 GROUP BY 0 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT log, count(*) FROM t1 GROUP BY 0 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for GROUP BY 0")
 		}
@@ -193,7 +193,7 @@ func TestSelect3GroupBy(t *testing.T) {
 
 	t.Run("2.11 - GROUP BY 3 out of range", func(t *testing.T) {
 		t.Skip("feature not yet implemented: GROUP BY")
-		err := catchSQL(t, db, "SELECT log, count(*) FROM t1 GROUP BY 3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT log, count(*) FROM t1 GROUP BY 3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for GROUP BY 3")
 		}
@@ -210,7 +210,7 @@ func TestSelect3GroupBy(t *testing.T) {
 
 	t.Run("2.13 - empty GROUP BY syntax error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: GROUP BY")
-		err := catchSQL(t, db, "SELECT log, count(*) FROM t1 GROUP BY ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT log, count(*) FROM t1 GROUP BY ORDER BY log")
 		if err == nil {
 			t.Error("expected syntax error for empty GROUP BY")
 		}
@@ -218,7 +218,7 @@ func TestSelect3GroupBy(t *testing.T) {
 
 	t.Run("2.14 - GROUP BY; syntax error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: GROUP BY")
-		err := catchSQL(t, db, "SELECT log, count(*) FROM t1 GROUP BY;")
+		err := catchSQLErr(t, db, "SELECT log, count(*) FROM t1 GROUP BY;")
 		if err == nil {
 			t.Error("expected syntax error for GROUP BY;")
 		}

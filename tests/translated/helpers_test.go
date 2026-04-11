@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/sqlite-go/sqlite-go/sqlite"
@@ -184,6 +185,14 @@ func execSQL(t *testing.T, db *sqlite.Database, sqls ...string) {
 	}
 }
 
+// execSQLArgs executes a SQL statement with arguments.
+func execSQLArgs(t *testing.T, db *sqlite.Database, sql string, args ...interface{}) {
+	t.Helper()
+	if err := db.Exec(sql, args...); err != nil {
+		t.Fatalf("Exec(%q, %v): %v", sql, args, err)
+	}
+}
+
 // catchSQL executes SQL and returns (errorOccurred, errorMessage).
 func catchSQL(t *testing.T, db *sqlite.Database, sql string, args ...interface{}) (bool, string) {
 	t.Helper()
@@ -192,6 +201,12 @@ func catchSQL(t *testing.T, db *sqlite.Database, sql string, args ...interface{}
 		return true, err.Error()
 	}
 	return false, ""
+}
+
+// catchSQLErr executes SQL and returns the error (for tests that check err != nil).
+func catchSQLErr(t *testing.T, db *sqlite.Database, sql string) error {
+	t.Helper()
+	return db.Exec(sql)
 }
 
 // catchQuery executes a query and returns (errorOccurred, errorMessage).
@@ -203,6 +218,34 @@ func catchQuery(t *testing.T, db *sqlite.Database, sql string, args ...interface
 	}
 	rs.Close()
 	return false, ""
+}
+
+// collectResults runs a query and returns first-column strings (unsorted).
+func collectResults(t *testing.T, db *sqlite.Database, sql string, args ...interface{}) []string {
+	t.Helper()
+	return queryStrings(t, db, sql, args...)
+}
+
+// collectSortedResults runs a query and returns sorted first-column strings.
+func collectSortedResults(t *testing.T, db *sqlite.Database, sql string, args ...interface{}) []string {
+	t.Helper()
+	result := queryStrings(t, db, sql, args...)
+	sort.Strings(result)
+	return result
+}
+
+// assertResults compares string slices.
+func assertResults(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("got %d results, want %d: %v", len(got), len(want), got)
+		return
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("result[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
 }
 
 // collectRows collects all rows from a result set into a slice of maps.

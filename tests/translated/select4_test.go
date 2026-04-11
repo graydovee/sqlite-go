@@ -84,7 +84,7 @@ func TestSelect4UnionAll(t *testing.T) {
 
 	t.Run("1.3 - ORDER BY before UNION ALL error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: UNION ALL")
-		err := catchSQL(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for ORDER BY before UNION ALL")
 		}
@@ -106,7 +106,7 @@ func TestSelect4Union(t *testing.T) {
 
 	t.Run("2.3 - ORDER BY before UNION error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: UNION")
-		err := catchSQL(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log UNION SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log UNION SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for ORDER BY before UNION")
 		}
@@ -131,7 +131,7 @@ func TestSelect4Except(t *testing.T) {
 
 	t.Run("3.3 - ORDER BY before EXCEPT error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: EXCEPT")
-		err := catchSQL(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log EXCEPT SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log EXCEPT SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for ORDER BY before EXCEPT")
 		}
@@ -167,7 +167,7 @@ func TestSelect4Intersect(t *testing.T) {
 
 	t.Run("4.3 - ORDER BY before INTERSECT error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: INTERSECT")
-		err := catchSQL(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log INTERSECT SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log INTERSECT SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for ORDER BY before INTERSECT")
 		}
@@ -180,7 +180,7 @@ func TestSelect4ErrorMessages(t *testing.T) {
 
 	t.Run("5.1 - no such table in UNION", func(t *testing.T) {
 		t.Skip("feature not yet implemented: UNION error handling")
-		err := catchSQL(t, db, "SELECT DISTINCT log FROM t2 UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log FROM t2 UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for non-existent table t2")
 		}
@@ -188,7 +188,7 @@ func TestSelect4ErrorMessages(t *testing.T) {
 
 	t.Run("5.3 - column count mismatch", func(t *testing.T) {
 		t.Skip("feature not yet implemented: UNION error handling")
-		err := catchSQL(t, db, "SELECT DISTINCT log, n FROM t1 UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
+		err := catchSQLErr(t, db, "SELECT DISTINCT log, n FROM t1 UNION ALL SELECT n FROM t1 WHERE log=3 ORDER BY log")
 		if err == nil {
 			t.Error("expected error for column count mismatch in UNION ALL")
 		}
@@ -357,7 +357,7 @@ func TestSelect4ColumnMismatch(t *testing.T) {
 
 	t.Run("11.1 - too many columns left", func(t *testing.T) {
 		t.Skip("feature not yet implemented: column mismatch in compound queries")
-		err := catchSQL(t, db, "SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM t2 UNION SELECT x FROM t2")
+		err := catchSQLErr(t, db, "SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM t2 UNION SELECT x FROM t2")
 		if err == nil {
 			t.Error("expected error for column count mismatch")
 		}
@@ -365,7 +365,7 @@ func TestSelect4ColumnMismatch(t *testing.T) {
 
 	t.Run("11.2 - too many columns right", func(t *testing.T) {
 		t.Skip("feature not yet implemented: column mismatch in compound queries")
-		err := catchSQL(t, db, "SELECT x FROM t2 UNION SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM t2")
+		err := catchSQLErr(t, db, "SELECT x FROM t2 UNION SELECT x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x FROM t2")
 		if err == nil {
 			t.Error("expected error for column count mismatch")
 		}

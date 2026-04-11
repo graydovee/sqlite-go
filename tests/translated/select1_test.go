@@ -27,20 +27,8 @@ func queryFlat(t *testing.T, db *sqlite.Database, sql string) []interface{} {
 	return result
 }
 
-// Helper: execute SQL expected to fail, return error message
-func catchSQL(t *testing.T, db *sqlite.Database, sql string) error {
-	t.Helper()
-	err := db.Exec(sql)
-	if err != nil {
-		return err
-	}
-	rs, err := db.Query(sql)
-	if err != nil {
-		return err
-	}
-	rs.Close()
-	return nil
-}
+// Note: catchSQL is defined in helpers_test.go as catchSQL(t, db, sql) (bool, string).
+// For tests that need catchSQL returning error, use catchSQLErr from helpers_test.go.
 
 // ============================================================================
 // select1-1: Basic SELECT tests
@@ -283,7 +271,7 @@ func TestSelect1Aggregate(t *testing.T) {
 	// Error messages from aggregate function checks
 	t.Run("2.1 - count(f1,f2) wrong args", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT count(f1,f2) FROM test1")
+		err := catchSQLErr(t, db, "SELECT count(f1,f2) FROM test1")
 		if err == nil {
 			t.Error("expected error for count(f1,f2)")
 		}
@@ -349,7 +337,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.6 - min(*) wrong args", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT min(*) FROM test1")
+		err := catchSQLErr(t, db, "SELECT min(*) FROM test1")
 		if err == nil {
 			t.Error("expected error for min(*)")
 		}
@@ -407,7 +395,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.9 - MAX(*) wrong args", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT MAX(*) FROM test1")
+		err := catchSQLErr(t, db, "SELECT MAX(*) FROM test1")
 		if err == nil {
 			t.Error("expected error for MAX(*)")
 		}
@@ -475,7 +463,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.14 - SUM(*) wrong args", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT SUM(*) FROM test1")
+		err := catchSQLErr(t, db, "SELECT SUM(*) FROM test1")
 		if err == nil {
 			t.Error("expected error for SUM(*)")
 		}
@@ -491,7 +479,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.16 - sum(f1,f2) wrong args", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT sum(f1,f2) FROM test1")
+		err := catchSQLErr(t, db, "SELECT sum(f1,f2) FROM test1")
 		if err == nil {
 			t.Error("expected error for sum(f1,f2)")
 		}
@@ -521,7 +509,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.18 - no such function XYZZY", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT XYZZY(f1) FROM test1")
+		err := catchSQLErr(t, db, "SELECT XYZZY(f1) FROM test1")
 		if err == nil {
 			t.Error("expected error for unknown function XYZZY")
 		}
@@ -538,7 +526,7 @@ func TestSelect1Aggregate(t *testing.T) {
 
 	t.Run("2.20 - SUM(min(f1)) misuse aggregate", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT SUM(min(f1)) FROM test1")
+		err := catchSQLErr(t, db, "SELECT SUM(min(f1)) FROM test1")
 		if err == nil {
 			t.Error("expected error for nested aggregate misuse")
 		}
@@ -627,7 +615,7 @@ func TestSelect1Where(t *testing.T) {
 
 	t.Run("3.9 - count(f1,f2) in WHERE error", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 WHERE count(f1,f2)!=11")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 WHERE count(f1,f2)!=11")
 		if err == nil {
 			t.Error("expected error for aggregate in WHERE")
 		}
@@ -671,14 +659,14 @@ func TestSelect1OrderBy(t *testing.T) {
 
 	t.Run("4.4 - ORDER BY min(f1) misuse aggregate", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 ORDER BY min(f1)")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 ORDER BY min(f1)")
 		if err == nil {
 			t.Error("expected error for aggregate in ORDER BY")
 		}
 	})
 
 	t.Run("4.5 - INSERT SELECT ORDER BY min(f1) misuse", func(t *testing.T) {
-		err := catchSQL(t, db, "INSERT INTO test1(f1) SELECT f1 FROM test1 ORDER BY min(f1)")
+		err := catchSQLErr(t, db, "INSERT INTO test1(f1) SELECT f1 FROM test1 ORDER BY min(f1)")
 		if err == nil {
 			t.Error("expected error for aggregate in ORDER BY")
 		}
@@ -734,7 +722,7 @@ func TestSelect1OrderBy(t *testing.T) {
 
 	t.Run("4.10.1 - ORDER BY 3 out of range", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT * FROM t5 ORDER BY 3")
+		err := catchSQLErr(t, db, "SELECT * FROM t5 ORDER BY 3")
 		if err == nil {
 			t.Error("expected error for ORDER BY column out of range")
 		}
@@ -742,7 +730,7 @@ func TestSelect1OrderBy(t *testing.T) {
 
 	t.Run("4.10.2 - ORDER BY -1 out of range", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT * FROM t5 ORDER BY -1")
+		err := catchSQLErr(t, db, "SELECT * FROM t5 ORDER BY -1")
 		if err == nil {
 			t.Error("expected error for ORDER BY column out of range")
 		}
@@ -811,7 +799,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.1 - WHERE f2= (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 WHERE f2=")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 WHERE f2=")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -819,7 +807,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.3 - incomplete input", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 as 'hi', test2 as")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 as 'hi', test2 as")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -827,7 +815,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.4 - ORDER BY; (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 ORDER BY;")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 ORDER BY;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -835,7 +823,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.5 - ORDER BY ... where (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 ORDER BY f1 desc, f2 where;")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 ORDER BY f1 desc, f2 where;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -843,7 +831,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.6 - count(f1,f2 FROM (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT count(f1,f2 FROM test1;")
+		err := catchSQLErr(t, db, "SELECT count(f1,f2 FROM test1;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -851,7 +839,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.7 - count(f1,f2+) (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT count(f1,f2+) FROM test1;")
+		err := catchSQLErr(t, db, "SELECT count(f1,f2+) FROM test1;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -859,7 +847,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.8 - ORDER BY f2, f1+ (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 ORDER BY f2, f1+;")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 ORDER BY f2, f1+;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -867,7 +855,7 @@ func TestSelect1SyntaxErrors(t *testing.T) {
 
 	t.Run("7.9 - LIMIT before ORDER BY (syntax error)", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT f1 FROM test1 LIMIT 5+3 OFFSET 11 ORDER BY f2;")
+		err := catchSQLErr(t, db, "SELECT f1 FROM test1 LIMIT 5+3 OFFSET 11 ORDER BY f2;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -1049,7 +1037,7 @@ func TestSelect1TableStar(t *testing.T) {
 
 	t.Run("11.10 - no such table t5", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT t5.* FROM t3, t4")
+		err := catchSQLErr(t, db, "SELECT t5.* FROM t3, t4")
 		if err == nil {
 			t.Error("expected error for non-existent table t5")
 		}
@@ -1057,7 +1045,7 @@ func TestSelect1TableStar(t *testing.T) {
 
 	t.Run("11.11 - t3.* but t3 is aliased", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT t3.* FROM t3 AS x, t4")
+		err := catchSQLErr(t, db, "SELECT t3.* FROM t3 AS x, t4")
 		if err == nil {
 			t.Error("expected error: no such table t3 (aliased as x)")
 		}
@@ -1097,7 +1085,7 @@ func TestSelect1CrashBugs(t *testing.T) {
 
 	t.Run("16.1 - SELECT 1 FROM (SELECT *) error", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT 1 FROM (SELECT *)")
+		err := catchSQLErr(t, db, "SELECT 1 FROM (SELECT *)")
 		if err == nil {
 			t.Error("expected error for SELECT * without table")
 		}
@@ -1105,7 +1093,7 @@ func TestSelect1CrashBugs(t *testing.T) {
 
 	t.Run("16.2 - syntax error with #1", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "SELECT 1 FROM sqlite_master LIMIT 1,#1;")
+		err := catchSQLErr(t, db, "SELECT 1 FROM sqlite_master LIMIT 1,#1;")
 		if err == nil {
 			t.Error("expected syntax error")
 		}
@@ -1156,7 +1144,7 @@ func TestSelect1ColumnMismatch(t *testing.T) {
 
 	t.Run("19.20 - INSERT with wrong column count", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "INSERT INTO t1 SELECT 1,2,3,4,5,6,7 UNION ALL SELECT 1,2,3,4,5,6,7 ORDER BY 1")
+		err := catchSQLErr(t, db, "INSERT INTO t1 SELECT 1,2,3,4,5,6,7 UNION ALL SELECT 1,2,3,4,5,6,7 ORDER BY 1")
 		if err == nil {
 			t.Error("expected error for column count mismatch")
 		}
@@ -1164,7 +1152,7 @@ func TestSelect1ColumnMismatch(t *testing.T) {
 
 	t.Run("19.21 - INSERT with more wrong column count", func(t *testing.T) {
 		t.Skip("not yet implemented")
-		err := catchSQL(t, db, "INSERT INTO t1 SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 UNION ALL SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 ORDER BY 1")
+		err := catchSQLErr(t, db, "INSERT INTO t1 SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 UNION ALL SELECT 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 ORDER BY 1")
 		if err == nil {
 			t.Error("expected error for column count mismatch")
 		}

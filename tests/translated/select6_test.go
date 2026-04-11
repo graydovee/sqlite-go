@@ -238,7 +238,7 @@ func TestSelect6ColumnMismatch(t *testing.T) {
 
 	t.Run("10.3 - UNION ALL column mismatch", func(t *testing.T) {
 		t.Skip("feature not yet implemented: UNION ALL not supported")
-		err := catchSQL(t, db, "SELECT * FROM t UNION ALL SELECT * FROM j")
+		err := catchSQLErr(t, db, "SELECT * FROM t UNION ALL SELECT * FROM j")
 		if err == nil {
 			t.Error("expected error for column count mismatch")
 		}

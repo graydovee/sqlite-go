@@ -75,7 +75,7 @@ func TestSelect5GroupByErrors(t *testing.T) {
 
 	t.Run("2.1.1 - GROUP BY non-existent column z", func(t *testing.T) {
 		t.Skip("feature not yet implemented: GROUP BY not supported")
-		err := catchSQL(t, db, "SELECT y, count(*) FROM t1 GROUP BY z ORDER BY y")
+		err := catchSQLErr(t, db, "SELECT y, count(*) FROM t1 GROUP BY z ORDER BY y")
 		if err == nil {
 			t.Error("expected error for non-existent column z")
 		}
@@ -92,7 +92,7 @@ func TestSelect5GroupByErrors(t *testing.T) {
 
 	t.Run("2.4 - HAVING with non-existent function z(y)", func(t *testing.T) {
 		t.Skip("feature not yet implemented: HAVING not supported")
-		err := catchSQL(t, db, "SELECT y, count(*) FROM t1 GROUP BY y HAVING z(y)<3 ORDER BY y")
+		err := catchSQLErr(t, db, "SELECT y, count(*) FROM t1 GROUP BY y HAVING z(y)<3 ORDER BY y")
 		if err == nil {
 			t.Error("expected error for non-existent function z")
 		}
@@ -100,7 +100,7 @@ func TestSelect5GroupByErrors(t *testing.T) {
 
 	t.Run("2.5 - HAVING with non-existent column z", func(t *testing.T) {
 		t.Skip("feature not yet implemented: HAVING not supported")
-		err := catchSQL(t, db, "SELECT y, count(*) FROM t1 GROUP BY y HAVING count(*)<z ORDER BY y")
+		err := catchSQLErr(t, db, "SELECT y, count(*) FROM t1 GROUP BY y HAVING count(*)<z ORDER BY y")
 		if err == nil {
 			t.Error("expected error for non-existent column z")
 		}

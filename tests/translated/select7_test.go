@@ -86,7 +86,7 @@ func TestSelect7SubselectColumns(t *testing.T) {
 	t.Run("5.1 - IN with multi-column subquery error", func(t *testing.T) {
 		t.Skip("feature not yet implemented: IN subquery not supported")
 		db.Exec("CREATE TABLE t2(a,b)")
-		err := catchSQL(t, db, "SELECT 5 IN (SELECT a,b FROM t2)")
+		err := catchSQLErr(t, db, "SELECT 5 IN (SELECT a,b FROM t2)")
 		if err == nil {
 			t.Error("expected error for multi-column IN subquery")
 		}
@@ -94,7 +94,7 @@ func TestSelect7SubselectColumns(t *testing.T) {
 
 	t.Run("5.2 - IN with SELECT * from 2-col table", func(t *testing.T) {
 		t.Skip("feature not yet implemented: IN subquery not supported")
-		err := catchSQL(t, db, "SELECT 5 IN (SELECT * FROM t2)")
+		err := catchSQLErr(t, db, "SELECT 5 IN (SELECT * FROM t2)")
 		if err == nil {
 			t.Error("expected error for multi-column IN subquery")
 		}
@@ -144,14 +144,14 @@ func TestSelect7CompoundColumnMismatch(t *testing.T) {
 	db.Exec("CREATE TABLE t02(x, y)")
 
 	t.Run("8.1 - UNION column mismatch", func(t *testing.T) {
-		err := catchSQL(t, db, "SELECT * FROM (SELECT * FROM t01 UNION SELECT x FROM t02) WHERE y=1")
+		err := catchSQLErr(t, db, "SELECT * FROM (SELECT * FROM t01 UNION SELECT x FROM t02) WHERE y=1")
 		if err == nil {
 			t.Error("expected error for column count mismatch in UNION")
 		}
 	})
 
 	t.Run("8.2 - VIEW with UNION column mismatch", func(t *testing.T) {
-		err := catchSQL(t, db, "CREATE VIEW v0 as SELECT x, y FROM t01 UNION SELECT x FROM t02")
+		err := catchSQLErr(t, db, "CREATE VIEW v0 as SELECT x, y FROM t01 UNION SELECT x FROM t02")
 		if err == nil {
 			t.Error("expected error for column count mismatch in VIEW UNION")
 		}
