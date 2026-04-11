@@ -1128,6 +1128,16 @@ func isAggregate(name string) bool {
 	return false
 }
 
+// isWindowFunc returns true for built-in window function names.
+func isWindowFunc(name string) bool {
+	switch strings.ToUpper(name) {
+	case "ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE",
+		"LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE":
+		return true
+	}
+	return false
+}
+
 // affinityFromType maps SQL type names to affinity codes for OP_Cast.
 func affinityFromType(typeName string) int {
 	upper := strings.ToUpper(typeName)

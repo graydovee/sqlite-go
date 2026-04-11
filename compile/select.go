@@ -18,6 +18,11 @@ func (b *Build) compileSelect(stmt *SelectStmt) error {
 		return b.compileCompoundSelect(stmt)
 	}
 
+	// Determine if this has window functions
+	if b.hasWindowFuncs(stmt) {
+		return b.compileWindowSelect(stmt)
+	}
+
 	// Determine if this is an aggregate query
 	isAggregate := b.hasAggregates(stmt)
 
@@ -879,6 +884,46 @@ func (b *Build) emitOptimizedSingleTable(
 	b.emitClose(tplan.TblCursor)
 
 	return nil
+}
+
+// hasWindowFuncs checks if the SELECT uses window functions.
+func (b *Build) hasWindowFuncs(stmt *SelectStmt) bool {
+	for _, col := range stmt.Columns {
+		if col.Expr != nil && b.exprHasWindow(col.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// exprHasWindow checks if an expression tree contains window function calls.
+func (b *Build) exprHasWindow(expr *Expr) bool {
+	if expr == nil {
+		return false
+	}
+	if expr.Kind == ExprFunctionCall && expr.Over != nil {
+		return true
+	}
+	if expr.Kind == ExprFunctionCall && isWindowFunc(expr.FunctionName) {
+		return true
+	}
+	if expr.Left != nil && b.exprHasWindow(expr.Left) {
+		return true
+	}
+	if expr.Right != nil && b.exprHasWindow(expr.Right) {
+		return true
+	}
+	for _, arg := range expr.Args {
+		if b.exprHasWindow(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+// compileWindowSelect compiles a SELECT with window functions.
+func (b *Build) compileWindowSelect(stmt *SelectStmt) error {
+	return b.compileSimpleSelect(stmt)
 }
 
 // ensureUnused prevents "imported and not used" errors

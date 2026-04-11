@@ -63,6 +63,9 @@ type Expr struct {
 	Args         []*Expr // Function arguments (nil for func(*))
 	StarArg      bool    // true for COUNT(*) etc.
 
+	// Window function (OVER clause)
+	Over *WindowSpec // Non-nil if this is a window function call
+
 	// Subquery / EXISTS
 	Select *SelectStmt
 
@@ -144,13 +147,55 @@ type CTEDef struct {
 	Body    *SelectStmt // CTE body query
 }
 
-// WindowDef represents a window definition (basic parsing).
+// WindowDef represents a named window definition (WINDOW clause).
 type WindowDef struct {
-	Name         string   // Window name
-	PartitionBy  []*Expr  // PARTITION BY expressions
-	OrderBy      []*OrderItem // ORDER BY items
-	// Frame spec omitted for now - basic support
+	Name        string       // Window name
+	PartitionBy []*Expr      // PARTITION BY expressions
+	OrderBy     []*OrderItem // ORDER BY items
+	Frame       *FrameSpec   // Frame specification (nil if not specified)
 }
+
+// WindowSpec represents an inline OVER(...) clause attached to a function call.
+type WindowSpec struct {
+	Name        string       // Named window reference (OVER w) — empty for inline
+	PartitionBy []*Expr      // PARTITION BY expressions
+	OrderBy     []*OrderItem // ORDER BY items
+	Frame       *FrameSpec   // Frame specification (nil if not specified)
+}
+
+// FrameSpec represents a window frame specification.
+type FrameSpec struct {
+	Type         FrameType   // ROWS, RANGE, or GROUPS
+	Start        FrameBound  // Frame start bound
+	End          FrameBound  // Frame end bound
+	EndSpecified bool        // true if BETWEEN ... AND ... was used
+}
+
+// FrameType identifies the type of window frame.
+type FrameType int
+
+const (
+	FrameRows   FrameType = iota // ROWS
+	FrameRange                   // RANGE
+	FrameGroups                   // GROUPS
+)
+
+// FrameBound represents a window frame boundary.
+type FrameBound struct {
+	Type FrameBoundType
+	Expr *Expr // Expression for offset (n PRECEDING/FOLLOWING)
+}
+
+// FrameBoundType identifies the type of frame boundary.
+type FrameBoundType int
+
+const (
+	FrameUnboundedPreceding FrameBoundType = iota
+	FramePreceding
+	FrameCurrentRow
+	FrameFollowing
+	FrameUnboundedFollowing
+)
 
 // =============================================================================
 // SELECT

@@ -938,6 +938,9 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		return nil, NewError(Error, "empty SQL statement")
 	}
 
+	if isKeyword(filtered[0], "with") {
+		return db.queryWithCTE(sql, args)
+	}
 	if !isKeyword(filtered[0], "select") {
 		return nil, NewError(Error, "not a SELECT statement")
 	}
@@ -974,9 +977,9 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 			!isKeyword(filtered[pos], "from") &&
 			!isKeyword(filtered[pos], "where") &&
 			!isKeyword(filtered[pos], "limit") &&
-			!isKeyword(filtered[pos], "order") &&
+			(parenDepth > 0 || !isKeyword(filtered[pos], "order")) &&
 			!isKeyword(filtered[pos], "group") {
-			if isKeyword(filtered[pos], "as") {
+			if isKeyword(filtered[pos], "as") && parenDepth == 0 {
 				pos++
 				if pos < len(filtered) {
 					cols = append(cols, selectCol{
@@ -1017,13 +1020,31 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		return db.selectWithoutTable(cols, args)
 	}
 
-	tbl, ok := db.tables[tableName]
-	if !ok {
+	var tbl *tableEntry
+	var cteTbl *cteTable
+
+	if t, ok := db.tables[tableName]; ok {
+		tbl = t
+	} else if db.cteData != nil {
+		if ct, cok := db.cteData[tableName]; cok {
+			cteTbl = ct
+		}
+	}
+
+	if tbl == nil && cteTbl == nil {
 		// Check if it's a view
 		if v, vok := db.views[tableName]; vok {
 			return db.queryView(v, cols, args)
 		}
 		return nil, NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	// Effective columns for both regular tables and CTEs
+	var ecols []columnEntry
+	if cteTbl != nil {
+		ecols = cteTbl.columns
+	} else if tbl != nil {
+		ecols = tbl.columns
 	}
 
 	// Parse WHERE clause
@@ -1043,7 +1064,7 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	var resultCols []ResultColumnInfo
 	for _, c := range cols {
 		if c.expr == "*" {
-			for _, col := range tbl.columns {
+			for _, col := range ecols {
 				resultCols = append(resultCols, ResultColumnInfo{
 					Name: col.name,
 					Type: ColNull,
@@ -1071,56 +1092,80 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	}
 
 	// Build column name list for row context
-	colNames := make([]string, len(tbl.columns))
-	for i, col := range tbl.columns {
+	colNames := make([]string, len(ecols))
+	for i, col := range ecols {
 		colNames[i] = col.name
 	}
 
-	// Scan the table
-	cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), false)
-	if err != nil {
-		return nil, NewErrorf(Error, "open cursor: %s", err)
-	}
-	defer cursor.Close()
-
+	// Scan rows from either btree or in-memory CTE data
 	var rawData []rawRow
 
-	hasRow, err := cursor.First()
-	if err != nil {
-		return nil, err
-	}
-	for hasRow {
-		data, err := cursor.Data()
-		if err != nil {
-			return nil, err
-		}
-		values, err := vdbe.ParseRecord(data)
-		if err != nil {
-			return nil, err
-		}
-
-		// WHERE filtering
-		if whereExpr != "" {
-			wval := evalExprWithRow(whereExpr, args, colNames, values)
-			if !isTruthy(wval) {
-				hasRow, err = cursor.Next()
-				if err != nil {
-					return nil, err
+	if cteTbl != nil {
+		// Scan CTE rows from memory
+		for _, rd := range cteTbl.rows {
+			if whereExpr != "" {
+				wval := evalExprWithRow(whereExpr, args, colNames, rd.values)
+				if !isTruthy(wval) {
+					continue
 				}
-				continue
 			}
+			rawData = append(rawData, rd)
 		}
+	} else {
+		// Scan the table via btree cursor
+		cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), false)
+		if err != nil {
+			return nil, NewErrorf(Error, "open cursor: %s", err)
+		}
+		defer cursor.Close()
 
-		rawData = append(rawData, rawRow{values: values})
-		hasRow, err = cursor.Next()
+		hasRow, err := cursor.First()
 		if err != nil {
 			return nil, err
+		}
+		for hasRow {
+			data, err := cursor.Data()
+			if err != nil {
+				return nil, err
+			}
+			values, err := vdbe.ParseRecord(data)
+			if err != nil {
+				return nil, err
+			}
+
+			// WHERE filtering
+			if whereExpr != "" {
+				wval := evalExprWithRow(whereExpr, args, colNames, values)
+				if !isTruthy(wval) {
+					hasRow, err = cursor.Next()
+					if err != nil {
+						return nil, err
+					}
+					continue
+				}
+			}
+
+			rawData = append(rawData, rawRow{values: values})
+			hasRow, err = cursor.Next()
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	var rows []Row
 
-	if hasAgg {
+	// Check if any column expression uses a window function
+	hasWin := false
+	for _, c := range cols {
+		if isWindowExpr(c.expr) {
+			hasWin = true
+		}
+	}
+
+	if hasWin {
+		rows = db.computeWindowFunctions(cols, rawData, colNames, resultCols, ecols, args)
+	} else if hasAgg {
 		// Compute aggregate results
 		row := Row{cols: resultCols}
 		for _, c := range cols {
@@ -1148,7 +1193,7 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 			row := Row{cols: resultCols}
 			for _, c := range cols {
 				if c.expr == "*" {
-					for i := range tbl.columns {
+					for i := range ecols {
 						if i < len(rd.values) {
 							row.values = append(row.values, vdbe.MemFromValue(rd.values[i]))
 						} else {
@@ -1176,6 +1221,225 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	}
 
 	return newResultSet(rows, resultCols), nil
+}
+
+// queryWithCTE handles queries starting with WITH (common table expressions).
+func (db *Database) queryWithCTE(sql string, args []interface{}) (*ResultSet, error) {
+	// Save and restore CTE data for proper scoping
+	oldCTEData := db.cteData
+	db.cteData = make(map[string]*cteTable)
+	defer func() { db.cteData = oldCTEData }()
+
+	tokens := compile.Tokenize(sql)
+	filtered := filterTokens(tokens)
+
+	pos := 1 // skip WITH
+
+	// Check RECURSIVE keyword
+	recursive := false
+	if pos < len(filtered) && isKeyword(filtered[pos], "recursive") {
+		recursive = true
+		pos++
+	}
+
+	// CTE definition intermediate struct
+	type cteDef struct {
+		name    string
+		columns []string
+		bodySQL string
+	}
+	var ctes []cteDef
+
+	// Parse all CTE definitions
+	for pos < len(filtered) {
+		// Stop when we hit the main statement
+		if isKeyword(filtered[pos], "select") || isKeyword(filtered[pos], "insert") ||
+			isKeyword(filtered[pos], "update") || isKeyword(filtered[pos], "delete") {
+			break
+		}
+		if pos >= len(filtered) || filtered[pos].Type == compile.TokenComma {
+			pos++
+			continue
+		}
+
+		// CTE name
+		cteName := filtered[pos].Value
+		pos++
+
+		// Optional column list: (col1, col2, ...)
+		var cteCols []string
+		if pos < len(filtered) && filtered[pos].Type == compile.TokenLParen {
+			// Check if this is a column list (not a body starting with SELECT)
+			if pos+1 < len(filtered) && !isKeyword(filtered[pos+1], "select") {
+				pos++ // skip (
+				for pos < len(filtered) && filtered[pos].Type != compile.TokenRParen {
+					if filtered[pos].Type == compile.TokenID || filtered[pos].Type == compile.TokenKeyword {
+						cteCols = append(cteCols, filtered[pos].Value)
+					}
+					pos++
+				}
+				if pos < len(filtered) {
+					pos++ // skip )
+				}
+			}
+		}
+
+		// AS keyword
+		if pos < len(filtered) && isKeyword(filtered[pos], "as") {
+			pos++
+		}
+
+		// Body in parentheses: (SELECT ...)
+		if pos < len(filtered) && filtered[pos].Type == compile.TokenLParen {
+			pos++ // skip (
+			depth := 1
+			var bodyTokens []compile.Token
+			for pos < len(filtered) && depth > 0 {
+				if filtered[pos].Type == compile.TokenLParen {
+					depth++
+				}
+				if filtered[pos].Type == compile.TokenRParen {
+					depth--
+					if depth == 0 {
+						pos++ // skip closing )
+						break
+					}
+				}
+				bodyTokens = append(bodyTokens, filtered[pos])
+				pos++
+			}
+			bodySQL := joinTokenValues(bodyTokens)
+			ctes = append(ctes, cteDef{name: cteName, columns: cteCols, bodySQL: bodySQL})
+		}
+
+		// Comma between CTEs
+		if pos < len(filtered) && filtered[pos].Type == compile.TokenComma {
+			pos++
+		}
+	}
+
+	// Evaluate each CTE
+	for _, cte := range ctes {
+		if recursive {
+			anchorSQL, recSQL := splitUnionAll(cte.bodySQL)
+
+			// Execute anchor query
+			rs, err := db.querySingle(anchorSQL, args)
+			if err != nil {
+				return nil, err
+			}
+			ct := rsToCTE(rs, cte.columns)
+			rs.Close()
+
+			allRows := make([]rawRow, len(ct.rows))
+			copy(allRows, ct.rows)
+			workingSet := ct.rows
+
+			if recSQL != "" && len(workingSet) > 0 {
+				for {
+					// Set CTE data to working set for recursive reference
+					db.cteData[cte.name] = &cteTable{
+						columns: ct.columns,
+						rows:    workingSet,
+					}
+
+					rs, err := db.querySingle(recSQL, args)
+					if err != nil {
+						return nil, err
+					}
+					newCT := rsToCTE(rs, cte.columns)
+					rs.Close()
+
+					if len(newCT.rows) == 0 {
+						break
+					}
+
+					allRows = append(allRows, newCT.rows...)
+					workingSet = newCT.rows
+				}
+			}
+
+			// Set final CTE data with all accumulated rows
+			db.cteData[cte.name] = &cteTable{
+				columns: ct.columns,
+				rows:    allRows,
+			}
+		} else {
+			// Non-recursive: execute the body
+			rs, err := db.querySingle(cte.bodySQL, args)
+			if err != nil {
+				return nil, err
+			}
+			db.cteData[cte.name] = rsToCTE(rs, cte.columns)
+			rs.Close()
+		}
+	}
+
+	// Build main SELECT SQL from remaining tokens
+	var mainParts []string
+	for pos < len(filtered) {
+		mainParts = append(mainParts, filtered[pos].Value)
+		pos++
+	}
+	mainSQL := strings.Join(mainParts, " ")
+
+	return db.querySingle(mainSQL, args)
+}
+
+// splitUnionAll splits a SQL body at UNION ALL into anchor and recursive parts.
+func splitUnionAll(bodySQL string) (string, string) {
+	tokens := compile.Tokenize(bodySQL)
+	filtered := filterTokens(tokens)
+
+	for i := 0; i < len(filtered)-1; i++ {
+		if isKeyword(filtered[i], "union") && isKeyword(filtered[i+1], "all") {
+			anchor := joinTokenValues(filtered[:i])
+			recursive := joinTokenValues(filtered[i+2:])
+			return anchor, recursive
+		}
+		if isKeyword(filtered[i], "union") {
+			anchor := joinTokenValues(filtered[:i])
+			recursive := joinTokenValues(filtered[i+1:])
+			return anchor, recursive
+		}
+	}
+
+	return bodySQL, ""
+}
+
+// rsToCTE converts a ResultSet to a cteTable for CTE data storage.
+func rsToCTE(rs *ResultSet, cteColNames []string) *cteTable {
+	var cols []columnEntry
+	var rows []rawRow
+
+	for rs.Next() {
+		row := rs.Row()
+		if cols == nil {
+			if len(cteColNames) > 0 {
+				for _, name := range cteColNames {
+					cols = append(cols, columnEntry{name: name})
+				}
+			} else {
+				for _, ci := range row.cols {
+					cols = append(cols, columnEntry{name: ci.Name})
+				}
+			}
+		}
+		var vals []vdbe.Value
+		for _, v := range row.values {
+			vals = append(vals, memToValue(v))
+		}
+		rows = append(rows, rawRow{values: vals})
+	}
+
+	// Handle empty result set with explicit column names
+	if cols == nil && len(cteColNames) > 0 {
+		for _, name := range cteColNames {
+			cols = append(cols, columnEntry{name: name})
+		}
+	}
+
+	return &cteTable{columns: cols, rows: rows}
 }
 
 // isAggregateExpr checks if an expression is an aggregate function call.
@@ -1364,8 +1628,8 @@ func (db *Database) selectWithoutTable(cols []selectCol, args []interface{}) (*R
 		row.values = append(row.values, val)
 	}
 
-	rows := []Row{row}
 	row.cols = resultCols
+	rows := []Row{row}
 	return newResultSet(rows, resultCols), nil
 }
 
