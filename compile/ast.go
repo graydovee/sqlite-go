@@ -121,8 +121,10 @@ type Statement struct {
 	DeleteStmt     *DeleteStmt
 	CreateTable    *CreateTableStmt
 	CreateIndex    *CreateIndexStmt
+	CreateView     *CreateViewStmt
 	DropTable      *DropTableStmt
 	DropIndex      *DropIndexStmt
+	DropView       *DropViewStmt
 	BeginStmt      *BeginStmt
 	CommitStmt     *CommitStmt
 	RollbackStmt   *RollbackStmt
@@ -444,4 +446,27 @@ type CommitStmt struct{}
 // RollbackStmt represents a ROLLBACK statement.
 type RollbackStmt struct {
 	Savepoint string // TO savepoint name (empty if not specified)
+}
+
+// =============================================================================
+// CREATE VIEW
+// =============================================================================
+
+// CreateViewStmt represents a CREATE VIEW statement.
+type CreateViewStmt struct {
+	IfNotExists bool        // IF NOT EXISTS
+	Schema      string      // Schema name (e.g., "main")
+	Name        string      // View name
+	Select      *SelectStmt // The SELECT statement defining the view
+}
+
+// =============================================================================
+// DROP VIEW
+// =============================================================================
+
+// DropViewStmt represents a DROP VIEW statement.
+type DropViewStmt struct {
+	IfExists bool   // IF EXISTS
+	Schema   string // Schema name
+	Name     string // View name
 }
