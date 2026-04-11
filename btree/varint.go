@@ -20,7 +20,20 @@ func PutVarint(buf []byte, v int64) int {
 		return 2
 	}
 
-	// General case: up to 9 bytes
+	// 9-byte case: values with high byte set (negative int64)
+	if uv&0xff00000000000000 != 0 {
+		if len(buf) >= 9 {
+			buf[8] = byte(uv)
+			uv >>= 8
+			for i := 7; i >= 0; i-- {
+				buf[i] = byte((uv & 0x7f) | 0x80)
+				uv >>= 7
+			}
+		}
+		return 9
+	}
+
+	// General case: 3-8 bytes
 	var tmp [9]byte
 	n := 0
 	for i := 8; i >= 0; i-- {
