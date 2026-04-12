@@ -165,7 +165,7 @@ func MemFromValue(v Value) *Mem {
 func (m *Mem) String() string {
 	switch m.Type {
 	case MemNull:
-		return "NULL"
+		return ""
 	case MemInt:
 		return fmt.Sprintf("%d", m.IntVal)
 	case MemFloat:

@@ -788,7 +788,7 @@ func (p *Parser) isReservedForOnUsing() bool {
 		lower == "group" || lower == "having" || lower == "order" ||
 		lower == "limit" || lower == "join" || lower == "inner" ||
 		lower == "left" || lower == "right" || lower == "cross" ||
-		lower == "natural" || lower == "full" ||
+		lower == "natural" || lower == "outer" || lower == "full" ||
 		lower == "union" || lower == "intersect" || lower == "except" ||
 		lower == "window"
 }
