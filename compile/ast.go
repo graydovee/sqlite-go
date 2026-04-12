@@ -297,6 +297,7 @@ type TableRef struct {
 
 	// Join info
 	JoinType JoinType // Type of join to this table
+	Natural  bool     // true for NATURAL joins (combined with JoinType)
 	On       *Expr    // ON condition
 	Using    []string // USING columns
 

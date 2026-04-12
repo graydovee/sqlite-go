@@ -1317,8 +1317,9 @@ func TestValuesClause(t *testing.T) {
 func TestNaturalJoin(t *testing.T) {
 	sql := "SELECT * FROM a NATURAL JOIN b"
 	stmt := parseOne(t, sql)
-	if stmt.SelectStmt.From.Tables[1].JoinType != JoinNatural {
-		t.Fatalf("expected NATURAL join, got %d", stmt.SelectStmt.From.Tables[1].JoinType)
+	ref := stmt.SelectStmt.From.Tables[1]
+	if !ref.Natural {
+		t.Fatalf("expected NATURAL join (Natural=true), got JoinType=%d Natural=%v", ref.JoinType, ref.Natural)
 	}
 }
 

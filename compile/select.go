@@ -399,12 +399,13 @@ func (b *Build) compileSelectInner(stmt *SelectStmt, destCursor int) error {
 }
 
 // openFromTables opens cursors for all tables in the FROM clause.
+// It also computes USING/NATURAL column information for SELECT * deduplication.
 func (b *Build) openFromTables(from *FromClause, forWrite bool) error {
 	if from == nil || len(from.Tables) == 0 {
 		return nil
 	}
 
-	for _, tref := range from.Tables {
+	for tableIdx, tref := range from.Tables {
 		if tref.Subquery != nil {
 			// Subquery in FROM: open ephemeral and compile subquery into it
 			cursor := b.b.AllocCursor()
@@ -463,8 +464,52 @@ func (b *Build) openFromTables(from *FromClause, forWrite bool) error {
 		}
 		b.addTableRef(tref.Name, alias, tbl, cursor)
 
+		// For NATURAL or USING joins, compute which columns are shared
+		// so that SELECT * can skip duplicates from the right table.
+		if tableIdx > 0 && (tref.Natural || len(tref.Using) > 0) {
+			entry := b.tables[len(b.tables)-1]
+			entry.usingCols = make(map[int]bool)
+
+			var usingNames []string
+			if len(tref.Using) > 0 {
+				usingNames = tref.Using
+			} else if tref.Natural {
+				// Find common column names with previous tables
+				for prevIdx := 0; prevIdx < len(b.tables)-1; prevIdx++ {
+					prevInfo := b.tables[prevIdx].table
+					if prevInfo == nil {
+						continue
+					}
+					for _, pc := range prevInfo.Columns {
+						for _, rc := range tbl.Columns {
+							if strings.EqualFold(pc.Name, rc.Name) {
+								// Check not already in list
+								found := false
+								for _, un := range usingNames {
+									if strings.EqualFold(un, rc.Name) {
+										found = true
+										break
+									}
+								}
+								if !found {
+									usingNames = append(usingNames, rc.Name)
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Map column names to column indices for the right table
+			for _, colName := range usingNames {
+				colIdx := tbl.FindColumn(colName)
+				if colIdx >= 0 {
+					entry.usingCols[colIdx] = true
+				}
+			}
+		}
+
 		// Open indexes if needed (for indexed lookups)
-		// This is where we'd analyze the WHERE clause for index usage
 	}
 
 	return nil
@@ -599,54 +644,154 @@ func (b *Build) emitDistinctCheck(distinctCursor, resultBase, nResult int, skipL
 	b.emitIdxInsert(distinctCursor, recReg)
 }
 
-// emitNestedLoopJoin emits nested loop join code.
+// emitNestedLoopJoin emits nested loop join code with support for
+// INNER JOIN, LEFT JOIN, NATURAL JOIN, and USING.
 func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
 	needSorter bool, sorterCursor, orderByBase int, emptyLabel, loopEndLabel int) error {
 
 	nTables := len(b.tables)
-	// Track loop body and end labels for each table level
-	loopBodies := make([]int, nTables)
-	loopEnds := make([]int, nTables)
-	joinFails := make([]int, nTables)
-
-	// Outer loop (first table) is already rewound
-	loopBodies[0] = b.b.NewLabel()
-	b.b.DefineLabel(loopBodies[0])
-
-	// For each subsequent table, emit Rewind and loop structure
-	for i := 1; i < nTables; i++ {
-		empty := b.b.NewLabel()
-		loopBodies[i] = b.b.NewLabel()
-		loopEnds[i] = b.b.NewLabel()
-		joinFails[i] = b.b.NewLabel()
-
-		b.b.EmitJump(vdbe.OpRewind, b.tables[i].cursor, empty, 0)
-		b.b.DefineLabel(loopBodies[i])
+	from := stmt.From
+	if from == nil {
+		return fmt.Errorf("no FROM clause for join")
 	}
 
-	// Check join conditions
-	if stmt.From != nil {
-		for _, tref := range stmt.From.Tables {
+	// Build join conditions for each table (from NATURAL/USING/ON)
+	joinConds := make([]*Expr, nTables)
+	for i := 1; i < nTables; i++ {
+		if i < len(from.Tables) {
+			tref := from.Tables[i]
 			if tref.On != nil {
-				joinFail := b.b.NewLabel()
-				if err := b.compileCondition(tref.On, joinFail, loopEndLabel, true); err != nil {
-					return err
-				}
-				b.b.DefineLabel(joinFail)
+				joinConds[i] = tref.On
+			} else if tref.Natural || len(tref.Using) > 0 {
+				joinConds[i] = b.buildJoinCondition(from, i)
 			}
 		}
 	}
 
-	// Evaluate WHERE
-	if stmt.Where != nil {
-		whereFail := b.b.NewLabel()
-		if err := b.compileCondition(stmt.Where, whereFail, loopEndLabel, true); err != nil {
-			return err
+	// Determine which tables are LEFT JOINs and allocate match flag registers
+	isLeftJoin := make([]bool, nTables)
+	matchFlags := make([]int, nTables)
+	for i := 1; i < nTables; i++ {
+		if i < len(from.Tables) {
+			tref := from.Tables[i]
+			isLeftJoin[i] = tref.JoinType == JoinLeft
+			if isLeftJoin[i] {
+				matchFlags[i] = b.b.AllocReg(1)
+			}
 		}
-		b.b.DefineLabel(whereFail)
 	}
 
-	// Compute result columns
+	// Labels for each loop level
+	loopBodies := make([]int, nTables)
+	endLabels := make([]int, nTables)   // target when Rewind finds empty table
+	skipLabels := make([]int, nTables)  // target when join condition fails
+
+	// Outer loop body (table 0 is already rewound by caller)
+	loopBodies[0] = b.b.NewLabel()
+	b.b.DefineLabel(loopBodies[0])
+
+	// For each table from 1 to N-1, emit Rewind, loop body, and condition check
+	for i := 1; i < nTables; i++ {
+		// For LEFT JOIN: initialize match flag to 0
+		if matchFlags[i] != 0 {
+			b.emitInteger(0, matchFlags[i])
+		}
+
+		// Rewind inner table; jump to endLabels[i] if empty
+		endLabels[i] = b.b.NewLabel()
+		b.b.EmitJump(vdbe.OpRewind, b.tables[i].cursor, endLabels[i], 0)
+
+		// Loop body
+		loopBodies[i] = b.b.NewLabel()
+		b.b.DefineLabel(loopBodies[i])
+
+		// Check join condition for this table
+		if joinConds[i] != nil {
+			skipLabels[i] = b.b.NewLabel()
+			condReg := b.b.AllocReg(1)
+			if err := b.compileExpr(joinConds[i], condReg); err != nil {
+				return err
+			}
+			// If condition is false (0), skip to skipLabels[i]
+			b.b.EmitJump(vdbe.OpIfNot, condReg, skipLabels[i], 0)
+
+			// For LEFT JOIN: set match flag when condition passes
+			if matchFlags[i] != 0 {
+				b.emitInteger(1, matchFlags[i])
+			}
+		}
+	}
+
+	// === At deepest nesting level ===
+
+	// Evaluate WHERE condition
+	if stmt.Where != nil {
+		whereSkip := b.b.NewLabel()
+		whereReg := b.b.AllocReg(1)
+		if err := b.compileExpr(stmt.Where, whereReg); err != nil {
+			return err
+		}
+		b.b.EmitJump(vdbe.OpIfNot, whereReg, whereSkip, 0)
+
+		// Compute result columns and output
+		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+			return err
+		}
+
+		b.b.DefineLabel(whereSkip)
+	} else {
+		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+			return err
+		}
+	}
+
+	// === Close loops from inner to outer ===
+	for i := nTables - 1; i >= 1; i-- {
+		// Define skip label (jumped to when join condition fails)
+		if skipLabels[i] != 0 {
+			b.b.DefineLabel(skipLabels[i])
+		}
+
+		// Next for this table's loop
+		b.emitNext(b.tables[i].cursor, loopBodies[i])
+
+		// Define end label (jumped to when Rewind finds empty table)
+		b.b.DefineLabel(endLabels[i])
+
+		// For LEFT JOIN: check match flag and emit NULL row
+		if matchFlags[i] != 0 {
+			hasMatch := b.b.NewLabel()
+			b.b.EmitJump(vdbe.OpIfPos, matchFlags[i], hasMatch, 0)
+
+			// No match: set NullRow for this table and all subsequent tables
+			for j := i; j < nTables; j++ {
+				b.b.Emit(vdbe.OpNullRow, b.tables[j].cursor, 0, 0)
+			}
+
+			// Emit output row with NULLs for unmatched tables
+			if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+				return err
+			}
+
+			b.b.DefineLabel(hasMatch)
+		}
+	}
+
+	// Next for outer table (table 0)
+	b.emitNext(b.tables[0].cursor, loopBodies[0])
+	b.b.DefineLabel(loopEndLabel)
+
+	// Close all cursors
+	for _, entry := range b.tables {
+		b.emitClose(entry.cursor)
+	}
+	return nil
+}
+
+// emitJoinResultRow computes result columns and emits a ResultRow (or SorterInsert).
+func (b *Build) emitJoinResultRow(resultBase int, resultCols []*resultColumn,
+	needSorter bool, sorterCursor, orderByBase int) error {
+
 	for i, rc := range resultCols {
 		if err := b.compileExpr(rc.Expr, resultBase+i); err != nil {
 			return err
@@ -660,22 +805,98 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 	} else {
 		b.emitResultRow(resultBase, len(resultCols))
 	}
-
-	// Close loops in reverse order
-	for i := nTables - 1; i >= 1; i-- {
-		b.emitNext(b.tables[i].cursor, loopBodies[i])
-		b.b.DefineLabel(loopEnds[i])
-	}
-
-	// Next for outer table
-	b.emitNext(b.tables[0].cursor, loopBodies[0])
-	b.b.DefineLabel(loopEndLabel)
-
-	// Close all cursors
-	for _, entry := range b.tables {
-		b.emitClose(entry.cursor)
-	}
 	return nil
+}
+
+// buildJoinCondition generates the join condition expression for NATURAL or USING joins.
+// For NATURAL, it finds common columns between the left tables and the current table.
+// For USING, it uses the specified columns.
+func (b *Build) buildJoinCondition(from *FromClause, tableIdx int) *Expr {
+	if tableIdx >= len(from.Tables) || tableIdx < 1 {
+		return nil
+	}
+
+	tref := from.Tables[tableIdx]
+	var usingCols []string
+
+	if len(tref.Using) > 0 {
+		usingCols = tref.Using
+	} else if tref.Natural {
+		// Find common columns between the left side and this table
+		rightInfo := b.tables[tableIdx].table
+		if rightInfo == nil {
+			return nil
+		}
+
+		rightCols := make(map[string]bool)
+		for _, c := range rightInfo.Columns {
+			rightCols[strings.ToUpper(c.Name)] = true
+		}
+
+		// Check all previous tables for common columns
+		for prevIdx := 0; prevIdx < tableIdx; prevIdx++ {
+			prevInfo := b.tables[prevIdx].table
+			if prevInfo == nil {
+				continue
+			}
+			for _, c := range prevInfo.Columns {
+				if rightCols[strings.ToUpper(c.Name)] {
+					// Check if already in usingCols
+					found := false
+					for _, uc := range usingCols {
+						if strings.EqualFold(uc, c.Name) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						usingCols = append(usingCols, c.Name)
+					}
+				}
+			}
+		}
+	}
+
+	if len(usingCols) == 0 {
+		return nil
+	}
+
+	// Build equality expressions: left.col = right.col AND ...
+	var cond *Expr
+	for _, col := range usingCols {
+		// Find which previous table has this column
+		var leftAlias string
+		for prevIdx := 0; prevIdx < tableIdx; prevIdx++ {
+			prevInfo := b.tables[prevIdx].table
+			if prevInfo != nil && prevInfo.FindColumn(col) >= 0 {
+				// Use the alias or name of the previous table
+				leftAlias = b.tables[prevIdx].alias
+				break
+			}
+		}
+
+		rightAlias := b.tables[tableIdx].alias
+
+		eq := &Expr{
+			Kind: ExprBinaryOp,
+			Op:   "=",
+			Left: &Expr{Kind: ExprColumnRef, Table: leftAlias, Name: col},
+			Right: &Expr{Kind: ExprColumnRef, Table: rightAlias, Name: col},
+		}
+
+		if cond == nil {
+			cond = eq
+		} else {
+			cond = &Expr{
+				Kind: ExprBinaryOp,
+				Op:   "AND",
+				Left: cond,
+				Right: eq,
+			}
+		}
+	}
+
+	return cond
 }
 
 // emitSortedOutput reads from a sorter and emits ResultRow.

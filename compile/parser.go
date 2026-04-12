@@ -609,8 +609,8 @@ func (p *Parser) parseFromClause() *FromClause {
 
 	// Parse additional joins
 	for {
-		jt := p.parseJoinType()
-		if jt == JoinNone && !p.peekJoinKeyword() {
+		jt, isNatural := p.parseJoinType()
+		if jt == JoinNone && !isNatural && !p.peekJoinKeyword() {
 			break
 		}
 		if jt == JoinNone {
@@ -626,6 +626,7 @@ func (p *Parser) parseFromClause() *FromClause {
 			break
 		}
 		ref.JoinType = jt
+		ref.Natural = isNatural
 
 		// ON or USING
 		if p.matchKw(KwOn) {
@@ -659,8 +660,8 @@ func (p *Parser) peekJoinKeyword() bool {
 }
 
 // parseJoinType parses and returns the join type, consuming tokens.
-// Returns JoinNone if no join keyword is found (i.e., just a comma).
-func (p *Parser) parseJoinType() JoinType {
+// Returns (JoinType, natural). JoinNone if no join keyword is found (i.e., just a comma).
+func (p *Parser) parseJoinType() (JoinType, bool) {
 	// Check for NATURAL prefix
 	natural := false
 	if p.isKw(KwNatural) {
@@ -694,19 +695,16 @@ func (p *Parser) parseJoinType() JoinType {
 	if natural || jt != JoinInner || p.isKw(KwJoin) {
 		if !p.matchKw(KwJoin) {
 			if !natural {
-				return JoinNone
+				return JoinNone, false
 			}
 			p.errorf("expected JOIN after NATURAL")
-			return JoinNone
+			return JoinNone, false
 		}
 	} else {
-		return JoinNone
+		return JoinNone, false
 	}
 
-	if natural {
-		jt = JoinNatural
-	}
-	return jt
+	return jt, natural
 }
 
 // parseTableRef parses a single table reference (name, subquery, etc.).

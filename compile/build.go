@@ -97,11 +97,12 @@ type IndexColumn struct {
 
 // tableEntry tracks a table reference during compilation.
 type tableEntry struct {
-	cursor  int
-	table   *TableInfo
-	alias   string
-	name    string
-	isOuter bool // true for LEFT/RIGHT/FULL join outer table
+	cursor    int
+	table     *TableInfo
+	alias     string
+	name      string
+	isOuter   bool          // true for LEFT/RIGHT/FULL join outer table
+	usingCols map[int]bool  // column indices that are USING/NATURAL columns (skip for SELECT *)
 }
 
 // Build holds the compilation context for generating VDBE bytecode.
@@ -533,6 +534,7 @@ func (b *Build) getOrCreateIntConst(val int64) int {
 }
 
 // expandStarColumns expands a * or table.* into a list of (cursor, colIdx) pairs.
+// For SELECT * with NATURAL/USING joins, shared columns from right tables are skipped.
 func (b *Build) expandStarColumns(table string) ([]struct {
 	cursor int
 	colIdx int
@@ -559,6 +561,10 @@ func (b *Build) expandStarColumns(table string) ([]struct {
 	} else {
 		for _, entry := range b.tables {
 			for i, col := range entry.table.Columns {
+				// Skip USING/NATURAL shared columns from right tables
+				if entry.usingCols != nil && entry.usingCols[i] {
+					continue
+				}
 				result = append(result, struct {
 					cursor int
 					colIdx int

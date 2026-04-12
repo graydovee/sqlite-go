@@ -4,6 +4,7 @@ package sqlite
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -1254,11 +1255,13 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	// Parse FROM clause
 	var tableName string
+	var joinTables []joinTableInfo
+	var hasJoin bool
 	if pos < len(filtered) && isKeyword(filtered[pos], "from") {
 		pos++
-		if pos < len(filtered) {
-			tableName = filtered[pos].Value
-			pos++
+		joinTables, hasJoin, pos = db.parseFromTables(filtered, pos)
+		if len(joinTables) > 0 {
+			tableName = joinTables[0].name
 		}
 	}
 
@@ -1271,6 +1274,11 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	lowerTable := strings.ToLower(tableName)
 	if lowerTable == "sqlite_master" || lowerTable == "sqlite_schema" {
 		return db.querySqliteMaster(filtered, pos, cols, args)
+	}
+
+	// Multi-table JOIN path
+	if hasJoin && len(joinTables) > 1 {
+		return db.queryJoin(joinTables, filtered, pos, cols, distinct, args)
 	}
 
 	var tbl *tableEntry
@@ -1859,6 +1867,1261 @@ func rowKey(values []*vdbe.Mem) string {
 func (db *Database) queryView(v *viewEntry, cols []selectCol, args []interface{}) (*ResultSet, error) {
 	// Re-execute the view's SELECT statement
 	return db.querySingle(v.sql, args)
+}
+
+// joinTableInfo describes a table participating in a join.
+type joinTableInfo struct {
+	name       string
+	alias      string
+	columns    []columnEntry
+	rows       []rawRow
+	joinType   string // "inner", "left", "cross"
+	onExpr     string // ON condition expression
+	natural    bool
+	usingCols  []string
+	isOuter    bool // true for LEFT JOIN (right table)
+}
+
+// parseFromTables parses the FROM clause extracting all tables and join info.
+func (db *Database) parseFromTables(filtered []compile.Token, pos int) ([]joinTableInfo, bool, int) {
+	var tables []joinTableInfo
+	hasJoin := false
+
+	// Parse first table
+	if pos >= len(filtered) {
+		return nil, false, pos
+	}
+
+	firstName := filtered[pos].Value
+	pos++
+	firstAlias := firstName
+	// Check for alias (AS keyword or another identifier before comma/join)
+	if pos < len(filtered) && isKeyword(filtered[pos], "as") {
+		pos++
+		if pos < len(filtered) {
+			firstAlias = filtered[pos].Value
+			pos++
+		}
+	}
+
+	tables = append(tables, joinTableInfo{name: firstName, alias: firstAlias})
+
+	// Parse additional tables with join syntax
+	for pos < len(filtered) {
+		// Check for comma or JOIN keyword
+		if filtered[pos].Type == compile.TokenComma {
+			pos++
+			hasJoin = true
+			// Parse table name
+			if pos >= len(filtered) {
+				break
+			}
+			tName := filtered[pos].Value
+			pos++
+			tAlias := tName
+			if pos < len(filtered) && isKeyword(filtered[pos], "as") {
+				pos++
+				if pos < len(filtered) {
+					tAlias = filtered[pos].Value
+					pos++
+				}
+			}
+			tables = append(tables, joinTableInfo{
+				name: tName, alias: tAlias, joinType: "inner",
+			})
+			// Check for ON (comma join with ON: t1, t2 ON ...)
+			if pos < len(filtered) && isKeyword(filtered[pos], "on") {
+				pos++
+				onExpr, newPos := collectExprTokens(filtered, pos)
+				pos = newPos
+				if len(tables) > 0 {
+					tables[len(tables)-1].onExpr = onExpr
+				}
+			}
+			continue
+		}
+
+		// Check for NATURAL
+		isNatural := false
+		if pos < len(filtered) && isKeyword(filtered[pos], "natural") {
+			isNatural = true
+			pos++
+		}
+
+		// Check for join type keywords
+		joinType := "inner"
+		isOuter := false
+		if pos < len(filtered) && isKeyword(filtered[pos], "left") {
+			joinType = "left"
+			isOuter = true
+			pos++
+			if pos < len(filtered) && isKeyword(filtered[pos], "outer") {
+				pos++
+			}
+		} else if pos < len(filtered) && isKeyword(filtered[pos], "right") {
+			joinType = "right"
+			pos++
+			if pos < len(filtered) && isKeyword(filtered[pos], "outer") {
+				pos++
+			}
+		} else if pos < len(filtered) && isKeyword(filtered[pos], "full") {
+			joinType = "full"
+			pos++
+			if pos < len(filtered) && isKeyword(filtered[pos], "outer") {
+				pos++
+			}
+		} else if pos < len(filtered) && isKeyword(filtered[pos], "cross") {
+			joinType = "cross"
+			pos++
+		} else if pos < len(filtered) && isKeyword(filtered[pos], "inner") {
+			pos++
+		}
+
+		// Expect JOIN keyword
+		if pos < len(filtered) && isKeyword(filtered[pos], "join") {
+			pos++
+			hasJoin = true
+		} else if isNatural {
+			hasJoin = true
+		} else {
+			// Not a join keyword - stop parsing
+			if isNatural || joinType != "inner" {
+				// consumed keywords but no JOIN - back up
+			}
+			break
+		}
+
+		// Parse table name
+		if pos >= len(filtered) {
+			break
+		}
+		tName := filtered[pos].Value
+		pos++
+		tAlias := tName
+		if pos < len(filtered) && isKeyword(filtered[pos], "as") {
+			pos++
+			if pos < len(filtered) {
+				tAlias = filtered[pos].Value
+				pos++
+			}
+		}
+
+		jt := joinTableInfo{
+			name:     tName,
+			alias:    tAlias,
+			joinType: joinType,
+			natural:  isNatural,
+			isOuter:  isOuter,
+		}
+
+		// Parse ON or USING
+		if pos < len(filtered) && isKeyword(filtered[pos], "on") {
+			pos++
+			onExpr, newPos := collectExprTokens(filtered, pos)
+			pos = newPos
+			jt.onExpr = onExpr
+		} else if pos < len(filtered) && isKeyword(filtered[pos], "using") {
+			pos++
+			if pos < len(filtered) && filtered[pos].Type == compile.TokenLParen {
+				pos++
+				for pos < len(filtered) && filtered[pos].Type != compile.TokenRParen {
+					if filtered[pos].Type != compile.TokenComma {
+						jt.usingCols = append(jt.usingCols, filtered[pos].Value)
+					}
+					pos++
+				}
+				if pos < len(filtered) {
+					pos++ // skip ')'
+				}
+			}
+		}
+
+		tables = append(tables, jt)
+	}
+
+	return tables, hasJoin, pos
+}
+
+// collectExprTokens collects expression tokens until a clause boundary keyword.
+func collectExprTokens(filtered []compile.Token, pos int) (string, int) {
+	var parts []string
+	parenDepth := 0
+	for pos < len(filtered) &&
+		!isKeyword(filtered[pos], "where") &&
+		!isKeyword(filtered[pos], "group") &&
+		!isKeyword(filtered[pos], "order") &&
+		!isKeyword(filtered[pos], "limit") &&
+		!isKeyword(filtered[pos], "having") &&
+		!isKeyword(filtered[pos], "on") &&
+		!isKeyword(filtered[pos], "join") &&
+		!isKeyword(filtered[pos], "left") &&
+		!isKeyword(filtered[pos], "right") &&
+		!isKeyword(filtered[pos], "inner") &&
+		!isKeyword(filtered[pos], "cross") &&
+		!isKeyword(filtered[pos], "natural") &&
+		!isKeyword(filtered[pos], "full") &&
+		(parenDepth > 0 || filtered[pos].Type != compile.TokenComma) {
+		if filtered[pos].Type == compile.TokenLParen {
+			parenDepth++
+		}
+		if filtered[pos].Type == compile.TokenRParen {
+			parenDepth--
+		}
+		parts = append(parts, filtered[pos].Value)
+		pos++
+	}
+	return strings.Join(parts, " "), pos
+}
+
+// queryJoin executes a multi-table join query.
+func (db *Database) queryJoin(tables []joinTableInfo, filtered []compile.Token, pos int, cols []selectCol, distinct bool, args []interface{}) (*ResultSet, error) {
+	// Load table metadata and rows
+	for i := range tables {
+		t, ok := db.tables[tables[i].name]
+		if !ok {
+			return nil, NewErrorf(Error, "no such table: %s", tables[i].name)
+		}
+		tables[i].columns = t.columns
+
+		// Scan all rows from the table
+		cursor, err := db.bt.Cursor(btree.PageNumber(t.rootPage), false)
+		if err != nil {
+			return nil, NewErrorf(Error, "open cursor for %s: %s", tables[i].name, err)
+		}
+		hasRow, err := cursor.First()
+		if err != nil {
+			cursor.Close()
+			return nil, err
+		}
+		for hasRow {
+			data, err := cursor.Data()
+			if err != nil {
+				cursor.Close()
+				return nil, err
+			}
+			values, err := vdbe.ParseRecord(data)
+			if err != nil {
+				cursor.Close()
+				return nil, err
+			}
+			// Append rowid as the last value
+			rowid := cursor.RowID()
+			tables[i].rows = append(tables[i].rows, rawRow{values: append(values, vdbe.Value{Type: "int", IntVal: int64(rowid)})})
+			hasRow, err = cursor.Next()
+			if err != nil {
+				cursor.Close()
+				return nil, err
+			}
+		}
+		cursor.Close()
+	}
+
+	// Build NATURAL join conditions if needed
+	for i := 1; i < len(tables); i++ {
+		if tables[i].natural && tables[i].onExpr == "" {
+			tables[i].usingCols = findCommonColumns(tables, i)
+		}
+	}
+
+	// Parse WHERE clause
+	var whereExpr string
+	if pos < len(filtered) && isKeyword(filtered[pos], "where") {
+		pos++
+		var whereParts []string
+		parenDepth := 0
+		for pos < len(filtered) &&
+			!isKeyword(filtered[pos], "limit") &&
+			!isKeyword(filtered[pos], "order") &&
+			!isKeyword(filtered[pos], "group") {
+			if filtered[pos].Type == compile.TokenLParen {
+				parenDepth++
+			}
+			if filtered[pos].Type == compile.TokenRParen {
+				parenDepth--
+			}
+			whereParts = append(whereParts, filtered[pos].Value)
+			pos++
+		}
+		whereExpr = strings.Join(whereParts, " ")
+	}
+
+	// Build combined column context for expression evaluation
+	_, _ = buildJoinColumnContext(tables)
+
+	// Determine output columns
+	var resultCols []ResultColumnInfo
+	var outputExprs []string
+	for _, c := range cols {
+		if c.expr == "*" {
+			// Expand * across all tables, skip USING columns from right tables
+			for ti, jt := range tables {
+				for _, col := range jt.columns {
+					// Skip USING columns from right tables
+					if ti > 0 && isUsingCol(tables, ti, col.name) {
+						continue
+					}
+					resultCols = append(resultCols, ResultColumnInfo{
+						Name: col.name,
+						Type: ColNull,
+					})
+					// Generate a qualified reference
+					outputExprs = append(outputExprs, jt.alias+"."+col.name)
+				}
+			}
+		} else if isTableStar(c.expr) {
+			// Expand table.* to all columns from that table
+			tblName := extractTableFromStar(c.expr)
+			for _, jt := range tables {
+				if strings.EqualFold(jt.alias, tblName) || strings.EqualFold(jt.name, tblName) {
+					for _, col := range jt.columns {
+						resultCols = append(resultCols, ResultColumnInfo{
+							Name: col.name,
+							Type: ColNull,
+						})
+						outputExprs = append(outputExprs, jt.alias+"."+col.name)
+					}
+					break
+				}
+			}
+		} else {
+			name := c.as
+			if name == "" {
+				name = c.expr
+			}
+			resultCols = append(resultCols, ResultColumnInfo{
+				Name: name,
+				Type: ColNull,
+			})
+			outputExprs = append(outputExprs, c.expr)
+		}
+	}
+
+	// Execute nested loop join
+	var rows []Row
+
+	// Recursive nested loop
+	var joinFunc func(depth int, currentRows []rawRow)
+	joinFunc = func(depth int, currentRows []rawRow) {
+		if depth == len(tables) {
+			// We have a complete row combination
+			// Flatten all values with combined context
+			var allValues []vdbe.Value
+			var rowColNames []string
+			var rowTblNames []string
+			for i, rr := range currentRows {
+				for j, col := range tables[i].columns {
+					if j < len(rr.values) {
+						allValues = append(allValues, rr.values[j])
+						rowColNames = append(rowColNames, col.name)
+						rowTblNames = append(rowTblNames, tables[i].alias)
+					}
+				}
+				// Add rowid
+				if len(rr.values) > len(tables[i].columns) {
+					allValues = append(allValues, rr.values[len(tables[i].columns)])
+					rowColNames = append(rowColNames, "rowid")
+					rowTblNames = append(rowTblNames, tables[i].alias)
+				}
+			}
+
+			// Check WHERE condition
+			if whereExpr != "" {
+				wval := evalJoinExpr(whereExpr, args, rowColNames, rowTblNames, allValues)
+				if !isTruthy(wval) {
+					return
+				}
+			}
+
+			// Evaluate output columns
+			row := Row{cols: resultCols}
+			for _, expr := range outputExprs {
+				val := evalJoinExpr(expr, args, rowColNames, rowTblNames, allValues)
+				row.values = append(row.values, val)
+			}
+
+			if distinct {
+				key := rowKey(row.values)
+				seen := rowSeenMap()
+				if seen[key] {
+					return
+				}
+				seen[key] = true
+			}
+
+			rows = append(rows, row)
+			return
+		}
+
+		// Check if this is a LEFT JOIN with no matches yet
+		if tables[depth].isOuter {
+			// Try matching rows
+			matched := false
+			for _, tableRow := range tables[depth].rows {
+				// Build combined values so far + this candidate row
+				var testValues []vdbe.Value
+				var testColNames []string
+				var testTblNames []string
+				for i, rr := range currentRows {
+					for j, col := range tables[i].columns {
+						if j < len(rr.values) {
+							testValues = append(testValues, rr.values[j])
+							testColNames = append(testColNames, col.name)
+							testTblNames = append(testTblNames, tables[i].alias)
+						}
+						if len(rr.values) > len(tables[i].columns) {
+							testValues = append(testValues, rr.values[len(tables[i].columns)])
+							testColNames = append(testColNames, "rowid")
+							testTblNames = append(testTblNames, tables[i].alias)
+						}
+					}
+				}
+				for j, col := range tables[depth].columns {
+					if j < len(tableRow.values) {
+						testValues = append(testValues, tableRow.values[j])
+						testColNames = append(testColNames, col.name)
+						testTblNames = append(testTblNames, tables[depth].alias)
+					}
+				}
+				if len(tableRow.values) > len(tables[depth].columns) {
+					testValues = append(testValues, tableRow.values[len(tables[depth].columns)])
+					testColNames = append(testColNames, "rowid")
+					testTblNames = append(testTblNames, tables[depth].alias)
+				}
+
+				// Check join condition
+				condOK := true
+				if tables[depth].onExpr != "" {
+					cval := evalJoinExpr(tables[depth].onExpr, args, testColNames, testTblNames, testValues)
+					if !isTruthy(cval) {
+						condOK = false
+					}
+				}
+				if condOK && len(tables[depth].usingCols) > 0 {
+					for _, uc := range tables[depth].usingCols {
+						cval := evalJoinExpr(tables[depth].alias+"."+uc+" = "+tables[depth-1].alias+"."+uc, args, testColNames, testTblNames, testValues)
+						if !isTruthy(cval) {
+							condOK = false
+							break
+						}
+					}
+				}
+
+				if condOK {
+					matched = true
+					joinFunc(depth+1, append(currentRows, tableRow))
+				}
+			}
+
+			if !matched {
+				// No match for LEFT JOIN: emit row with NULLs for right table
+				nullRow := rawRow{values: make([]vdbe.Value, len(tables[depth].columns)+1)}
+				for i := range nullRow.values {
+					nullRow.values[i] = vdbe.Value{Type: "null"}
+				}
+				joinFunc(depth+1, append(currentRows, nullRow))
+			}
+		} else {
+			// INNER join: iterate all rows
+			for _, tableRow := range tables[depth].rows {
+				// Build combined values so far + this candidate row for condition check
+				var testValues []vdbe.Value
+				var testColNames []string
+				var testTblNames []string
+				for i, rr := range currentRows {
+					for j, col := range tables[i].columns {
+						if j < len(rr.values) {
+							testValues = append(testValues, rr.values[j])
+							testColNames = append(testColNames, col.name)
+							testTblNames = append(testTblNames, tables[i].alias)
+						}
+						if len(rr.values) > len(tables[i].columns) {
+							testValues = append(testValues, rr.values[len(tables[i].columns)])
+							testColNames = append(testColNames, "rowid")
+							testTblNames = append(testTblNames, tables[i].alias)
+						}
+					}
+				}
+				for j, col := range tables[depth].columns {
+					if j < len(tableRow.values) {
+						testValues = append(testValues, tableRow.values[j])
+						testColNames = append(testColNames, col.name)
+						testTblNames = append(testTblNames, tables[depth].alias)
+					}
+				}
+				if len(tableRow.values) > len(tables[depth].columns) {
+					testValues = append(testValues, tableRow.values[len(tables[depth].columns)])
+					testColNames = append(testColNames, "rowid")
+					testTblNames = append(testTblNames, tables[depth].alias)
+				}
+
+				// Check join condition
+				condOK := true
+				if tables[depth].onExpr != "" {
+					cval := evalJoinExpr(tables[depth].onExpr, args, testColNames, testTblNames, testValues)
+					if !isTruthy(cval) {
+						condOK = false
+					}
+				}
+				if condOK && len(tables[depth].usingCols) > 0 {
+					for _, uc := range tables[depth].usingCols {
+						cval := evalJoinExpr(tables[depth].alias+"."+uc+" = "+tables[depth-1].alias+"."+uc, args, testColNames, testTblNames, testValues)
+						if !isTruthy(cval) {
+							condOK = false
+							break
+						}
+					}
+				}
+
+				if condOK {
+					joinFunc(depth+1, append(currentRows, tableRow))
+				}
+			}
+		}
+	}
+
+	// Start the nested loop from the first table
+	for _, firstRow := range tables[0].rows {
+		joinFunc(1, []rawRow{firstRow})
+	}
+
+	if rows == nil {
+		rows = []Row{}
+	}
+	return newResultSet(rows, resultCols), nil
+}
+
+// rowSeenMap returns a per-query dedup map. Uses a package-level var per call.
+// This is a simplification; in production, pass the map through.
+var rowSeenMap = func() func() map[string]bool {
+	return func() map[string]bool { return make(map[string]bool) }
+}()
+
+// findCommonColumns finds columns common between tables[0..i-1] and tables[i].
+func findCommonColumns(tables []joinTableInfo, idx int) []string {
+	rightCols := make(map[string]bool)
+	for _, c := range tables[idx].columns {
+		rightCols[strings.ToLower(c.name)] = true
+	}
+	var common []string
+	for prev := 0; prev < idx; prev++ {
+		for _, c := range tables[prev].columns {
+			if rightCols[strings.ToLower(c.name)] {
+				common = append(common, c.name)
+			}
+		}
+	}
+	return common
+}
+
+// isUsingCol checks if a column is in the USING list for a given table.
+// isTableStar checks if an expression is a table.* pattern (e.g., "t2 . *").
+func isTableStar(expr string) bool {
+	// The tokenizer produces "t2 . *" with spaces around dot
+	s := strings.ReplaceAll(expr, " ", "")
+	return len(s) > 2 && s[len(s)-2] == '.' && s[len(s)-1] == '*'
+}
+
+// extractTableFromStar extracts the table name from "table.*" or "table . *".
+func extractTableFromStar(expr string) string {
+	s := strings.TrimSpace(expr)
+	// Remove spaces and trailing .*
+	s = strings.ReplaceAll(s, " ", "")
+	if strings.HasSuffix(s, ".*") {
+		return s[:len(s)-2]
+	}
+	// Also handle "t2 . *" format
+	parts := strings.Fields(expr)
+	if len(parts) >= 1 {
+		return parts[0]
+	}
+	return ""
+}
+
+func isUsingCol(tables []joinTableInfo, tableIdx int, colName string) bool {
+	if len(tables[tableIdx].usingCols) == 0 {
+		return false
+	}
+	for _, uc := range tables[tableIdx].usingCols {
+		if strings.EqualFold(uc, colName) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildJoinColumnContext builds flattened column name and table name arrays.
+func buildJoinColumnContext(tables []joinTableInfo) ([]string, []string) {
+	var colNames, tblNames []string
+	for _, jt := range tables {
+		for _, col := range jt.columns {
+			colNames = append(colNames, col.name)
+			tblNames = append(tblNames, jt.alias)
+		}
+	}
+	return colNames, tblNames
+}
+
+// evalJoinExpr evaluates an expression in a join context with qualified column support.
+func evalJoinExpr(expr string, args []interface{}, colNames []string, tableNames []string, values []vdbe.Value) *vdbe.Mem {
+	p := &joinExprParser{
+		src:        strings.TrimSpace(expr),
+		args:       args,
+		colNames:   colNames,
+		tableNames: tableNames,
+		values:     values,
+	}
+	val := p.parseExpr()
+	if val != nil {
+		return val
+	}
+	return vdbe.NewMemStr(strings.TrimSpace(expr))
+}
+
+// joinExprParser extends exprParser with table-qualified column support.
+type joinExprParser struct {
+	src        string
+	pos        int
+	args       []interface{}
+	colNames   []string
+	tableNames []string
+	values     []vdbe.Value
+}
+
+func (p *joinExprParser) peek() byte {
+	if p.pos >= len(p.src) {
+		return 0
+	}
+	return p.src[p.pos]
+}
+
+func (p *joinExprParser) skipSpaces() {
+	for p.pos < len(p.src) && p.src[p.pos] == ' ' {
+		p.pos++
+	}
+}
+
+func (p *joinExprParser) remaining() string {
+	if p.pos >= len(p.src) {
+		return ""
+	}
+	return p.src[p.pos:]
+}
+
+func (p *joinExprParser) matchKeyword(kw string) bool {
+	p.skipSpaces()
+	rest := p.remaining()
+	if len(rest) < len(kw) {
+		return false
+	}
+	if !strings.EqualFold(rest[:len(kw)], kw) {
+		return false
+	}
+	after := len(kw)
+	if after < len(rest) {
+		c := rest[after]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			return false
+		}
+	}
+	p.pos += len(kw)
+	return true
+}
+
+func (p *joinExprParser) peekKeyword(kw string) bool {
+	saved := p.pos
+	result := p.matchKeyword(kw)
+	p.pos = saved
+	return result
+}
+
+func (p *joinExprParser) matchOp(op string) bool {
+	p.skipSpaces()
+	rest := p.remaining()
+	if len(rest) < len(op) {
+		return false
+	}
+	if rest[:len(op)] != op {
+		return false
+	}
+	p.pos += len(op)
+	return true
+}
+
+func (p *joinExprParser) peekOp(op string) bool {
+	saved := p.pos
+	result := p.matchOp(op)
+	p.pos = saved
+	return result
+}
+
+func (p *joinExprParser) parseExpr() *vdbe.Mem {
+	return p.parseOr()
+}
+
+func (p *joinExprParser) parseOr() *vdbe.Mem {
+	left := p.parseAnd()
+	for {
+		p.skipSpaces()
+		if p.matchKeyword("or") {
+			right := p.parseAnd()
+			if isTruthy(left) {
+				// skip remaining
+				left = vdbe.NewMemInt(1)
+			} else if isTruthy(right) {
+				left = vdbe.NewMemInt(1)
+			} else {
+				left = vdbe.NewMemInt(0)
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *joinExprParser) parseAnd() *vdbe.Mem {
+	left := p.parseNot()
+	for {
+		p.skipSpaces()
+		if p.matchKeyword("and") {
+			right := p.parseNot()
+			if !isTruthy(left) || !isTruthy(right) {
+				left = vdbe.NewMemInt(0)
+			} else {
+				left = vdbe.NewMemInt(1)
+			}
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *joinExprParser) parseNot() *vdbe.Mem {
+	p.skipSpaces()
+	if p.matchKeyword("not") {
+		val := p.parseNot()
+		if isTruthy(val) {
+			return vdbe.NewMemInt(0)
+		}
+		return vdbe.NewMemInt(1)
+	}
+	return p.parseComparison()
+}
+
+func (p *joinExprParser) parseComparison() *vdbe.Mem {
+	left := p.parseAddition()
+	for {
+		p.skipSpaces()
+		var op string
+		if p.matchOp("=") || p.matchOp("==") {
+			op = "="
+		} else if p.matchOp("!=") || p.matchOp("<>") {
+			op = "!="
+		} else if p.matchOp("<=") {
+			op = "<="
+		} else if p.matchOp(">=") {
+			op = ">="
+		} else if p.matchOp("<") {
+			op = "<"
+		} else if p.matchOp(">") {
+			op = ">"
+		} else if p.peekKeyword("is") {
+			p.matchKeyword("is")
+			if p.matchKeyword("not") {
+				op = "is not"
+			} else {
+				op = "is"
+			}
+		} else {
+			break
+		}
+		right := p.parseAddition()
+		left = compareValues(left, right, op)
+	}
+	return left
+}
+
+func (p *joinExprParser) parseAddition() *vdbe.Mem {
+	left := p.parseMultiplication()
+	for {
+		p.skipSpaces()
+		if p.matchOp("+") {
+			right := p.parseMultiplication()
+			left = arithOp(left, right, func(a, b int64) int64 { return a + b }, func(a, b float64) float64 { return a + b })
+		} else if p.matchOp("-") {
+			right := p.parseMultiplication()
+			left = arithOp(left, right, func(a, b int64) int64 { return a - b }, func(a, b float64) float64 { return a - b })
+		} else if p.matchOp("||") {
+			right := p.parseMultiplication()
+			// String concatenation
+			left = vdbe.NewMemStr(memStr(left) + memStr(right))
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *joinExprParser) parseMultiplication() *vdbe.Mem {
+	left := p.parsePrimary()
+	for {
+		p.skipSpaces()
+		if p.matchOp("*") {
+			right := p.parsePrimary()
+			left = arithOp(left, right, func(a, b int64) int64 { return a * b }, func(a, b float64) float64 { return a * b })
+		} else if p.matchOp("/") {
+			right := p.parsePrimary()
+			left = arithOp(left, right, func(a, b int64) int64 { return a / b }, func(a, b float64) float64 { return a / b })
+		} else if p.matchOp("%") {
+			right := p.parsePrimary()
+			left = arithOp(left, right, func(a, b int64) int64 { return a % b }, nil)
+		} else {
+			break
+		}
+	}
+	return left
+}
+
+func (p *joinExprParser) parsePrimary() *vdbe.Mem {
+	p.skipSpaces()
+	if p.pos >= len(p.src) {
+		return nil
+	}
+
+	// Parenthesized expression
+	if p.src[p.pos] == '(' {
+		p.pos++
+		val := p.parseExpr()
+		p.skipSpaces()
+		if p.pos < len(p.src) && p.src[p.pos] == ')' {
+			p.pos++
+		}
+		return val
+	}
+
+	// String literal
+	if p.src[p.pos] == '\'' {
+		p.pos++
+		var sb strings.Builder
+		for p.pos < len(p.src) {
+			if p.src[p.pos] == '\'' {
+				p.pos++
+				if p.pos < len(p.src) && p.src[p.pos] == '\'' {
+					sb.WriteByte('\'')
+					p.pos++
+					continue
+				}
+				break
+			}
+			sb.WriteByte(p.src[p.pos])
+			p.pos++
+		}
+		return vdbe.NewMemStr(sb.String())
+	}
+
+	// NULL keyword
+	if p.matchKeyword("null") {
+		return vdbe.NewMemNull()
+	}
+
+	// Number
+	if c := p.peek(); (c >= '0' && c <= '9') || (c == '.' && p.pos+1 < len(p.src) && p.src[p.pos+1] >= '0' && p.src[p.pos+1] <= '9') {
+		start := p.pos
+		isFloat := false
+		for p.pos < len(p.src) && ((p.src[p.pos] >= '0' && p.src[p.pos] <= '9') || p.src[p.pos] == '.') {
+			if p.src[p.pos] == '.' {
+				isFloat = true
+			}
+			p.pos++
+		}
+		if p.pos < len(p.src) && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
+			isFloat = true
+			p.pos++
+			if p.pos < len(p.src) && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
+				p.pos++
+			}
+			for p.pos < len(p.src) && p.src[p.pos] >= '0' && p.src[p.pos] <= '9' {
+				p.pos++
+			}
+		}
+		numStr := p.src[start:p.pos]
+		if isFloat {
+			if v, err := strconv.ParseFloat(numStr, 64); err == nil {
+				return vdbe.NewMemFloat(v)
+			}
+		} else {
+			if v, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+				return vdbe.NewMemInt(v)
+			}
+		}
+	}
+
+	// Read a word (identifier or keyword)
+	start := p.pos
+	for p.pos < len(p.src) {
+		c := p.src[p.pos]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9') {
+			p.pos++
+		} else {
+			break
+		}
+	}
+	word := p.src[start:p.pos]
+	if word == "" {
+		return nil
+	}
+
+	// Check for function call
+	p.skipSpaces()
+	if p.pos < len(p.src) && p.src[p.pos] == '(' {
+		p.pos++ // skip '('
+		return p.evalFunction(strings.ToLower(word))
+	}
+
+	// Check for qualified reference: table.column
+	p.skipSpaces()
+	if p.pos < len(p.src) && p.src[p.pos] == '.' {
+		p.pos++ // skip '.'
+		p.skipSpaces() // skip spaces after dot
+		// Read column name
+		colStart := p.pos
+		for p.pos < len(p.src) {
+			c := p.src[p.pos]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9') {
+				p.pos++
+			} else {
+				break
+			}
+		}
+		colName := p.src[colStart:p.pos]
+		if colName == "" {
+			return vdbe.NewMemNull()
+		}
+
+		// Handle table.* (shouldn't appear here, but just in case)
+		if colName == "*" {
+			return vdbe.NewMemStr(word + ".*")
+		}
+
+		// Look up qualified column
+		return p.lookupQualifiedColumn(word, colName)
+	}
+
+	// Unqualified column reference
+	return p.lookupColumn(word)
+}
+
+// lookupQualifiedColumn resolves table.column.
+func (p *joinExprParser) lookupQualifiedColumn(tableName, colName string) *vdbe.Mem {
+	tblLower := strings.ToLower(tableName)
+	colLower := strings.ToLower(colName)
+
+	// Handle rowid
+	if colLower == "rowid" {
+		for _, tn := range p.tableNames {
+			if strings.ToLower(tn) == tblLower {
+				// Find the rowid column (after the regular columns)
+				colCount := 0
+				for j, tn2 := range p.tableNames {
+					if strings.ToLower(tn2) == tblLower {
+						colCount++
+						if j >= len(p.values) {
+							return vdbe.NewMemNull()
+						}
+					}
+				}
+				// rowid is stored after regular columns for each table
+				// Find the start index for this table's rowid
+				tblStart := -1
+				tblColCount := 0
+				for j := 0; j < len(p.tableNames); j++ {
+					if strings.ToLower(p.tableNames[j]) == tblLower {
+						if tblStart == -1 {
+							tblStart = j
+						}
+						tblColCount++
+					} else if tblStart >= 0 && tblColCount > 0 {
+						break
+					}
+				}
+				rowidIdx := tblStart + tblColCount
+				if rowidIdx < len(p.values) {
+					return vdbe.MemFromValue(p.values[rowidIdx])
+				}
+				return vdbe.NewMemNull()
+			}
+		}
+		return vdbe.NewMemNull()
+	}
+
+	for i, tn := range p.tableNames {
+		if strings.ToLower(tn) == tblLower && i < len(p.colNames) {
+			if strings.ToLower(p.colNames[i]) == colLower && i < len(p.values) {
+				return vdbe.MemFromValue(p.values[i])
+			}
+		}
+	}
+	return vdbe.NewMemNull()
+}
+
+// lookupColumn resolves an unqualified column name.
+func (p *joinExprParser) lookupColumn(name string) *vdbe.Mem {
+	nameLower := strings.ToLower(name)
+
+	// Handle rowid
+	if nameLower == "rowid" {
+		// Return rowid from first table
+		for i, cn := range p.colNames {
+			if strings.ToLower(cn) == "rowid" && i < len(p.values) {
+				return vdbe.MemFromValue(p.values[i])
+			}
+		}
+		return vdbe.NewMemInt(0)
+	}
+
+	for i, cn := range p.colNames {
+		if strings.ToLower(cn) == nameLower && i < len(p.values) {
+			return vdbe.MemFromValue(p.values[i])
+		}
+	}
+	return vdbe.NewMemNull()
+}
+
+// evalFunction evaluates a SQL function call.
+func (p *joinExprParser) evalFunction(name string) *vdbe.Mem {
+	var funcArgs []*vdbe.Mem
+	p.skipSpaces()
+	for p.pos < len(p.src) && p.src[p.pos] != ')' {
+		if p.src[p.pos] == ',' {
+			p.pos++
+			continue
+		}
+		arg := p.parseExpr()
+		if arg != nil {
+			funcArgs = append(funcArgs, arg)
+		}
+	}
+	if p.pos < len(p.src) && p.src[p.pos] == ')' {
+		p.pos++
+	}
+
+	switch name {
+	case "coalesce":
+		for _, arg := range funcArgs {
+			if arg != nil && arg.Type != vdbe.MemNull {
+				return arg
+			}
+		}
+		return vdbe.NewMemNull()
+	case "ifnull":
+		if len(funcArgs) >= 2 && (funcArgs[0] == nil || funcArgs[0].Type == vdbe.MemNull) {
+			return funcArgs[1]
+		}
+		if len(funcArgs) >= 1 {
+			return funcArgs[0]
+		}
+		return vdbe.NewMemNull()
+	case "nullif":
+		if len(funcArgs) >= 2 && memEqual(funcArgs[0], funcArgs[1]) {
+			return vdbe.NewMemNull()
+		}
+		if len(funcArgs) >= 1 {
+			return funcArgs[0]
+		}
+		return vdbe.NewMemNull()
+	case "typeof":
+		if len(funcArgs) >= 1 {
+			if funcArgs[0] == nil || funcArgs[0].Type == vdbe.MemNull {
+				return vdbe.NewMemStr("null")
+			}
+			switch funcArgs[0].Type {
+			case vdbe.MemInt:
+				return vdbe.NewMemStr("integer")
+			case vdbe.MemFloat:
+				return vdbe.NewMemStr("real")
+			case vdbe.MemStr:
+				return vdbe.NewMemStr("text")
+			case vdbe.MemBlob:
+				return vdbe.NewMemStr("blob")
+			}
+		}
+		return vdbe.NewMemStr("null")
+	case "length":
+		if len(funcArgs) >= 1 && funcArgs[0] != nil && funcArgs[0].Type == vdbe.MemStr {
+			return vdbe.NewMemInt(int64(len(funcArgs[0].StringValue())))
+		}
+		return vdbe.NewMemNull()
+	case "abs":
+		if len(funcArgs) >= 1 && funcArgs[0] != nil {
+			switch funcArgs[0].Type {
+			case vdbe.MemInt:
+				v := funcArgs[0].IntVal
+				if v < 0 {
+					v = -v
+				}
+				return vdbe.NewMemInt(v)
+			case vdbe.MemFloat:
+				return vdbe.NewMemFloat(math.Abs(funcArgs[0].FloatVal))
+			}
+		}
+		return vdbe.NewMemNull()
+	case "lower":
+		if len(funcArgs) >= 1 && funcArgs[0] != nil && funcArgs[0].Type == vdbe.MemStr {
+			return vdbe.NewMemStr(strings.ToLower(funcArgs[0].StringValue()))
+		}
+		return vdbe.NewMemNull()
+	case "upper":
+		if len(funcArgs) >= 1 && funcArgs[0] != nil && funcArgs[0].Type == vdbe.MemStr {
+			return vdbe.NewMemStr(strings.ToUpper(funcArgs[0].StringValue()))
+		}
+		return vdbe.NewMemNull()
+	case "cast":
+		// Handled by the caller
+		return vdbe.NewMemNull()
+	}
+	return vdbe.NewMemNull()
+}
+
+// compareValues compares two mem values with the given operator.
+func compareValues(left, right *vdbe.Mem, op string) *vdbe.Mem {
+	if left == nil || right == nil {
+		return vdbe.NewMemNull()
+	}
+	if left.Type == vdbe.MemNull || right.Type == vdbe.MemNull {
+		if op == "is" {
+			if left.Type == vdbe.MemNull && right.Type == vdbe.MemNull {
+				return vdbe.NewMemInt(1)
+			}
+			return vdbe.NewMemInt(0)
+		}
+		if op == "is not" {
+			if left.Type == vdbe.MemNull && right.Type == vdbe.MemNull {
+				return vdbe.NewMemInt(0)
+			}
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemNull()
+	}
+
+	cmp := memCompare(left, right)
+	switch op {
+	case "=", "==":
+		if cmp == 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case "!=", "<>":
+		if cmp != 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case "<":
+		if cmp < 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case "<=":
+		if cmp <= 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case ">":
+		if cmp > 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case ">=":
+		if cmp >= 0 {
+			return vdbe.NewMemInt(1)
+		}
+		return vdbe.NewMemInt(0)
+	case "is":
+		return vdbe.NewMemInt(1) // both non-null and equal handled above
+	case "is not":
+		return vdbe.NewMemInt(0)
+	}
+	return vdbe.NewMemInt(0)
+}
+
+// memCompare returns -1, 0, or 1.
+func memCompare(a, b *vdbe.Mem) int {
+	// Type affinity: numeric < text < blob
+	aType := memTypeRank(a)
+	bType := memTypeRank(b)
+	if aType != bType {
+		if aType < bType {
+			return -1
+		}
+		return 1
+	}
+	switch a.Type {
+	case vdbe.MemInt:
+		ai, bi := a.IntVal, b.IntValue()
+		if ai < bi {
+			return -1
+		}
+		if ai > bi {
+			return 1
+		}
+		return 0
+	case vdbe.MemFloat:
+		af, bf := a.FloatValue(), b.FloatValue()
+		if af < bf {
+			return -1
+		}
+		if af > bf {
+			return 1
+		}
+		return 0
+	case vdbe.MemStr:
+		if memStr(a) < memStr(b) {
+			return -1
+		}
+		if memStr(a) > memStr(b) {
+			return 1
+		}
+		return 0
+	}
+	return 0
+}
+
+func memTypeRank(m *vdbe.Mem) int {
+	switch m.Type {
+	case vdbe.MemInt, vdbe.MemFloat:
+		return 0
+	case vdbe.MemStr:
+		return 1
+	case vdbe.MemBlob:
+		return 2
+	default:
+		return -1
+	}
+}
+
+// memStr returns the string representation of a mem value.
+func memStr(m *vdbe.Mem) string {
+	if m == nil || m.Type == vdbe.MemNull {
+		return ""
+	}
+	return m.String()
+}
+
+// arithOp performs arithmetic on two mem values.
+func arithOp(a, b *vdbe.Mem, intFn func(int64, int64) int64, floatFn func(float64, float64) float64) *vdbe.Mem {
+	if a == nil || b == nil {
+		return vdbe.NewMemNull()
+	}
+	if a.Type == vdbe.MemNull || b.Type == vdbe.MemNull {
+		return vdbe.NewMemNull()
+	}
+	if a.Type == vdbe.MemInt && b.Type == vdbe.MemInt && intFn != nil {
+		return vdbe.NewMemInt(intFn(a.IntVal, b.IntVal))
+	}
+	if floatFn != nil {
+		return vdbe.NewMemFloat(floatFn(a.FloatValue(), b.FloatValue()))
+	}
+	return vdbe.NewMemNull()
 }
 
 // querySqliteMaster handles SELECT queries against sqlite_master / sqlite_schema.
@@ -2871,16 +4134,6 @@ func isTruthy(m *vdbe.Mem) bool {
 	return false
 }
 
-func memStr(m *vdbe.Mem) string {
-	if isNull(m) {
-		return ""
-	}
-	if m.Type == vdbe.MemStr {
-		return string(m.Bytes)
-	}
-	return m.StringValue()
-}
-
 func toFloat(m *vdbe.Mem) float64 {
 	if isNull(m) {
 		return 0
@@ -2921,28 +4174,6 @@ func memEqual(a, b *vdbe.Mem) bool {
 		return memStr(a) == memStr(b)
 	}
 	return memCompare(a, b) == 0
-}
-
-func memCompare(a, b *vdbe.Mem) int {
-	if a.Type == vdbe.MemStr && b.Type == vdbe.MemStr {
-		sa, sb := memStr(a), memStr(b)
-		if sa < sb {
-			return -1
-		}
-		if sa > sb {
-			return 1
-		}
-		return 0
-	}
-	// Numeric comparison
-	fa, fb := toFloat(a), toFloat(b)
-	if fa < fb {
-		return -1
-	}
-	if fa > fb {
-		return 1
-	}
-	return 0
 }
 
 // likeMatch implements SQL LIKE pattern matching (% and _ wildcards).
