@@ -48,7 +48,7 @@ func TestJoin1Basic(t *testing.T) {
 	// join-1.2.1: implicit join with ON (comma syntax)
 	t.Run("1.2.1 - comma join with ON", func(t *testing.T) {
 		t.Skip("comma join with ON not supported")
-		got := queryFlatStrings(t, db, "SELECT t1.rowid, t2.rowid, '|' FROM t1, t2 ON t1.a=t2.b")
+			got := queryFlatStrings(t, db, "SELECT t1.rowid, t2.rowid, '|' FROM t1, t2 ON t1.a=t2.b")
 		want := []string{"1", "1", "|", "2", "2", "|", "3", "3", "|"}
 		assertResults(t, got, want)
 	})
@@ -237,16 +237,16 @@ func TestJoin1Basic(t *testing.T) {
 
 	// join-1.13: NATURAL JOIN with subquery (skip if subquery not supported)
 	t.Run("1.13 - natural join subquery", func(t *testing.T) {
-		t.Skip("subquery in FROM clause")
-		got := queryFlatStrings(t, db, "SELECT * FROM t1 NATURAL JOIN (SELECT b as 'c', c as 'd', d as 'e' FROM t2) as t3")
+		t.Skip("subquery in FROM not supported")
+			got := queryFlatStrings(t, db, "SELECT * FROM t1 NATURAL JOIN (SELECT b as 'c', c as 'd', d as 'e' FROM t2) as t3")
 		want := []string{"1", "2", "3", "4", "5"}
 		assertResults(t, got, want)
 	})
 
 	// join-1.14: NATURAL JOIN with subquery reversed
 	t.Run("1.14 - natural join subquery reversed", func(t *testing.T) {
-		t.Skip("subquery in FROM clause")
-		got := queryFlatStrings(t, db, "SELECT * FROM (SELECT b as 'c', c as 'd', d as 'e' FROM t2) as 'tx' NATURAL JOIN t1")
+		t.Skip("subquery in FROM not supported")
+			got := queryFlatStrings(t, db, "SELECT * FROM (SELECT b as 'c', c as 'd', d as 'e' FROM t2) as 'tx' NATURAL JOIN t1")
 		want := []string{"3", "4", "5", "1", "2"}
 		assertResults(t, got, want)
 	})
@@ -697,7 +697,7 @@ func TestJoin10EmptySubquery(t *testing.T) {
 // ============================================================================
 
 func TestJoin11SelfJoin(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("Self-join with alias not fully working")
 	
 	db := openTestDB(t)
 
@@ -803,7 +803,7 @@ func TestJoin11SelfJoin(t *testing.T) {
 // ============================================================================
 
 func TestJoin12MaxTables(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("Max table limit detection not implemented")
 	
 	db := openTestDB(t)
 
@@ -876,7 +876,6 @@ func TestJoin12MaxTables(t *testing.T) {
 // ============================================================================
 
 func TestJoin13WhereReorder(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
 	
 	db := openTestDB(t)
 
@@ -908,7 +907,7 @@ func TestJoin13WhereReorder(t *testing.T) {
 // ============================================================================
 
 func TestJoin14NestedSubquery(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("Nested subquery in FROM not supported")
 	
 	db := openTestDB(t)
 
@@ -964,7 +963,7 @@ func TestJoin14NestedSubquery(t *testing.T) {
 // ============================================================================
 
 func TestJoin15Case(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("LEFT JOIN with CASE expression not working")
 	
 	db := openTestDB(t)
 
@@ -1014,7 +1013,7 @@ func TestJoin15Case(t *testing.T) {
 // ============================================================================
 
 func TestJoin16OnZero(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("LEFT JOIN ON 0 not working")
 	
 	db := openTestDB(t)
 
@@ -1035,7 +1034,7 @@ func TestJoin16OnZero(t *testing.T) {
 // ============================================================================
 
 func TestJoin17Constants(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("LEFT JOIN with constant expressions not working")
 	
 	db := openTestDB(t)
 
@@ -1074,7 +1073,7 @@ func TestJoin18NullHandling(t *testing.T) {
 // ============================================================================
 
 func TestJoin19NullChecks(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("LEFT JOIN NULL checks not working")
 	
 	db := openTestDB(t)
 
@@ -1146,7 +1145,7 @@ func TestJoin20PartialIndex(t *testing.T) {
 // ============================================================================
 
 func TestJoin21PartialIndexIsNull(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("Partial index with ISNULL not implemented")
 	
 	db := openTestDB(t)
 
@@ -1192,7 +1191,7 @@ func TestJoin21PartialIndexIsNull(t *testing.T) {
 // ============================================================================
 
 func TestJoin22Distinct(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("DISTINCT with LEFT JOIN not working")
 	
 	db := openTestDB(t)
 
@@ -1215,7 +1214,7 @@ func TestJoin22Distinct(t *testing.T) {
 // ============================================================================
 
 func TestJoin24Index(t *testing.T) {
-	t.Skip("LEFT JOIN / advanced JOIN not fully working")
+	t.Skip("LEFT JOIN index edge cases not working")
 	
 	db := openTestDB(t)
 
