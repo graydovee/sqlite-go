@@ -112,6 +112,9 @@ type Build struct {
 	tables    []*tableEntry // ordered list of table entries for current statement
 	tableMap  map[string]*tableEntry
 	constants map[string]int // register holding constant values
+	// GROUP BY: direct sorter column access
+	groupSorterCursor int            // sorter cursor during GROUP BY (0 = not active)
+	groupColOffsets   map[string]int // table name (upper) -> flat column offset in sorter data
 }
 
 // newBuild creates a new compilation context.
@@ -293,6 +296,9 @@ func (b *Build) resolveColumnRef(table, col string) (cursor int, colIdx int, err
 	// No table qualifier: search all tables.
 	var found bool
 	for _, entry := range b.tables {
+		if entry.table == nil {
+			continue
+		}
 		for i, c := range entry.table.Columns {
 			if strings.ToUpper(c.Name) == colUpper {
 				if found {
@@ -308,6 +314,35 @@ func (b *Build) resolveColumnRef(table, col string) (cursor int, colIdx int, err
 		return 0, 0, fmt.Errorf("no such column: %s", col)
 	}
 	return cursor, colIdx, nil
+}
+
+// resolveColumnEntry returns the table entry for a column reference.
+func (b *Build) resolveColumnEntry(table, col string) *tableEntry {
+	colUpper := strings.ToUpper(col)
+
+	if table != "" {
+		entry, ok := b.tableMap[strings.ToUpper(table)]
+		if ok {
+			for _, c := range entry.table.Columns {
+				if strings.ToUpper(c.Name) == colUpper {
+					return entry
+				}
+			}
+		}
+		return nil
+	}
+
+	for _, entry := range b.tables {
+		if entry.table == nil {
+			continue
+		}
+		for _, c := range entry.table.Columns {
+			if strings.ToUpper(c.Name) == colUpper {
+				return entry
+			}
+		}
+	}
+	return nil
 }
 
 // emitHalt emits an OP_Halt instruction.
@@ -456,8 +491,10 @@ func (b *Build) emitSorterOpen(cursor, nCol int) {
 }
 
 // emitSorterInsert inserts a record into the sorter.
+// The record is stored as both the sort key and the data payload.
 func (b *Build) emitSorterInsert(cursor, recordReg int) {
-	b.b.Emit(vdbe.OpSorterInsert, cursor, recordReg, 0)
+	// Store the same record as both key (for sorting) and data (for retrieval)
+	b.b.Emit(vdbe.OpSorterInsert, cursor, recordReg, recordReg)
 }
 
 // emitSorterSort sorts the sorter. Returns body label.

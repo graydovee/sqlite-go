@@ -153,24 +153,27 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 	}
 	nResult := len(resultCols)
 
-	// Allocate registers for aggregate accumulators
+	hasGroupBy := len(stmt.GroupBy) > 0
+
+	if hasGroupBy {
+		return b.compileGroupBySelect(stmt, resultCols, nResult)
+	}
+
+	// No GROUP BY: aggregate over entire result set
+	return b.compileAggregateNoGroup(stmt, resultCols, nResult)
+}
+
+// compileAggregateNoGroup compiles an aggregate SELECT without GROUP BY.
+// It scans all rows, accumulating aggregate state, then outputs a single result row.
+func (b *Build) compileAggregateNoGroup(stmt *SelectStmt, resultCols []*resultColumn, nResult int) error {
+	// Allocate registers for aggregate accumulators (one per result column)
 	aggBase := b.b.AllocReg(nResult)
 
-	// Initialize accumulators to NULL (or 0 for COUNT)
+	// Initialize accumulators to NULL
 	for i := 0; i < nResult; i++ {
 		b.emitNull(aggBase + i)
 	}
 
-	// Sorter for GROUP BY
-	var groupSorter int
-	hasGroupBy := len(stmt.GroupBy) > 0
-	if hasGroupBy {
-		groupSorter = b.b.AllocCursor()
-		nGroupCols := len(stmt.GroupBy)
-		b.emitSorterOpen(groupSorter, nGroupCols)
-	}
-
-	// Main loop
 	emptyLabel := b.b.NewLabel()
 	loopEndLabel := b.b.NewLabel()
 
@@ -190,25 +193,11 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 		b.b.DefineLabel(skipLabel)
 	}
 
-	// If GROUP BY, insert groups into sorter
-	if hasGroupBy {
-		groupKeyBase := b.b.AllocReg(len(stmt.GroupBy))
-		for i, gExpr := range stmt.GroupBy {
-			if err := b.compileExpr(gExpr, groupKeyBase+i); err != nil {
+	// Accumulate aggregates for each result column
+	for i, rc := range resultCols {
+		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
 				return err
-			}
-		}
-		// Make record from group key
-		recReg := b.b.AllocReg(1)
-		b.emitMakeRecord(groupKeyBase, len(stmt.GroupBy), recReg)
-		b.emitSorterInsert(groupSorter, recReg)
-	} else {
-		// No GROUP BY: aggregate over entire result set
-		for i, rc := range resultCols {
-			if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
-				if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
-					return err
-				}
 			}
 		}
 	}
@@ -217,53 +206,467 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 	b.b.DefineLabel(loopEndLabel)
 	b.b.DefineLabel(emptyLabel)
 
-	// Finalize aggregates
-	if hasGroupBy {
-		// Sort groups, then iterate through groups
-		sortEmpty := b.b.NewLabel()
-		sortBody := b.emitSorterSort(groupSorter, sortEmpty)
-
-		// For each group, compute aggregates
-		groupLoopEnd := b.b.NewLabel()
-		for {
-			// Aggregate step for each result column
-			for i, rc := range resultCols {
-				if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
-					if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
-						return err
-					}
-				}
+	// Finalize aggregates and output single row
+	for i, rc := range resultCols {
+		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+			b.emitAggFinalForCol(rc.Expr, aggBase+i)
+		} else if rc.Expr != nil {
+			// Non-aggregate column without GROUP BY: evaluate once
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				return err
 			}
-
-			// Check HAVING
-			if stmt.Having != nil {
-				havingFail := b.b.NewLabel()
-				if err := b.compileCondition(stmt.Having, havingFail, groupLoopEnd, true); err != nil {
-					return err
-				}
-				b.b.DefineLabel(havingFail)
-			}
-
-			// Finalize and output
-			for i := 0; i < nResult; i++ {
-				b.b.Emit(vdbe.OpAggFinal, aggBase+i, 0, 0)
-			}
-			b.emitResultRow(aggBase, nResult)
-			break
 		}
+	}
+	b.emitResultRow(aggBase, nResult)
 
-		b.emitSorterNext(groupSorter, sortBody)
-		b.b.DefineLabel(groupLoopEnd)
-		b.b.DefineLabel(sortEmpty)
+	b.emitHalt(0)
+	return nil
+}
+
+// compileGroupBySelect compiles a SELECT with GROUP BY.
+//
+// Strategy:
+//  1. Scan all source rows, insert (group_key, row_data) into a sorter
+//  2. Sort by group key
+//  3. Iterate sorted rows, detect group boundaries via SorterCompare
+//  4. For each group: accumulate aggregates, finalize, apply HAVING, output
+func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColumn, nResult int) error {
+	nGroupCols := len(stmt.GroupBy)
+
+	// Count source columns across all tables
+	nSourceCols := 0
+	for _, entry := range b.tables {
+		if entry.table != nil {
+			nSourceCols += len(entry.table.Columns)
+		}
+	}
+
+	// Sorter for storing (group_key, row_data)
+	groupSorter := b.b.AllocCursor()
+	b.emitSorterOpen(groupSorter, nGroupCols)
+
+	// === Phase 1: Scan source rows and insert into sorter ===
+	emptyLabel := b.b.NewLabel()
+	loopEndLabel := b.b.NewLabel()
+
+	if len(b.tables) > 0 {
+		b.b.EmitJump(vdbe.OpRewind, b.tables[0].cursor, emptyLabel, 0)
+	}
+
+	loopBody := b.b.NewLabel()
+	b.b.DefineLabel(loopBody)
+
+	// Evaluate WHERE
+	if stmt.Where != nil {
+		skipLabel := b.b.NewLabel()
+		if err := b.compileCondition(stmt.Where, skipLabel, loopEndLabel, true); err != nil {
+			return err
+		}
+		b.b.DefineLabel(skipLabel)
+	}
+
+	// Evaluate GROUP BY key columns
+	groupKeyBase := b.b.AllocReg(nGroupCols)
+	for i, gExpr := range stmt.GroupBy {
+		if err := b.compileExpr(gExpr, groupKeyBase+i); err != nil {
+			return err
+		}
+	}
+
+	// Build the sort key from group columns
+	keyRecReg := b.b.AllocReg(1)
+	b.emitMakeRecord(groupKeyBase, nGroupCols, keyRecReg)
+
+	// Build the data record from all source table columns
+	if nSourceCols > 0 {
+		dataBase := b.b.AllocReg(nSourceCols)
+		idx := 0
+		for _, entry := range b.tables {
+			if entry.table != nil {
+				for colIdx := range entry.table.Columns {
+					b.emitColumn(entry.cursor, colIdx, dataBase+idx)
+					idx++
+				}
+			}
+		}
+		dataRecReg := b.b.AllocReg(1)
+		b.emitMakeRecord(dataBase, nSourceCols, dataRecReg)
+		// Insert with key = group key record, data = full row record
+		b.b.Emit(vdbe.OpSorterInsert, groupSorter, keyRecReg, dataRecReg)
 	} else {
-		// No GROUP BY: finalize aggregates and output single row
-		for i := 0; i < nResult; i++ {
-			b.b.Emit(vdbe.OpAggFinal, aggBase+i, 0, 0)
+		b.emitSorterInsert(groupSorter, keyRecReg)
+	}
+
+	b.emitNext(b.tables[0].cursor, loopBody)
+	b.b.DefineLabel(loopEndLabel)
+	b.b.DefineLabel(emptyLabel)
+
+	// === Phase 2: Sort by group key and iterate groups ===
+	sortEmptyLabel := b.b.NewLabel()
+	_ = b.emitSorterSort(groupSorter, sortEmptyLabel)
+
+	// We need an output sorter if there's ORDER BY
+	var outSorter int
+	needOutSorter := len(stmt.OrderBy) > 0
+	if needOutSorter {
+		outSorter = b.b.AllocCursor()
+		b.emitSorterOpen(outSorter, nResult)
+	}
+
+	// Set up GROUP BY mode: compileColumnRef will read directly from the sorter cursor
+	b.groupSorterCursor = groupSorter
+	b.groupColOffsets = make(map[string]int)
+	off := 0
+	for _, entry := range b.tables {
+		if entry.table != nil {
+			key := entry.name
+			if entry.alias != "" {
+				key = entry.alias
+			}
+			b.groupColOffsets[strings.ToUpper(key)] = off
+			off += len(entry.table.Columns)
 		}
-		b.emitResultRow(aggBase, nResult)
+	}
+
+	// Registers for aggregate accumulators and group key
+	aggBase := b.b.AllocReg(nResult)
+
+	// Initialize accumulators to NULL
+	for i := 0; i < nResult; i++ {
+		b.emitNull(aggBase + i)
+	}
+
+	// Register for saved group key values (for comparison)
+	savedKeyBase := b.b.AllocReg(nGroupCols)
+	for i := 0; i < nGroupCols; i++ {
+		b.emitNull(savedKeyBase + i)
+	}
+
+	rowLabel := b.b.NewLabel()
+	b.b.DefineLabel(rowLabel)
+
+	// Re-initialize accumulators for a new group
+	for i := 0; i < nResult; i++ {
+		b.emitNull(aggBase + i)
+	}
+
+	// Inner loop: accumulate rows within a group
+	accLoop := b.b.NewLabel()
+	b.b.DefineLabel(accLoop)
+
+	// Run aggregate steps for each result column containing aggregates
+	for i, rc := range resultCols {
+		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Also evaluate non-aggregate columns (like `log` in `SELECT log, count(*)`)
+	for i, rc := range resultCols {
+		if rc.Expr != nil && !b.exprHasAggregate(rc.Expr) {
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Compute current group key from source columns
+	curKeyBase := b.b.AllocReg(nGroupCols)
+	for i, gExpr := range stmt.GroupBy {
+		if err := b.compileExpr(gExpr, curKeyBase+i); err != nil {
+			return err
+		}
+	}
+
+	// Copy current key to saved key for comparison
+	for i := 0; i < nGroupCols; i++ {
+		b.emitSCopy(curKeyBase+i, savedKeyBase+i)
+	}
+
+	// Advance to next row
+	groupEnd := b.b.NewLabel()
+	b.emitSorterNext(groupSorter, groupEnd)
+
+	// If we get here, there IS a next row. Compute its group key.
+	nextKeyBase := b.b.AllocReg(nGroupCols)
+	for i, gExpr := range stmt.GroupBy {
+		if err := b.compileExpr(gExpr, nextKeyBase+i); err != nil {
+			return err
+		}
+	}
+
+	// Compare saved key with next row's key
+	keyChangedLabel := b.b.NewLabel()
+	compareBase := b.b.AllocReg(2)
+	for i := 0; i < nGroupCols; i++ {
+		b.emitSCopy(savedKeyBase+i, compareBase)
+		b.emitSCopy(nextKeyBase+i, compareBase+1)
+		b.b.EmitJump(vdbe.OpNe, compareBase, keyChangedLabel, compareBase+1)
+	}
+
+	// All columns matched: same group, continue accumulating
+	b.b.EmitJump(vdbe.OpGoto, 0, accLoop, 0)
+
+	b.b.DefineLabel(keyChangedLabel)
+
+	// Key changed: finalize current group, output, then start new group
+	b.emitGroupOutput(stmt, resultCols, nResult, aggBase, outSorter, needOutSorter)
+	b.b.EmitJump(vdbe.OpGoto, 0, rowLabel, 0)
+
+	b.b.DefineLabel(groupEnd)
+
+	// Finalize last group
+	b.emitGroupOutput(stmt, resultCols, nResult, aggBase, outSorter, needOutSorter)
+
+	b.b.DefineLabel(sortEmptyLabel)
+
+	// Clear GROUP BY mode
+	b.groupSorterCursor = 0
+	b.groupColOffsets = nil
+
+	// If ORDER BY, output from outSorter
+	if needOutSorter {
+		b.emitClose(groupSorter)
+		b.emitSortedOutput(outSorter, nResult)
 	}
 
 	b.emitHalt(0)
+	return nil
+}
+
+// emitGroupOutput finalizes aggregates and emits a result row for the current group.
+func (b *Build) emitGroupOutput(stmt *SelectStmt, resultCols []*resultColumn, nResult int, aggBase int, outSorter int, needOutSorter bool) {
+	// Finalize all aggregates
+	for i, rc := range resultCols {
+		b.emitAggFinalForCol(rc.Expr, aggBase+i)
+	}
+
+	// Check HAVING
+	if stmt.Having != nil {
+		havingSkip := b.b.NewLabel()
+		if err := b.compileCondition(stmt.Having, havingSkip, havingSkip, true); err != nil {
+			_ = err
+		}
+		if needOutSorter {
+			recReg := b.b.AllocReg(1)
+			b.emitMakeRecord(aggBase, nResult, recReg)
+			b.emitSorterInsert(outSorter, recReg)
+		} else {
+			b.emitResultRow(aggBase, nResult)
+		}
+		b.b.DefineLabel(havingSkip)
+	} else {
+		if needOutSorter {
+			recReg := b.b.AllocReg(1)
+			b.emitMakeRecord(aggBase, nResult, recReg)
+			b.emitSorterInsert(outSorter, recReg)
+		} else {
+			b.emitResultRow(aggBase, nResult)
+		}
+	}
+}
+
+// emitAggFinal emits an OpAggFinal for the given register with the correct AggFuncInfo.
+func (b *Build) emitAggFinalForCol(expr *Expr, reg int) {
+	if expr == nil || !b.exprHasAggregate(expr) {
+		return
+	}
+	afi := b.makeAggFuncInfo(expr)
+	b.b.EmitP4(vdbe.OpAggFinal, reg, reg, 0, afi, "AGG FINAL")
+}
+
+// makeAggFuncInfo creates an AggFuncInfo for the given aggregate expression.
+func (b *Build) makeAggFuncInfo(expr *Expr) *vdbe.AggFuncInfo {
+	if expr == nil {
+		return nil
+	}
+	// For compound expressions containing aggregates, find the innermost aggregate
+	if expr.Kind == ExprBinaryOp || expr.Kind == ExprUnaryOp {
+		if expr.Left != nil && b.exprHasAggregate(expr.Left) {
+			return b.makeAggFuncInfo(expr.Left)
+		}
+		if expr.Right != nil && b.exprHasAggregate(expr.Right) {
+			return b.makeAggFuncInfo(expr.Right)
+		}
+	}
+	if expr.Kind != ExprFunctionCall || !isAggregate(expr.FunctionName) {
+		return nil
+	}
+
+	fnName := strings.ToUpper(expr.FunctionName)
+	switch fnName {
+	case "COUNT":
+		if expr.StarArg {
+			return &vdbe.AggFuncInfo{
+				Name: "COUNT",
+				Step: func(state interface{}, args []*vdbe.Mem) {
+					s := aggStateCount(state)
+					s.count++
+				},
+				Finalize: func(state interface{}) *vdbe.Mem {
+					s, ok := state.(*interface{})
+					if !ok || *s == nil {
+						return vdbe.NewMemInt(0)
+					}
+					cs := (*s).(*countState)
+					return vdbe.NewMemInt(cs.count)
+				},
+			}
+		}
+		return &vdbe.AggFuncInfo{
+			Name: "COUNT",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				s := aggStateCount(state)
+				if len(args) > 0 && args[0].Type != vdbe.MemNull {
+					s.count++
+				}
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				s, ok := state.(*interface{})
+				if !ok || *s == nil {
+					return vdbe.NewMemInt(0)
+				}
+				cs := (*s).(*countState)
+				return vdbe.NewMemInt(cs.count)
+			},
+		}
+	case "SUM":
+		return &vdbe.AggFuncInfo{
+			Name: "SUM",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				s := aggStateSum(state)
+				if len(args) == 0 || args[0].Type == vdbe.MemNull {
+					return
+				}
+				s.hasValue = true
+				arg := args[0]
+				if s.useFloat {
+					s.sum += arg.FloatValue()
+					return
+				}
+				if arg.Type == vdbe.MemInt {
+					newSum := s.intSum + arg.IntVal
+					if (newSum > 0) != (s.intSum > 0 || arg.IntVal > 0) &&
+						s.intSum != 0 && arg.IntVal != 0 {
+						s.sum = float64(s.intSum) + float64(arg.IntVal)
+						s.useFloat = true
+					} else {
+						s.intSum = newSum
+					}
+				} else {
+					s.sum = float64(s.intSum) + arg.FloatValue()
+					s.useFloat = true
+				}
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				sp := state.(*interface{})
+				if *sp == nil {
+					return vdbe.NewMemNull()
+				}
+				s := (*sp).(*sumState)
+				if !s.hasValue {
+					return vdbe.NewMemNull()
+				}
+				if s.useFloat {
+					return vdbe.NewMemFloat(s.sum)
+				}
+				return vdbe.NewMemInt(s.intSum)
+			},
+		}
+	case "AVG":
+		return &vdbe.AggFuncInfo{
+			Name: "AVG",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				s := aggStateAvg(state)
+				if len(args) == 0 || args[0].Type == vdbe.MemNull {
+					return
+				}
+				s.sum += args[0].FloatValue()
+				s.count++
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				sp := state.(*interface{})
+				if *sp == nil {
+					return vdbe.NewMemNull()
+				}
+				s := (*sp).(*avgState)
+				if s.count == 0 {
+					return vdbe.NewMemNull()
+				}
+				return vdbe.NewMemFloat(s.sum / float64(s.count))
+			},
+		}
+	case "MIN":
+		return &vdbe.AggFuncInfo{
+			Name: "MIN",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				if len(args) == 0 || args[0].Type == vdbe.MemNull {
+					return
+				}
+				sp := state.(*interface{})
+				s, ok := (*sp).(*minMaxState)
+				if !ok || *sp == nil {
+					*sp = &minMaxState{value: args[0].Copy()}
+					return
+				}
+				if s.value == nil || s.value.Type == vdbe.MemNull {
+					s.value = args[0].Copy()
+					return
+				}
+				cmp := vdbe.MemCompare(s.value, args[0])
+				if cmp > 0 {
+					s.value = args[0].Copy()
+				}
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				sp := state.(*interface{})
+				if *sp == nil {
+					return vdbe.NewMemNull()
+				}
+				s := (*sp).(*minMaxState)
+				if s.value == nil {
+					return vdbe.NewMemNull()
+				}
+				return s.value.Copy()
+			},
+		}
+	case "MAX":
+		return &vdbe.AggFuncInfo{
+			Name: "MAX",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				if len(args) == 0 || args[0].Type == vdbe.MemNull {
+					return
+				}
+				sp := state.(*interface{})
+				s, ok := (*sp).(*minMaxState)
+				if !ok || *sp == nil {
+					*sp = &minMaxState{value: args[0].Copy()}
+					return
+				}
+				if s.value == nil || s.value.Type == vdbe.MemNull {
+					s.value = args[0].Copy()
+					return
+				}
+				cmp := vdbe.MemCompare(s.value, args[0])
+				if cmp < 0 {
+					s.value = args[0].Copy()
+				}
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				sp := state.(*interface{})
+				if *sp == nil {
+					return vdbe.NewMemNull()
+				}
+				s := (*sp).(*minMaxState)
+				if s.value == nil {
+					return vdbe.NewMemNull()
+				}
+				return s.value.Copy()
+			},
+		}
+	}
 	return nil
 }
 

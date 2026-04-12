@@ -113,10 +113,25 @@ func (b *Build) compileVariable(expr *Expr, targetReg int) error {
 
 // compileColumnRef compiles a column reference to OP_Column.
 func (b *Build) compileColumnRef(expr *Expr, targetReg int) error {
-	cursor, colIdx, err := b.resolveColumnRef(expr.Table, expr.Name)
+	_, colIdx, err := b.resolveColumnRef(expr.Table, expr.Name)
 	if err != nil {
 		return err
 	}
+	// GROUP BY mode: read directly from the sorter cursor with adjusted column offset
+	if b.groupSorterCursor != 0 {
+		entry := b.resolveColumnEntry(expr.Table, expr.Name)
+		if entry != nil {
+			key := entry.name
+			if entry.alias != "" {
+				key = entry.alias
+			}
+			if off, ok := b.groupColOffsets[strings.ToUpper(key)]; ok {
+				b.emitColumn(b.groupSorterCursor, off+colIdx, targetReg)
+				return nil
+			}
+		}
+	}
+	cursor, _, _ := b.resolveColumnRef(expr.Table, expr.Name)
 	b.emitColumn(cursor, colIdx, targetReg)
 	return nil
 }
@@ -481,10 +496,26 @@ func (b *Build) compileAggregate(expr *Expr, targetReg int) error {
 }
 
 // compileCount handles COUNT(*) and COUNT(expr).
+// Emits OpAggStep with AggFuncInfo carrying the step/finalize callbacks.
 func (b *Build) compileCount(expr *Expr, targetReg int) error {
 	if expr.StarArg {
-		// COUNT(*): increment counter for every row
-		b.b.Emit(vdbe.OpAggStep, 0, targetReg, 1)
+		// COUNT(*): no arguments, just increment for every row
+		fi := &vdbe.AggFuncInfo{
+			Name: "COUNT",
+			Step: func(state interface{}, args []*vdbe.Mem) {
+				s := aggStateCount(state)
+				s.count++
+			},
+			Finalize: func(state interface{}) *vdbe.Mem {
+				s, ok := state.(*interface{})
+				if !ok || *s == nil {
+					return vdbe.NewMemInt(0)
+				}
+				cs := (*s).(*countState)
+				return vdbe.NewMemInt(cs.count)
+			},
+		}
+		b.b.EmitP4(vdbe.OpAggStep, targetReg, 0, 0, fi, "COUNT(*) STEP")
 		return nil
 	}
 	if len(expr.Args) != 1 {
@@ -494,10 +525,47 @@ func (b *Build) compileCount(expr *Expr, targetReg int) error {
 	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
 		return err
 	}
-	// Step: increment count if not null
-	fi := &FuncInfo{Name: "COUNT", ArgCount: 1}
-	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, 1, fi, "COUNT STEP")
+	fi := &vdbe.AggFuncInfo{
+		Name: "COUNT",
+		Step: func(state interface{}, args []*vdbe.Mem) {
+			s := aggStateCount(state)
+			if len(args) > 0 && args[0].Type != vdbe.MemNull {
+				s.count++
+			}
+		},
+		Finalize: func(state interface{}) *vdbe.Mem {
+			s, ok := state.(*interface{})
+			if !ok || *s == nil {
+				return vdbe.NewMemInt(0)
+			}
+			cs := (*s).(*countState)
+			return vdbe.NewMemInt(cs.count)
+		},
+	}
+	b.b.EmitP4(vdbe.OpAggStep, targetReg, 1, argReg, fi, "COUNT STEP")
 	return nil
+}
+
+// countState holds accumulator state for COUNT
+type countState struct {
+	count int64
+}
+
+// aggStateCount initializes or retrieves count state
+func aggStateCount(state interface{}) *countState {
+	sp := state.(*interface{})
+	if *sp == nil {
+		*sp = &countState{}
+	}
+	return (*sp).(*countState)
+}
+
+// sumState holds accumulator state for SUM
+type sumState struct {
+	sum      float64
+	useFloat bool
+	intSum   int64
+	hasValue bool
 }
 
 // compileSum handles SUM(expr).
@@ -509,9 +577,112 @@ func (b *Build) compileSum(expr *Expr, targetReg int) error {
 	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
 		return err
 	}
-	fi := &FuncInfo{Name: "SUM", ArgCount: 1}
-	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, 1, fi, "SUM STEP")
+	fi := &vdbe.AggFuncInfo{
+		Name: "SUM",
+		Step: func(state interface{}, args []*vdbe.Mem) {
+			s := aggStateSum(state)
+			if len(args) == 0 || args[0].Type == vdbe.MemNull {
+				return
+			}
+			s.hasValue = true
+			arg := args[0]
+			if s.useFloat {
+				s.sum += arg.FloatValue()
+				return
+			}
+			if arg.Type == vdbe.MemInt {
+				newSum := s.intSum + arg.IntVal
+				if (newSum > 0) != (s.intSum > 0 || arg.IntVal > 0) &&
+					s.intSum != 0 && arg.IntVal != 0 {
+					s.sum = float64(s.intSum) + float64(arg.IntVal)
+					s.useFloat = true
+				} else {
+					s.intSum = newSum
+				}
+			} else {
+				s.sum = float64(s.intSum) + arg.FloatValue()
+				s.useFloat = true
+			}
+		},
+		Finalize: func(state interface{}) *vdbe.Mem {
+			sp := state.(*interface{})
+			if *sp == nil {
+				return vdbe.NewMemNull()
+			}
+			s := (*sp).(*sumState)
+			if !s.hasValue {
+				return vdbe.NewMemNull()
+			}
+			if s.useFloat {
+				return vdbe.NewMemFloat(s.sum)
+			}
+			return vdbe.NewMemInt(s.intSum)
+		},
+	}
+	b.b.EmitP4(vdbe.OpAggStep, targetReg, 1, argReg, fi, "SUM STEP")
 	return nil
+}
+
+func aggStateSum(state interface{}) *sumState {
+	sp := state.(*interface{})
+	if *sp == nil {
+		*sp = &sumState{}
+	}
+	return (*sp).(*sumState)
+}
+
+// avgState holds accumulator state for AVG
+type avgState struct {
+	sum   float64
+	count int64
+}
+
+// compileAvg handles AVG(expr).
+func (b *Build) compileAvg(expr *Expr, targetReg int) error {
+	if len(expr.Args) != 1 {
+		return fmt.Errorf("AVG requires exactly 1 argument")
+	}
+	argReg := b.b.AllocReg(1)
+	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
+		return err
+	}
+	fi := &vdbe.AggFuncInfo{
+		Name: "AVG",
+		Step: func(state interface{}, args []*vdbe.Mem) {
+			s := aggStateAvg(state)
+			if len(args) == 0 || args[0].Type == vdbe.MemNull {
+				return
+			}
+			s.sum += args[0].FloatValue()
+			s.count++
+		},
+		Finalize: func(state interface{}) *vdbe.Mem {
+			sp := state.(*interface{})
+			if *sp == nil {
+				return vdbe.NewMemNull()
+			}
+			s := (*sp).(*avgState)
+			if s.count == 0 {
+				return vdbe.NewMemNull()
+			}
+			return vdbe.NewMemFloat(s.sum / float64(s.count))
+		},
+	}
+	b.b.EmitP4(vdbe.OpAggStep, targetReg, 1, argReg, fi, "AVG STEP")
+	return nil
+}
+
+func aggStateAvg(state interface{}) *avgState {
+	sp := state.(*interface{})
+	if *sp == nil {
+		*sp = &avgState{}
+	}
+	return (*sp).(*avgState)
+}
+
+// minMaxState holds accumulator state for MIN/MAX
+type minMaxState struct {
+	value *vdbe.Mem
 }
 
 // compileMinMax handles MIN/MAX.
@@ -524,25 +695,46 @@ func (b *Build) compileMinMax(expr *Expr, targetReg int, isMin bool) error {
 		return err
 	}
 	name := "MIN"
-	if !isMin {
+	isMax := !isMin
+	if isMax {
 		name = "MAX"
 	}
-	fi := &FuncInfo{Name: name, ArgCount: 1}
-	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, 1, fi, name+" STEP")
-	return nil
-}
-
-// compileAvg handles AVG(expr).
-func (b *Build) compileAvg(expr *Expr, targetReg int) error {
-	if len(expr.Args) != 1 {
-		return fmt.Errorf("AVG requires exactly 1 argument")
+	fi := &vdbe.AggFuncInfo{
+		Name: name,
+		Step: func(state interface{}, args []*vdbe.Mem) {
+			if len(args) == 0 || args[0].Type == vdbe.MemNull {
+				return
+			}
+			sp := state.(*interface{})
+			s, ok := (*sp).(*minMaxState)
+			if !ok || *sp == nil {
+				*sp = &minMaxState{value: args[0].Copy()}
+				return
+			}
+			if s.value == nil || s.value.Type == vdbe.MemNull {
+				s.value = args[0].Copy()
+				return
+			}
+			cmp := vdbe.MemCompare(s.value, args[0])
+			if isMax && cmp < 0 {
+				s.value = args[0].Copy()
+			} else if !isMax && cmp > 0 {
+				s.value = args[0].Copy()
+			}
+		},
+		Finalize: func(state interface{}) *vdbe.Mem {
+			sp := state.(*interface{})
+			if *sp == nil {
+				return vdbe.NewMemNull()
+			}
+			s := (*sp).(*minMaxState)
+			if s.value == nil {
+				return vdbe.NewMemNull()
+			}
+			return s.value.Copy()
+		},
 	}
-	argReg := b.b.AllocReg(1)
-	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
-		return err
-	}
-	fi := &FuncInfo{Name: "AVG", ArgCount: 1}
-	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, 1, fi, "AVG STEP")
+	b.b.EmitP4(vdbe.OpAggStep, targetReg, 1, argReg, fi, name+" STEP")
 	return nil
 }
 
@@ -562,8 +754,9 @@ func (b *Build) compileGroupConcat(expr *Expr, targetReg int) error {
 			return err
 		}
 	}
-	fi := &FuncInfo{Name: "GROUP_CONCAT", ArgCount: len(expr.Args)}
-	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, 1, fi, "GROUP_CONCAT STEP")
+	nArgs := len(expr.Args)
+	fi := &FuncInfo{Name: "GROUP_CONCAT", ArgCount: nArgs}
+	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, nArgs, fi, "GROUP_CONCAT STEP")
 	return nil
 }
 

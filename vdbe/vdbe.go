@@ -1994,6 +1994,23 @@ func (v *VDBE) execColumn(pOp *Instruction) {
 		return
 	}
 
+	// Special handling for sorter cursors
+	if sorter, ok := vc.Cursor.(*Sorter); ok {
+		data := sorter.Data()
+		if data == nil {
+			v.regs[destIdx].SetNull()
+			return
+		}
+		values, err := ParseRecord(data)
+		if err != nil || colIdx >= len(values) {
+			v.regs[destIdx].SetNull()
+			return
+		}
+		result := MemFromValue(values[colIdx])
+		v.regs[destIdx] = *result
+		return
+	}
+
 	cursor, ok := vc.Cursor.(Cursor)
 	if !ok || !cursor.IsValid() {
 		v.regs[destIdx].SetNull()

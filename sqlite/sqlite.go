@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/sqlite-go/sqlite-go/btree"
 	"github.com/sqlite-go/sqlite-go/compile"
@@ -1933,6 +1935,26 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		whereExpr = db.resolveSubqueries(strings.Join(whereParts, " "), args)
 	}
 
+	// Parse ORDER BY clause
+	var orderByCol string
+	var orderDesc bool
+	if pos < len(filtered) && isKeyword(filtered[pos], "order") {
+		pos++
+		if pos < len(filtered) && isKeyword(filtered[pos], "by") {
+			pos++
+		}
+		if pos < len(filtered) {
+			orderByCol = strings.ToLower(filtered[pos].Value)
+			pos++
+			if pos < len(filtered) && isKeyword(filtered[pos], "desc") {
+				orderDesc = true
+				pos++
+			} else if pos < len(filtered) && isKeyword(filtered[pos], "asc") {
+				pos++
+			}
+		}
+	}
+
 	// Determine output columns
 	var resultCols []ResultColumnInfo
 	for _, c := range cols {
@@ -2036,6 +2058,41 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+
+	// Apply ORDER BY sorting on raw data
+	if orderByCol != "" {
+		orderIdx := -1
+		for i, name := range colNames {
+			if strings.ToLower(name) == orderByCol {
+				orderIdx = i
+				break
+			}
+		}
+		if orderIdx >= 0 {
+			sort.SliceStable(rawData, func(i, j int) bool {
+				vi := rawData[i].values[orderIdx]
+				vj := rawData[j].values[orderIdx]
+				// NULL sorts first (smallest) in ASC order
+				if vi.Type == "null" && vj.Type == "null" {
+					return false
+				}
+				if vi.Type == "null" {
+					return !orderDesc
+				}
+				if vj.Type == "null" {
+					return orderDesc
+				}
+				// Non-null comparison
+				mi := vdbe.MemFromValue(vi)
+				mj := vdbe.MemFromValue(vj)
+				cmp := memCompare(mi, mj)
+				if orderDesc {
+					return cmp > 0
+				}
+				return cmp < 0
+			})
 		}
 	}
 
@@ -3906,7 +3963,10 @@ func (db *Database) selectWithoutTable(cols []selectCol, args []interface{}) (*R
 		})
 
 		// Evaluate simple expressions
-		val := evalSimpleExpr(c.expr, args)
+		val, evalErr := evalSimpleExpr(c.expr, args)
+		if evalErr != nil {
+			return nil, NewErrorf(Error, "%s", evalErr)
+		}
 		row.values = append(row.values, val)
 	}
 
@@ -3916,13 +3976,16 @@ func (db *Database) selectWithoutTable(cols []selectCol, args []interface{}) (*R
 }
 
 // evalSimpleExpr evaluates a SQL expression string and returns a Mem value.
-func evalSimpleExpr(expr string, args []interface{}) *vdbe.Mem {
+func evalSimpleExpr(expr string, args []interface{}) (*vdbe.Mem, error) {
 	p := &exprParser{src: strings.TrimSpace(expr), args: args}
 	val := p.parseExpr()
-	if val != nil {
-		return val
+	if p.err != nil {
+		return nil, p.err
 	}
-	return vdbe.NewMemStr(strings.TrimSpace(expr))
+	if val != nil {
+		return val, nil
+	}
+	return vdbe.NewMemStr(strings.TrimSpace(expr)), nil
 }
 
 // evalExprWithRow evaluates a SQL expression in the context of a table row.
@@ -3942,6 +4005,7 @@ type exprParser struct {
 	args      []interface{}
 	colNames  []string
 	colValues []vdbe.Value
+	err       error // set if a parse/eval error occurs
 }
 
 func (p *exprParser) peek() byte {
@@ -4090,13 +4154,26 @@ func (p *exprParser) parseNot() *vdbe.Mem {
 	return p.parseComparison()
 }
 
-// parseComparison handles =, !=, <, >, <=, >=, IS NULL, IN, BETWEEN, LIKE.
+// parseComparison handles =, !=, <, >, <=, >=, IS, IS NOT, IS NULL,
+// ISNULL, NOTNULL, IN, BETWEEN, LIKE, GLOB.
 func (p *exprParser) parseComparison() *vdbe.Mem {
 	left := p.parseConcat()
 	for {
 		p.skipSpaces()
 
-		// IS [NOT] NULL
+		// Postfix ISNULL / NOTNULL
+		if p.peekKeyword("isnull") {
+			p.matchKeyword("isnull")
+			left = boolToInt(isNull(left))
+			continue
+		}
+		if p.peekKeyword("notnull") {
+			p.matchKeyword("notnull")
+			left = boolToInt(!isNull(left))
+			continue
+		}
+
+		// IS [NOT] NULL  or  IS [NOT] expr
 		if p.peekKeyword("is") {
 			p.matchKeyword("is")
 			p.skipSpaces()
@@ -4105,25 +4182,48 @@ func (p *exprParser) parseComparison() *vdbe.Mem {
 				neg = true
 			}
 			if p.matchKeyword("null") {
+				// IS NULL / IS NOT NULL
 				if neg {
 					left = boolToInt(!isNull(left))
 				} else {
 					left = boolToInt(isNull(left))
 				}
+			} else {
+				// IS expr / IS NOT expr — NULL-equal comparison
+				right := p.parseConcat()
+				if isNull(left) && isNull(right) {
+					if neg {
+						left = vdbe.NewMemInt(0)
+					} else {
+						left = vdbe.NewMemInt(1)
+					}
+				} else if isNull(left) || isNull(right) {
+					if neg {
+						left = vdbe.NewMemInt(1)
+					} else {
+						left = vdbe.NewMemInt(0)
+					}
+				} else {
+					eq := memEqual(left, right)
+					if neg {
+						left = boolToInt(!eq)
+					} else {
+						left = boolToInt(eq)
+					}
+				}
 			}
 			continue
 		}
 
-		// Check for NOT prefix (for IN, BETWEEN, LIKE)
+		// Check for NOT prefix (for IN, BETWEEN, LIKE, GLOB)
 		negate := false
 		saved := p.pos
 		if p.peekKeyword("not") {
 			p.matchKeyword("not")
-			if p.peekKeyword("in") || p.peekKeyword("between") || p.peekKeyword("like") {
+			if p.peekKeyword("in") || p.peekKeyword("between") || p.peekKeyword("like") || p.peekKeyword("glob") {
 				negate = true
 			} else {
 				p.pos = saved
-				// NOT followed by something else - fall through to comparison ops
 			}
 		}
 
@@ -4164,29 +4264,99 @@ func (p *exprParser) parseComparison() *vdbe.Mem {
 
 		if negate || p.peekKeyword("between") {
 			// [NOT] BETWEEN low AND high
+			// Implements three-valued logic: x BETWEEN low AND high ≡ x >= low AND x <= high
 			if p.matchKeyword("between") {
 				low := p.parseConcat()
 				p.skipSpaces()
 				p.matchKeyword("and")
 				high := p.parseConcat()
-				result := false
-				if !isNull(left) && !isNull(low) && !isNull(high) {
-					result = memCompare(left, low) >= 0 && memCompare(left, high) <= 0
-				}
-				if negate {
-					left = boolToInt(!result)
+
+				var result *vdbe.Mem
+				if isNull(left) {
+					result = vdbe.NewMemNull()
 				} else {
-					left = boolToInt(result)
+					// Evaluate x >= low
+					var geLow *vdbe.Mem
+					if isNull(low) {
+						geLow = vdbe.NewMemNull()
+					} else {
+						geLow = boolToInt(memCompare(left, low) >= 0)
+					}
+
+					// If x >= low is false (0), AND short-circuits to false
+					if geLow.Type == vdbe.MemInt && geLow.IntVal == 0 {
+						result = vdbe.NewMemInt(0)
+					} else {
+						// Evaluate x <= high
+						var leHigh *vdbe.Mem
+						if isNull(high) {
+							leHigh = vdbe.NewMemNull()
+						} else {
+							leHigh = boolToInt(memCompare(left, high) <= 0)
+						}
+						// AND of geLow and leHigh with three-valued logic
+						result = threeValAnd(geLow, leHigh)
+					}
 				}
+
+				if negate {
+					result = threeValNot(result)
+				}
+				left = result
 				continue
 			}
 		}
 
 		if negate || p.peekKeyword("like") {
-			// [NOT] LIKE
+			// [NOT] LIKE [ESCAPE esc]
 			if p.matchKeyword("like") {
 				pattern := p.parseConcat()
-				match := likeMatch(memStr(left), memStr(pattern))
+				// Check for ESCAPE clause
+				var escapeRune rune
+				p.skipSpaces()
+				if p.peekKeyword("escape") {
+					p.matchKeyword("escape")
+					escVal := p.parseConcat()
+					if escVal == nil || isNull(escVal) {
+						escapeRune = -1
+					} else {
+						escStr := memStr(escVal)
+						if len(escStr) == 0 {
+							// Empty escape string is an error
+							p.err = fmt.Errorf("ESCAPE expression must be a single character")
+							left = vdbe.NewMemNull()
+							if negate {
+								left = vdbe.NewMemNull()
+							}
+							continue
+						}
+						if len(escStr) > 1 {
+							// Multi-char escape is an error
+							p.err = fmt.Errorf("ESCAPE expression must be a single character")
+							left = vdbe.NewMemNull()
+							if negate {
+								left = vdbe.NewMemNull()
+							}
+							continue
+						}
+						escapeRune, _ = utf8.DecodeRuneInString(escStr)
+					}
+				}
+				match := likeMatchWithEscape(memStr(left), memStr(pattern), escapeRune)
+				if negate {
+					left = boolToInt(!match)
+				} else {
+					left = boolToInt(match)
+				}
+				continue
+			}
+		}
+
+		if negate || p.peekKeyword("glob") {
+			// [NOT] GLOB pattern
+			if p.matchKeyword("glob") {
+				pattern := p.parseConcat()
+				match := globMatch(memStr(left), memStr(pattern))
 				if negate {
 					left = boolToInt(!match)
 				} else {
@@ -4818,37 +4988,197 @@ func memEqual(a, b *vdbe.Mem) bool {
 
 // likeMatch implements SQL LIKE pattern matching (% and _ wildcards).
 func likeMatch(input, pattern string) bool {
-	pi, pp := 0, 0
-	for pi < len(input) && pp < len(pattern) {
-		if pattern[pp] == '%' {
+	return likeMatchWithEscape(input, pattern, -1)
+}
+
+// likeMatchWithEscape implements SQL LIKE pattern matching with optional escape character.
+// escapeRune < 0 means no escape character.
+func likeMatchWithEscape(input, pattern string, escapeRune rune) bool {
+	return likeMatchRunes(
+		[]rune(input),
+		[]rune(pattern),
+		0, 0,
+		escapeRune,
+		false,
+	)
+}
+
+func likeMatchRunes(input, pattern []rune, pi, pp int, esc rune, escaped bool) bool {
+	for pp < len(pattern) {
+		if !escaped && esc >= 0 && pattern[pp] == esc {
 			pp++
-			if pp == len(pattern) {
+			if pp >= len(pattern) {
+				return false
+			}
+			escaped = true
+			continue
+		}
+		ch := pattern[pp]
+		if !escaped && ch == '%' {
+			pp++
+			// Skip consecutive %
+			for pp < len(pattern) && pattern[pp] == '%' && !(esc >= 0 && pattern[pp] == esc) {
+				pp++
+			}
+			if pp >= len(pattern) {
 				return true
 			}
-			for pi < len(input) {
-				if likeMatch(input[pi:], pattern[pp:]) {
+			// Try matching rest at each position in input
+			for pi <= len(input) {
+				if likeMatchRunes(input, pattern, pi, pp, esc, false) {
 					return true
 				}
 				pi++
 			}
-			return likeMatch("", pattern[pp:])
+			return false
 		}
-		if pattern[pp] == '_' {
+		if pi >= len(input) {
+			return false
+		}
+		if !escaped && ch == '_' {
+			pp++
+			pi++
+			escaped = false
+			continue
+		}
+		if unicodeToLower(ch) != unicodeToLower(input[pi]) {
+			return false
+		}
+		pp++
+		pi++
+		escaped = false
+	}
+	return pi >= len(input)
+}
+
+func unicodeToLower(r rune) rune {
+	if r >= 'A' && r <= 'Z' {
+		return r + ('a' - 'A')
+	}
+	return r
+}
+
+// globMatch implements GLOB pattern matching (case-sensitive).
+// Wildcards: * = any sequence, ? = any single char, [...] = character class.
+func globMatch(input, pattern string) bool {
+	return globMatchRunes([]rune(input), []rune(pattern), 0, 0)
+}
+
+func globMatchRunes(input, pattern []rune, pi, pp int) bool {
+	for pp < len(pattern) {
+		ch := pattern[pp]
+		if ch == '*' {
+			pp++
+			// Skip consecutive *
+			for pp < len(pattern) && pattern[pp] == '*' {
+				pp++
+			}
+			if pp >= len(pattern) {
+				return true
+			}
+			// Try matching rest at each position
+			for pi <= len(input) {
+				if globMatchRunes(input, pattern, pi, pp) {
+					return true
+				}
+				pi++
+			}
+			return false
+		}
+		if ch == '?' {
+			if pi >= len(input) {
+				return false
+			}
 			pp++
 			pi++
 			continue
 		}
-		if strings.ToLower(string(input[pi])) == strings.ToLower(string(pattern[pp])) {
+		if ch == '[' {
+			// Character class
+			if pi >= len(input) {
+				return false
+			}
 			pp++
+			if pp >= len(pattern) {
+				return false
+			}
+			negate := false
+			if pattern[pp] == '^' {
+				negate = true
+				pp++
+			} else if pattern[pp] == '!' {
+				negate = true
+				pp++
+			}
+			matched := false
+			prevRune := rune(-1)
+			for pp < len(pattern) && pattern[pp] != ']' {
+				if pattern[pp] == '-' && prevRune >= 0 && pp+1 < len(pattern) && pattern[pp+1] != ']' {
+					// Range: a-z
+					pp++ // skip -
+					endRune := pattern[pp]
+					if input[pi] >= prevRune && input[pi] <= endRune {
+						matched = true
+					}
+					prevRune = -1
+				} else {
+					if pattern[pp] == input[pi] {
+						matched = true
+					}
+					prevRune = pattern[pp]
+				}
+				pp++
+			}
+			if pp < len(pattern) && pattern[pp] == ']' {
+				pp++
+			}
+			if negate {
+				matched = !matched
+			}
+			if !matched {
+				return false
+			}
 			pi++
-		} else {
+			continue
+		}
+		// Literal character (case-sensitive)
+		if pi >= len(input) || input[pi] != ch {
 			return false
 		}
-	}
-	for pp < len(pattern) && pattern[pp] == '%' {
 		pp++
+		pi++
 	}
-	return pi == len(input) && pp == len(pattern)
+	return pi >= len(input)
+}
+
+// threeValAnd implements three-valued AND logic (SQL NULL semantics).
+// false AND anything = false; true AND null = null; true AND true = true.
+func threeValAnd(a, b *vdbe.Mem) *vdbe.Mem {
+	aFalse := a != nil && a.Type == vdbe.MemInt && a.IntVal == 0
+	bFalse := b != nil && b.Type == vdbe.MemInt && b.IntVal == 0
+	aNull := isNull(a)
+	bNull := isNull(b)
+
+	if aFalse || bFalse {
+		return vdbe.NewMemInt(0)
+	}
+	if aNull || bNull {
+		return vdbe.NewMemNull()
+	}
+	// Both are non-null, non-zero (truthy)
+	return vdbe.NewMemInt(1)
+}
+
+// threeValNot implements three-valued NOT logic.
+// NOT null = null; NOT true = false; NOT false = true.
+func threeValNot(m *vdbe.Mem) *vdbe.Mem {
+	if isNull(m) {
+		return vdbe.NewMemNull()
+	}
+	if m.Type == vdbe.MemInt && m.IntVal == 0 {
+		return vdbe.NewMemInt(1)
+	}
+	return vdbe.NewMemInt(0)
 }
 
 // compileStatement builds a VDBE program from tokenized SQL.
@@ -5063,7 +5393,10 @@ func parseInsertExprValue(tokens []compile.Token, pos *int, args []interface{}, 
 	}
 
 	// Evaluate using the expression parser
-	val := evalSimpleExpr(expr, args)
+	val, evalErr := evalSimpleExpr(expr, args)
+	if evalErr != nil {
+		return nil, evalErr
+	}
 	switch val.Type {
 	case vdbe.MemNull:
 		return nil, nil
