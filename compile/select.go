@@ -305,6 +305,10 @@ func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColum
 	sortEmptyLabel := b.b.NewLabel()
 	_ = b.emitSorterSort(groupSorter, sortEmptyLabel)
 
+	// Advance sorter to the first row (SorterSort rewinds to iterIdx=0,
+	// but OpColumn reads from the sorter data which is nil at iterIdx=0).
+	b.emitSorterNext(groupSorter, sortEmptyLabel)
+
 	// We need an output sorter if there's ORDER BY
 	var outSorter int
 	needOutSorter := len(stmt.OrderBy) > 0
