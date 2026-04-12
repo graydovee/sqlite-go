@@ -72,7 +72,7 @@ func (m *Mem) TextValue() string {
 	case MemFloat:
 		return strconv.FormatFloat(m.FloatVal, 'g', -1, 64)
 	case MemNull:
-		return "NULL"
+		return ""
 	default:
 		return ""
 	}

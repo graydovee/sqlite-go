@@ -314,7 +314,7 @@ func TestJoin1Basic(t *testing.T) {
 // ============================================================================
 
 func TestJoin2LeftJoin(t *testing.T) {
-	t.Skip("LEFT JOIN execution not fully working")
+	// t.Skip("LEFT JOIN execution not fully working")
 	
 	db := openTestDB(t)
 	setupJoinTables(t, db)
@@ -510,7 +510,7 @@ func TestJoin3Errors(t *testing.T) {
 // ============================================================================
 
 func TestJoin4Nulls(t *testing.T) {
-	t.Skip("LEFT JOIN execution not fully working")
+	// t.Skip("LEFT JOIN execution not fully working")
 	
 	db := openTestDB(t)
 
@@ -604,7 +604,7 @@ func TestJoin4Nulls(t *testing.T) {
 // ============================================================================
 
 func TestJoin5LeftJoinIndex(t *testing.T) {
-	t.Skip("LEFT JOIN execution not fully working")
+	// t.Skip("LEFT JOIN execution not fully working")
 	
 	db := openTestDB(t)
 

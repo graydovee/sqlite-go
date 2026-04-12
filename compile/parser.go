@@ -656,7 +656,7 @@ func (p *Parser) peekJoinKeyword() bool {
 	lower := strings.ToLower(tok.Value)
 	return lower == "join" || lower == "inner" || lower == "left" ||
 		lower == "right" || lower == "full" || lower == "cross" ||
-		lower == "natural"
+		lower == "natural" || lower == "outer"
 }
 
 // parseJoinType parses and returns the join type, consuming tokens.
@@ -669,11 +669,18 @@ func (p *Parser) parseJoinType() (JoinType, bool) {
 		p.advance()
 	}
 
+	// Optional OUTER prefix (e.g., "OUTER LEFT JOIN")
+	hadOuter := false
+	if p.isKw(KwOuter) {
+		hadOuter = true
+		p.advance()
+	}
+
 	// Join type keyword
 	jt := JoinInner
 	if p.isKw(KwLeft) {
 		p.advance()
-		p.matchKw(KwOuter) // optional OUTER
+		p.matchKw(KwOuter) // optional OUTER after LEFT
 		jt = JoinLeft
 	} else if p.isKw(KwRight) {
 		p.advance()
@@ -689,6 +696,16 @@ func (p *Parser) parseJoinType() (JoinType, bool) {
 	} else if p.isKw(KwInner) {
 		p.advance()
 		jt = JoinInner
+	} else if hadOuter {
+		// Just OUTER without LEFT/RIGHT/FULL is an error in standard SQL
+		// but treat it as LEFT for compatibility
+		jt = JoinLeft
+	}
+
+	// Handle NATURAL after join type (e.g., "LEFT NATURAL JOIN")
+	if !natural && p.isKw(KwNatural) {
+		natural = true
+		p.advance()
 	}
 
 	// JOIN keyword

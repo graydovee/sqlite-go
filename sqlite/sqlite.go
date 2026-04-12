@@ -1948,6 +1948,11 @@ func (db *Database) parseFromTables(filtered []compile.Token, pos int) ([]joinTa
 			pos++
 		}
 
+		// Check for optional OUTER prefix (e.g., "OUTER LEFT JOIN")
+		if pos < len(filtered) && isKeyword(filtered[pos], "outer") {
+			pos++
+		}
+
 		// Check for join type keywords
 		joinType := "inner"
 		isOuter := false
@@ -1974,6 +1979,12 @@ func (db *Database) parseFromTables(filtered []compile.Token, pos int) ([]joinTa
 			joinType = "cross"
 			pos++
 		} else if pos < len(filtered) && isKeyword(filtered[pos], "inner") {
+			pos++
+		}
+
+		// Check for NATURAL after join type (e.g., "LEFT NATURAL JOIN")
+		if !isNatural && pos < len(filtered) && isKeyword(filtered[pos], "natural") {
+			isNatural = true
 			pos++
 		}
 
