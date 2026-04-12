@@ -980,6 +980,323 @@ func TestInsertMultipleValueRows(t *testing.T) {
 	}
 }
 
+// --- DELETE / UPDATE WHERE tests ---
+
+func setupTableForWhere(t *testing.T) *Database {
+	t.Helper()
+	db, err := OpenInMemory()
+	if err != nil {
+		t.Fatalf("OpenInMemory failed: %v", err)
+	}
+	err = db.Exec("CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)")
+	if err != nil {
+		t.Fatalf("CREATE TABLE failed: %v", err)
+	}
+	db.Exec("INSERT INTO t VALUES (1, 'alice', 30)")
+	db.Exec("INSERT INTO t VALUES (2, 'bob', 25)")
+	db.Exec("INSERT INTO t VALUES (3, 'charlie', 30)")
+	db.Exec("INSERT INTO t VALUES (4, 'dave', 40)")
+	return db
+}
+
+func countRows(t *testing.T, db *Database, query string) int {
+	t.Helper()
+	rs, err := db.Query(query)
+	if err != nil {
+		t.Fatalf("Query %q failed: %v", query, err)
+	}
+	defer rs.Close()
+	count := 0
+	for rs.Next() {
+		count++
+	}
+	return count
+}
+
+func TestDeleteAllRows(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t")
+	if err != nil {
+		t.Fatalf("DELETE failed: %v", err)
+	}
+	if db.Changes() != 4 {
+		t.Errorf("expected Changes()=4, got %d", db.Changes())
+	}
+	if countRows(t, db, "SELECT * FROM t") != 0 {
+		t.Error("expected 0 rows after DELETE FROM t")
+	}
+}
+
+func TestDeleteWhereEquals(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE name = 'bob'")
+	if err != nil {
+		t.Fatalf("DELETE WHERE failed: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Errorf("expected Changes()=1, got %d", db.Changes())
+	}
+	n := countRows(t, db, "SELECT * FROM t")
+	if n != 3 {
+		t.Errorf("expected 3 rows after deleting bob, got %d", n)
+	}
+	// Verify bob is gone
+	rs, err := db.Query("SELECT name FROM t WHERE name = 'bob'")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	if rs.Next() {
+		t.Error("expected bob to be deleted")
+	}
+}
+
+func TestDeleteWhereNumericComparison(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE age > 30")
+	if err != nil {
+		t.Fatalf("DELETE WHERE failed: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Errorf("expected Changes()=1, got %d", db.Changes())
+	}
+	n := countRows(t, db, "SELECT * FROM t")
+	if n != 3 {
+		t.Errorf("expected 3 rows after deleting age>30, got %d", n)
+	}
+}
+
+func TestDeleteWhereMultipleMatch(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE age = 30")
+	if err != nil {
+		t.Fatalf("DELETE WHERE failed: %v", err)
+	}
+	if db.Changes() != 2 {
+		t.Errorf("expected Changes()=2, got %d", db.Changes())
+	}
+	n := countRows(t, db, "SELECT * FROM t")
+	if n != 2 {
+		t.Errorf("expected 2 rows after deleting age=30, got %d", n)
+	}
+}
+
+func TestDeleteWhereNoMatch(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE id = 999")
+	if err != nil {
+		t.Fatalf("DELETE WHERE failed: %v", err)
+	}
+	if db.Changes() != 0 {
+		t.Errorf("expected Changes()=0, got %d", db.Changes())
+	}
+	if countRows(t, db, "SELECT * FROM t") != 4 {
+		t.Error("expected all 4 rows to remain")
+	}
+}
+
+func TestDeleteWhereAndCondition(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE age = 30 AND name = 'alice'")
+	if err != nil {
+		t.Fatalf("DELETE WHERE AND failed: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Errorf("expected Changes()=1, got %d", db.Changes())
+	}
+	n := countRows(t, db, "SELECT * FROM t")
+	if n != 3 {
+		t.Errorf("expected 3 rows, got %d", n)
+	}
+}
+
+func TestUpdateWhereEquals(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET age = 26 WHERE name = 'bob'")
+	if err != nil {
+		t.Fatalf("UPDATE WHERE failed: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Errorf("expected Changes()=1, got %d", db.Changes())
+	}
+
+	// Verify bob's age changed
+	rs, err := db.Query("SELECT age FROM t WHERE name = 'bob'")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("expected bob row")
+	}
+	row := rs.Row()
+	var age int64
+	if err := row.Scan(&age); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	if age != 26 {
+		t.Errorf("expected bob age=26, got %d", age)
+	}
+}
+
+func TestUpdateWhereMultipleMatch(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET age = 99 WHERE age = 30")
+	if err != nil {
+		t.Fatalf("UPDATE WHERE failed: %v", err)
+	}
+	if db.Changes() != 2 {
+		t.Errorf("expected Changes()=2, got %d", db.Changes())
+	}
+
+	// Both alice and charlie should now have age 99
+	rs, err := db.Query("SELECT name FROM t WHERE age = 99 ORDER BY name")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	count := 0
+	for rs.Next() {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 rows with age=99, got %d", count)
+	}
+}
+
+func TestUpdateWhereNoMatch(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET age = 99 WHERE id = 999")
+	if err != nil {
+		t.Fatalf("UPDATE WHERE failed: %v", err)
+	}
+	if db.Changes() != 0 {
+		t.Errorf("expected Changes()=0, got %d", db.Changes())
+	}
+}
+
+func TestUpdateAllRowsNoWhere(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET age = 0")
+	if err != nil {
+		t.Fatalf("UPDATE failed: %v", err)
+	}
+	if db.Changes() != 4 {
+		t.Errorf("expected Changes()=4, got %d", db.Changes())
+	}
+
+	rs, err := db.Query("SELECT age FROM t")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	for rs.Next() {
+		var age int64
+		if err := rs.Row().Scan(&age); err != nil {
+			t.Fatalf("Scan failed: %v", err)
+		}
+		if age != 0 {
+			t.Errorf("expected age=0, got %d", age)
+		}
+	}
+}
+
+func TestUpdateMultipleColumnsWhere(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET name = 'robert', age = 26 WHERE name = 'bob'")
+	if err != nil {
+		t.Fatalf("UPDATE SET multiple columns WHERE failed: %v", err)
+	}
+	if db.Changes() != 1 {
+		t.Errorf("expected Changes()=1, got %d", db.Changes())
+	}
+
+	rs, err := db.Query("SELECT name, age FROM t WHERE name = 'robert'")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	if !rs.Next() {
+		t.Fatal("expected robert row")
+	}
+	var name string
+	var age int64
+	if err := rs.Row().Scan(&name, &age); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	if name != "robert" {
+		t.Errorf("expected name='robert', got %q", name)
+	}
+	if age != 26 {
+		t.Errorf("expected age=26, got %d", age)
+	}
+}
+
+func TestDeleteWhereOrCondition(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("DELETE FROM t WHERE name = 'alice' OR name = 'bob'")
+	if err != nil {
+		t.Fatalf("DELETE WHERE OR failed: %v", err)
+	}
+	if db.Changes() != 2 {
+		t.Errorf("expected Changes()=2, got %d", db.Changes())
+	}
+	n := countRows(t, db, "SELECT * FROM t")
+	if n != 2 {
+		t.Errorf("expected 2 rows remaining, got %d", n)
+	}
+}
+
+func TestUpdateWhereGreaterThan(t *testing.T) {
+	db := setupTableForWhere(t)
+	defer db.Close()
+
+	err := db.Exec("UPDATE t SET age = 100 WHERE age >= 30")
+	if err != nil {
+		t.Fatalf("UPDATE WHERE >= failed: %v", err)
+	}
+	if db.Changes() != 3 {
+		t.Errorf("expected Changes()=3, got %d", db.Changes())
+	}
+
+	rs, err := db.Query("SELECT name FROM t WHERE age = 100 ORDER BY name")
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	defer rs.Close()
+	count := 0
+	for rs.Next() {
+		count++
+	}
+	if count != 3 {
+		t.Errorf("expected 3 rows with age=100, got %d", count)
+	}
+}
+
 // --- helper ---
 
 func contains(s, substr string) bool {

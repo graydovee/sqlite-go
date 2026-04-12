@@ -363,7 +363,7 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
-		return db.execDelete(filtered)
+		return db.execDelete(filtered, args)
 	case "update":
 		return db.execUpdate(filtered, args)
 	case "begin":
@@ -1608,7 +1608,7 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 }
 
 // execDelete handles DELETE statements.
-func (db *Database) execDelete(tokens []compile.Token) error {
+func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error {
 	pos := 0
 	expectKeyword(tokens, &pos, "delete")
 	expectKeyword(tokens, &pos, "from")
@@ -1624,8 +1624,24 @@ func (db *Database) execDelete(tokens []compile.Token) error {
 		return NewErrorf(Error, "no such table: %s", tableName)
 	}
 
-	// Simple DELETE FROM table (no WHERE support yet)
-	// For now, clear the entire table
+	// Parse optional WHERE clause
+	var whereExpr string
+	if pos < len(tokens) && isKeyword(tokens[pos], "where") {
+		pos++
+		var whereParts []string
+		for pos < len(tokens) {
+			whereParts = append(whereParts, tokens[pos].Value)
+			pos++
+		}
+		whereExpr = strings.Join(whereParts, " ")
+	}
+
+	// Build column name list for expression evaluation
+	colNames := make([]string, len(tbl.columns))
+	for i, col := range tbl.columns {
+		colNames[i] = col.name
+	}
+
 	cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
 	if err != nil {
 		return NewErrorf(Error, "open cursor: %s", err)
@@ -1638,6 +1654,37 @@ func (db *Database) execDelete(tokens []compile.Token) error {
 		return err
 	}
 	for hasRow {
+		if whereExpr != "" {
+			data, err := cursor.Data()
+			if err != nil {
+				return err
+			}
+			values, err := vdbe.ParseRecord(data)
+			if err != nil {
+				return err
+			}
+			// Pad values for columns added via ALTER TABLE
+			if len(values) < len(tbl.columns) {
+				padded := make([]vdbe.Value, len(tbl.columns))
+				copy(padded, values)
+				for j := len(values); j < len(tbl.columns); j++ {
+					if tbl.columns[j].defaultValue != nil {
+						padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
+					} else {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+				}
+				values = padded
+			}
+			wval := evalExprWithRow(whereExpr, args, colNames, values)
+			if !isTruthy(wval) {
+				hasRow, err = cursor.Next()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		if err := db.bt.Delete(cursor); err != nil {
 			return err
 		}
@@ -1701,6 +1748,18 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 	}
 
+	// Parse optional WHERE clause
+	var whereExpr string
+	if pos < len(tokens) && isKeyword(tokens[pos], "where") {
+		pos++
+		var whereParts []string
+		for pos < len(tokens) {
+			whereParts = append(whereParts, tokens[pos].Value)
+			pos++
+		}
+		whereExpr = strings.Join(whereParts, " ")
+	}
+
 	// Build column name list
 	colNames := make([]string, len(tbl.columns))
 	for i, col := range tbl.columns {
@@ -1750,6 +1809,17 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 				}
 				values = padded
 			}
+		// Apply WHERE filter
+		if whereExpr != "" {
+			wval := evalExprWithRow(whereExpr, args, colNames, values)
+			if !isTruthy(wval) {
+				hasRow, err = cursor.Next()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		for _, s := range sets {
 			evalVal := evalExprWithRow(s.exprStr, args, colNames, values)
 			for i, col := range tbl.columns {
