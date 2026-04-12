@@ -28,6 +28,9 @@ type Database struct {
 	tables map[string]*tableEntry
 	views  map[string]*viewEntry
 
+	// sqlite_master entries — the system catalog
+	masterEntries []sqliteMasterEntry
+
 	// Connection state
 	lastInsertRowID int64
 	changes         int64
@@ -40,6 +43,16 @@ type Database struct {
 
 	// CTE temporary data (populated during WITH query execution)
 	cteData map[string]*cteTable
+}
+
+// sqliteMasterEntry represents one row in the sqlite_master system table.
+// Columns: type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT
+type sqliteMasterEntry struct {
+	Type     string // "table", "index", "view", "trigger"
+	Name     string
+	TblName  string
+	RootPage int
+	SQL      string
 }
 
 // tableEntry stores metadata about a table.
@@ -328,8 +341,14 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execCreateTable(filtered)
 	case "create_view":
 		return db.execCreateView(filtered)
+	case "create_index":
+		return db.execCreateIndex(filtered)
 	case "drop_view":
 		return db.execDropView(filtered)
+	case "drop_table":
+		return db.execDropTable(filtered)
+	case "drop_index":
+		return db.execDropIndex(filtered)
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
@@ -362,6 +381,9 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 
 // execCreateTable handles CREATE TABLE statements.
 func (db *Database) execCreateTable(tokens []compile.Token) error {
+	// Reconstruct the original SQL for sqlite_master
+	sqlText := rebuildSQL(tokens)
+
 	// Parse: CREATE TABLE [IF NOT EXISTS] name (col-defs)
 	pos := 0
 	expectKeyword(tokens, &pos, "create")
@@ -461,11 +483,22 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		columns:  columns,
 	}
 
+	// Add entry to sqlite_master
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:     "table",
+		Name:     tableName,
+		TblName:  tableName,
+		RootPage: int(rootPage),
+		SQL:      sqlText,
+	})
+
 	return nil
 }
 
 // execCreateView handles CREATE VIEW statements.
 func (db *Database) execCreateView(tokens []compile.Token) error {
+	sqlText := rebuildSQL(tokens)
+
 	pos := 0
 	expectKeyword(tokens, &pos, "create")
 	expectKeyword(tokens, &pos, "view")
@@ -529,6 +562,14 @@ func (db *Database) execCreateView(tokens []compile.Token) error {
 		sql:  selectSQL,
 	}
 
+	// Add entry to sqlite_master
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:    "view",
+		Name:    viewName,
+		TblName: viewName,
+		SQL:     sqlText,
+	})
+
 	return nil
 }
 
@@ -559,7 +600,213 @@ func (db *Database) execDropView(tokens []compile.Token) error {
 	}
 
 	delete(db.views, viewName)
+	db.removeMasterEntry("view", viewName)
 	return nil
+}
+
+// execDropTable handles DROP TABLE statements.
+func (db *Database) execDropTable(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "drop")
+	expectKeyword(tokens, &pos, "table")
+
+	ifExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "exists")
+		ifExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected table name")
+	}
+	tableName := tokens[pos].Value
+	pos++
+
+	if db.tables[tableName] == nil {
+		if ifExists {
+			return nil
+		}
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	delete(db.tables, tableName)
+
+	// Remove the table entry from sqlite_master and any associated indexes
+	db.removeMasterEntry("table", tableName)
+	db.removeMasterEntriesForTable(tableName)
+
+	return nil
+}
+
+// execCreateIndex handles CREATE INDEX statements.
+func (db *Database) execCreateIndex(tokens []compile.Token) error {
+	sqlText := rebuildSQL(tokens)
+
+	pos := 0
+	expectKeyword(tokens, &pos, "create")
+	if pos < len(tokens) && isKeyword(tokens[pos], "unique") {
+		pos++
+	}
+	expectKeyword(tokens, &pos, "index")
+
+	ifNotExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "not")
+		expectKeyword(tokens, &pos, "exists")
+		ifNotExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected index name")
+	}
+	indexName := tokens[pos].Value
+	pos++
+
+	// ON keyword
+	expectKeyword(tokens, &pos, "on")
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected table name in CREATE INDEX")
+	}
+	tableName := tokens[pos].Value
+	pos++
+
+	// Check table exists
+	if db.tables[tableName] == nil {
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	// Check if index already exists
+	for _, e := range db.masterEntries {
+		if e.Type == "index" && strings.EqualFold(e.Name, indexName) {
+			if ifNotExists {
+				return nil
+			}
+			return NewErrorf(Error, "index %s already exists", indexName)
+		}
+	}
+
+	// Create a B-tree for the index
+	if !db.inTx {
+		if err := db.pgr.Begin(true); err != nil {
+			return NewErrorf(Busy, "begin transaction: %s", err)
+		}
+		if err := db.bt.Begin(true); err != nil {
+			db.pgr.Rollback()
+			return NewErrorf(Error, "begin btree transaction: %s", err)
+		}
+	}
+
+	rootPage, err := db.bt.CreateBTree(btree.CreateIndex)
+	if err != nil {
+		if !db.inTx {
+			db.bt.Rollback()
+			db.pgr.Rollback()
+		}
+		return NewErrorf(Error, "create index btree: %s", err)
+	}
+
+	if !db.inTx {
+		if err := db.bt.Commit(); err != nil {
+			return NewErrorf(Error, "commit btree: %s", err)
+		}
+		if err := db.pgr.Commit(); err != nil {
+			return NewErrorf(IOError, "commit pager: %s", err)
+		}
+	}
+
+	// Add entry to sqlite_master
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:     "index",
+		Name:     indexName,
+		TblName:  tableName,
+		RootPage: int(rootPage),
+		SQL:      sqlText,
+	})
+
+	return nil
+}
+
+// execDropIndex handles DROP INDEX statements.
+func (db *Database) execDropIndex(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "drop")
+	expectKeyword(tokens, &pos, "index")
+
+	ifExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "exists")
+		ifExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected index name")
+	}
+	indexName := tokens[pos].Value
+	pos++
+
+	// Check if index exists
+	found := false
+	for _, e := range db.masterEntries {
+		if e.Type == "index" && strings.EqualFold(e.Name, indexName) {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		if ifExists {
+			return nil
+		}
+		return NewErrorf(Error, "no such index: %s", indexName)
+	}
+
+	db.removeMasterEntry("index", indexName)
+	return nil
+}
+
+// removeMasterEntry removes a single entry from sqlite_master by type and name.
+func (db *Database) removeMasterEntry(typeName, name string) {
+	for i, e := range db.masterEntries {
+		if e.Type == typeName && strings.EqualFold(e.Name, name) {
+			db.masterEntries = append(db.masterEntries[:i], db.masterEntries[i+1:]...)
+			return
+		}
+	}
+}
+
+// removeMasterEntriesForTable removes all entries associated with a table
+// (indexes, triggers) from sqlite_master. The table entry itself should
+// already have been removed.
+func (db *Database) removeMasterEntriesForTable(tableName string) {
+	var kept []sqliteMasterEntry
+	for _, e := range db.masterEntries {
+		if strings.EqualFold(e.TblName, tableName) && e.Type != "table" {
+			continue // remove associated index/trigger entries
+		}
+		kept = append(kept, e)
+	}
+	db.masterEntries = kept
+}
+
+// rebuildSQL reconstructs a SQL string from tokens.
+func rebuildSQL(tokens []compile.Token) string {
+	var buf strings.Builder
+	prevEnd := -1
+	for i, t := range tokens {
+		if i > 0 {
+			// Add a space between tokens if needed
+			if prevEnd >= 0 {
+				buf.WriteByte(' ')
+			}
+		}
+		buf.WriteString(t.Value)
+		prevEnd = len(t.Value)
+	}
+	return buf.String()
 }
 
 // execInsert handles INSERT statements.
@@ -1018,6 +1265,12 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	// For SELECT without FROM (e.g., SELECT 1+2), compute directly
 	if tableName == "" {
 		return db.selectWithoutTable(cols, args)
+	}
+
+	// Handle sqlite_master / sqlite_schema virtual table
+	lowerTable := strings.ToLower(tableName)
+	if lowerTable == "sqlite_master" || lowerTable == "sqlite_schema" {
+		return db.querySqliteMaster(filtered, pos, cols, args)
 	}
 
 	var tbl *tableEntry
@@ -1606,6 +1859,134 @@ func rowKey(values []*vdbe.Mem) string {
 func (db *Database) queryView(v *viewEntry, cols []selectCol, args []interface{}) (*ResultSet, error) {
 	// Re-execute the view's SELECT statement
 	return db.querySingle(v.sql, args)
+}
+
+// querySqliteMaster handles SELECT queries against sqlite_master / sqlite_schema.
+func (db *Database) querySqliteMaster(filtered []compile.Token, pos int, cols []selectCol, args []interface{}) (*ResultSet, error) {
+	// sqlite_master columns: type, name, tbl_name, rootpage, sql
+	masterCols := []columnEntry{
+		{name: "type"},
+		{name: "name"},
+		{name: "tbl_name"},
+		{name: "rootpage"},
+		{name: "sql"},
+	}
+
+	// Parse optional WHERE clause
+	var whereExpr string
+	if pos < len(filtered) && isKeyword(filtered[pos], "where") {
+		pos++
+		var whereParts []string
+		for pos < len(filtered) && !isKeyword(filtered[pos], "limit") &&
+			!isKeyword(filtered[pos], "order") && !isKeyword(filtered[pos], "group") {
+			whereParts = append(whereParts, filtered[pos].Value)
+			pos++
+		}
+		whereExpr = strings.Join(whereParts, " ")
+	}
+
+	// Build rows from master entries
+	var rawData []rawRow
+	colNames := []string{"type", "name", "tbl_name", "rootpage", "sql"}
+
+	for _, entry := range db.masterEntries {
+		values := []vdbe.Value{
+			{Type: "text", Bytes: []byte(entry.Type)},
+			{Type: "text", Bytes: []byte(entry.Name)},
+			{Type: "text", Bytes: []byte(entry.TblName)},
+			{Type: "int", IntVal: int64(entry.RootPage)},
+			{Type: "text", Bytes: []byte(entry.SQL)},
+		}
+
+		// Apply WHERE filter
+		if whereExpr != "" {
+			wval := evalExprWithRow(whereExpr, args, colNames, values)
+			if !isTruthy(wval) {
+				continue
+			}
+		}
+
+		rawData = append(rawData, rawRow{values: values})
+	}
+
+	// Determine output columns
+	var resultCols []ResultColumnInfo
+	for _, c := range cols {
+		if c.expr == "*" {
+			for _, col := range masterCols {
+				resultCols = append(resultCols, ResultColumnInfo{
+					Name: col.name,
+					Type: ColNull,
+				})
+			}
+		} else {
+			name := c.as
+			if name == "" {
+				name = c.expr
+			}
+			resultCols = append(resultCols, ResultColumnInfo{
+				Name: name,
+				Type: ColNull,
+			})
+		}
+	}
+
+	// Check for aggregates
+	hasAgg := false
+	for _, c := range cols {
+		if isAggregateExpr(c.expr) {
+			hasAgg = true
+			break
+		}
+	}
+
+	var rows []Row
+
+	if hasAgg {
+		row := Row{cols: resultCols}
+		for _, c := range cols {
+			if c.expr == "*" {
+				row.values = append(row.values, vdbe.NewMemInt(int64(len(rawData))))
+				continue
+			}
+			agg := parseAggregate(c.expr)
+			if agg != nil {
+				row.values = append(row.values, computeAggregate(agg, rawData, colNames))
+			} else {
+				if len(rawData) > 0 {
+					row.values = append(row.values, evalExprWithRow(c.expr, args, colNames, rawData[0].values))
+				} else {
+					row.values = append(row.values, vdbe.NewMemNull())
+				}
+			}
+		}
+		rows = []Row{row}
+	} else {
+		for _, rd := range rawData {
+			row := Row{cols: resultCols}
+			for _, c := range cols {
+				if c.expr == "*" {
+					for i := range masterCols {
+						if i < len(rd.values) {
+							row.values = append(row.values, vdbe.MemFromValue(rd.values[i]))
+						} else {
+							row.values = append(row.values, vdbe.NewMemNull())
+						}
+					}
+				} else {
+					val := evalExprWithRow(c.expr, args, colNames, rd.values)
+					row.values = append(row.values, val)
+				}
+			}
+			rows = append(rows, row)
+		}
+	}
+
+	if rows == nil {
+		rows = []Row{}
+	}
+
+	return newResultSet(rows, resultCols), nil
 }
 
 // selectWithoutTable handles SELECT without a FROM clause.
@@ -2730,6 +3111,10 @@ func classifyStatement(tokens []compile.Token) string {
 			switch second {
 			case "view":
 				return "drop_view"
+			case "table":
+				return "drop_table"
+			case "index":
+				return "drop_index"
 			}
 		}
 		return "drop"
