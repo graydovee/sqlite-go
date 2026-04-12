@@ -1803,6 +1803,12 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	if isKeyword(filtered[0], "with") {
 		return db.queryWithCTE(sql, args)
 	}
+
+	// Check for compound SELECT (UNION / UNION ALL / INTERSECT / EXCEPT)
+	if compoundParts := splitCompoundSelect(filtered); len(compoundParts) > 1 {
+		return db.queryCompoundSelect(compoundParts, args)
+	}
+
 	if !isKeyword(filtered[0], "select") {
 		return nil, NewError(Error, "not a SELECT statement")
 	}
@@ -2350,6 +2356,220 @@ func splitUnionAll(bodySQL string) (string, string) {
 	}
 
 	return bodySQL, ""
+}
+
+// compoundPart represents one part of a compound SELECT.
+// op is the operator that FOLLOWS this part (empty for the last part).
+type compoundPart struct {
+	sql string           // The SQL of this sub-select
+	op  compoundSelectOp // Operator after this part
+}
+
+// compoundSelectOp identifies the type of compound operator.
+type compoundSelectOp int
+
+const (
+	compoundNone      compoundSelectOp = iota
+	compoundUnion                      // UNION
+	compoundUnionAll                   // UNION ALL
+	compoundIntersect                  // INTERSECT
+	compoundExcept                     // EXCEPT
+)
+
+// splitCompoundSelect splits a filtered token list at top-level
+// UNION / UNION ALL / INTERSECT / EXCEPT boundaries, respecting
+// parenthesization (subqueries, expressions).
+// Returns nil if no compound operators found.
+func splitCompoundSelect(filtered []compile.Token) []compoundPart {
+	var parts []compoundPart
+	parenDepth := 0
+	start := 0
+
+	for i := 0; i < len(filtered); i++ {
+		tok := filtered[i]
+		switch tok.Type {
+		case compile.TokenLParen:
+			parenDepth++
+		case compile.TokenRParen:
+			if parenDepth > 0 {
+				parenDepth--
+			}
+		case compile.TokenKeyword:
+			if parenDepth == 0 {
+				var op compoundSelectOp
+				var skip int
+
+				if strings.EqualFold(tok.Value, "union") && i+1 < len(filtered) && isKeyword(filtered[i+1], "all") {
+					op = compoundUnionAll
+					skip = 2
+				} else if strings.EqualFold(tok.Value, "union") {
+					op = compoundUnion
+					skip = 1
+				} else if strings.EqualFold(tok.Value, "intersect") {
+					op = compoundIntersect
+					skip = 1
+				} else if strings.EqualFold(tok.Value, "except") {
+					op = compoundExcept
+					skip = 1
+			}
+
+				if op != compoundNone {
+					parts = append(parts, compoundPart{
+						sql: joinTokenValues(filtered[start:i]),
+						op:  op,
+					})
+					i += skip - 1 // -1 because loop will i++
+					start = i + 1
+				}
+			}
+		}
+	}
+
+	if len(parts) == 0 {
+		return nil
+	}
+
+	// Add the last part (no operator follows it)
+	parts = append(parts, compoundPart{
+		sql: joinTokenValues(filtered[start:]),
+		op:  compoundNone,
+	})
+	return parts
+}
+
+// queryCompoundSelect executes a compound SELECT (UNION/INTERSECT/EXCEPT).
+func (db *Database) queryCompoundSelect(parts []compoundPart, args []interface{}) (*ResultSet, error) {
+	if len(parts) == 0 {
+		return nil, NewError(Error, "empty compound select")
+	}
+
+	// Execute the first sub-select
+	rs, err := db.querySingle(parts[0].sql, args)
+	if err != nil {
+		return nil, err
+	}
+	currentRows := collectResultRows(rs)
+	currentCols := rs.ColumnNames()
+	rs.Close()
+
+	// Apply each compound operator in order
+	for i := 1; i < len(parts); i++ {
+		op := parts[i-1].op
+
+		rs, err := db.querySingle(parts[i].sql, args)
+		if err != nil {
+			return nil, err
+		}
+		nextRows := collectResultRows(rs)
+		// Column names come from the leftmost SELECT, so we ignore
+		// the right side's column names.
+		rs.Close()
+
+		switch op {
+		case compoundUnionAll:
+			currentRows = append(currentRows, nextRows...)
+		case compoundUnion:
+			currentRows = append(currentRows, nextRows...)
+			currentRows = deduplicateRows(currentRows)
+		case compoundIntersect:
+			currentRows = intersectRows(currentRows, nextRows)
+		case compoundExcept:
+			currentRows = exceptRows(currentRows, nextRows)
+		}
+	}
+
+	// Build result set
+	var colInfos []ResultColumnInfo
+	for _, name := range currentCols {
+		colInfos = append(colInfos, ResultColumnInfo{Name: name})
+	}
+
+	var rows []Row
+	for _, vals := range currentRows {
+		row := Row{values: vals, cols: colInfos}
+		rows = append(rows, row)
+	}
+
+	return newResultSet(rows, colInfos), nil
+}
+
+// collectResultRows extracts row values from a ResultSet.
+func collectResultRows(rs *ResultSet) [][]*vdbe.Mem {
+	var rows [][]*vdbe.Mem
+	for rs.Next() {
+		r := rs.Row()
+		vals := make([]*vdbe.Mem, r.ColumnCount())
+		for i := 0; i < r.ColumnCount(); i++ {
+			vals[i] = valueToMem(r.ColumnValue(i))
+		}
+		rows = append(rows, vals)
+	}
+	return rows
+}
+
+// valueToMem converts an interface{} value back to a *vdbe.Mem.
+func valueToMem(v interface{}) *vdbe.Mem {
+	switch val := v.(type) {
+	case nil:
+		return vdbe.NewMemNull()
+	case int64:
+		return vdbe.NewMemInt(val)
+	case float64:
+		return vdbe.NewMemFloat(val)
+	case string:
+		return vdbe.NewMemText(val)
+	case []byte:
+		return vdbe.NewMemBlob(val)
+	default:
+		return vdbe.NewMemNull()
+	}
+}
+
+// deduplicateRows removes duplicate rows (for UNION).
+func deduplicateRows(rows [][]*vdbe.Mem) [][]*vdbe.Mem {
+	seen := make(map[string]bool)
+	var result [][]*vdbe.Mem
+	for _, row := range rows {
+		key := rowKey(row)
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// intersectRows returns rows present in BOTH a and b (for INTERSECT).
+func intersectRows(a, b [][]*vdbe.Mem) [][]*vdbe.Mem {
+	bSet := make(map[string]bool)
+	for _, row := range b {
+		bSet[rowKey(row)] = true
+	}
+	seen := make(map[string]bool)
+	var result [][]*vdbe.Mem
+	for _, row := range a {
+		key := rowKey(row)
+		if bSet[key] && !seen[key] {
+			seen[key] = true
+			result = append(result, row)
+		}
+	}
+	return result
+}
+
+// exceptRows returns rows in a but NOT in b (for EXCEPT).
+func exceptRows(a, b [][]*vdbe.Mem) [][]*vdbe.Mem {
+	bSet := make(map[string]bool)
+	for _, row := range b {
+		bSet[rowKey(row)] = true
+	}
+	var result [][]*vdbe.Mem
+	for _, row := range a {
+		if !bSet[rowKey(row)] {
+			result = append(result, row)
+		}
+	}
+	return result
 }
 
 // rsToCTE converts a ResultSet to a cteTable for CTE data storage.
