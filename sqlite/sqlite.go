@@ -2011,6 +2011,50 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		whereExpr = db.resolveSubqueries(strings.Join(whereParts, " "), args)
 	}
 
+	// Parse GROUP BY clause
+	var groupByExprs []string
+	if pos < len(filtered) && isKeyword(filtered[pos], "group") {
+		pos++
+		if pos < len(filtered) && isKeyword(filtered[pos], "by") {
+			pos++
+		}
+		for pos < len(filtered) &&
+			!isKeyword(filtered[pos], "having") &&
+			!isKeyword(filtered[pos], "order") &&
+			!isKeyword(filtered[pos], "limit") {
+			if filtered[pos].Type == compile.TokenComma {
+				pos++
+				continue
+			}
+			var gbParts []string
+			for pos < len(filtered) &&
+				filtered[pos].Type != compile.TokenComma &&
+				!isKeyword(filtered[pos], "having") &&
+				!isKeyword(filtered[pos], "order") &&
+				!isKeyword(filtered[pos], "limit") {
+				gbParts = append(gbParts, filtered[pos].Value)
+				pos++
+			}
+			if len(gbParts) > 0 {
+				groupByExprs = append(groupByExprs, strings.Join(gbParts, " "))
+			}
+		}
+	}
+
+	// Parse HAVING clause
+	var havingExpr string
+	if pos < len(filtered) && isKeyword(filtered[pos], "having") {
+		pos++
+		var havingParts []string
+		for pos < len(filtered) &&
+			!isKeyword(filtered[pos], "order") &&
+			!isKeyword(filtered[pos], "limit") {
+			havingParts = append(havingParts, filtered[pos].Value)
+			pos++
+		}
+		havingExpr = strings.Join(havingParts, " ")
+	}
+
 	// Parse ORDER BY clause
 	var orderByCol string
 	var orderDesc bool
@@ -2184,12 +2228,82 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	if hasWin {
 		rows = db.computeWindowFunctions(cols, rawData, colNames, resultCols, ecols, args)
+	} else if hasAgg && len(groupByExprs) > 0 {
+		// GROUP BY: group rows, then compute aggregates per group
+		type group struct {
+			key    string
+			rows   []rawRow
+			sample rawRow
+		}
+		var groups []*group
+		groupIndex := make(map[string]*group)
+
+		for _, rd := range rawData {
+			var keyParts []string
+			for _, gbExpr := range groupByExprs {
+				val := evalExprWithRow(gbExpr, args, colNames, rd.values)
+				if isNull(val) {
+					keyParts = append(keyParts, "\x00NULL")
+				} else {
+					keyParts = append(keyParts, "\x01"+val.StringValue())
+				}
+			}
+			key := strings.Join(keyParts, "\x00")
+
+			if g, ok := groupIndex[key]; ok {
+				g.rows = append(g.rows, rd)
+			} else {
+				g := &group{key: key, rows: []rawRow{rd}, sample: rd}
+				groupIndex[key] = g
+				groups = append(groups, g)
+			}
+		}
+
+		for _, g := range groups {
+			row := Row{cols: resultCols}
+			for _, c := range cols {
+				if c.expr == "*" {
+					row.values = append(row.values, vdbe.NewMemInt(int64(len(g.rows))))
+					continue
+				}
+				agg := parseAggregate(c.expr)
+				if agg != nil {
+					row.values = append(row.values, computeAggregate(agg, g.rows, colNames))
+				} else {
+					row.values = append(row.values, evalExprWithRow(c.expr, args, colNames, g.sample.values))
+				}
+			}
+
+			// Apply HAVING filter
+			if havingExpr != "" {
+				// Replace aggregate expressions in HAVING with their computed values
+				havingEval := havingExpr
+				for i, c := range cols {
+					agg := parseAggregate(c.expr)
+					if agg != nil && i < len(row.values) {
+						val := row.values[i]
+						if !isNull(val) {
+							havingEval = strings.ReplaceAll(havingEval, c.expr, val.StringValue())
+						}
+					}
+				}
+				hval := evalExprWithRow(havingEval, args, colNames, g.sample.values)
+				if !isTruthy(hval) {
+					continue
+				}
+			}
+
+			rows = append(rows, row)
+		}
+		if rows == nil {
+			rows = []Row{}
+		}
 	} else if hasAgg {
-		// Compute aggregate results
+		// Compute aggregate results (no GROUP BY)
 		row := Row{cols: resultCols}
 		for _, c := range cols {
 			if c.expr == "*" {
-				// count(*) — * in aggregate context
+				// count(*) aggregate without GROUP BY
 				row.values = append(row.values, vdbe.NewMemInt(int64(len(rawData))))
 				continue
 			}
