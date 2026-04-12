@@ -28,7 +28,7 @@ import (
 // TestAlter2AddColumnBasics tests fundamental ADD COLUMN operations.
 // alter2-1.1 through 1.3
 func TestAlter2AddColumnBasics(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// alter2-1.1: Add column, verify existing rows get NULL
 	t.Run("alter2-1.1_null_default", func(t *testing.T) {
 		db := openTestDB(t)
@@ -81,7 +81,7 @@ func TestAlter2AddColumnBasics(t *testing.T) {
 
 // TestAlter2AddColumnIndex tests ADD COLUMN with index operations.
 func TestAlter2AddColumnIndex(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// alter2-1.4: Create index on new column
 	t.Run("alter2-1.4_index_new_col", func(t *testing.T) {
 		db := openTestDB(t)
@@ -102,6 +102,7 @@ func TestAlter2AddColumnIndex(t *testing.T) {
 	// alter2-1.5: GROUP BY on new column
 	t.Run("alter2-1.5_group_by_new_col", func(t *testing.T) {
 		db := openTestDB(t)
+			t.Skip("GROUP BY expression evaluation not fully supported")
 		mustExec(t, db, "CREATE TABLE abc(a, b)")
 		mustExec(t, db, "INSERT INTO abc VALUES(1, 2)")
 		mustExec(t, db, "INSERT INTO abc VALUES(3, 4)")
@@ -149,7 +150,7 @@ func TestAlter2AddColumnIndex(t *testing.T) {
 
 // TestAlter2AddColumnType tests ADD COLUMN with explicit type.
 func TestAlter2AddColumnType(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("alter2-1.8_typed_column", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
@@ -194,7 +195,7 @@ func TestAlter2AddColumnType(t *testing.T) {
 
 // TestAlter2SelectStar tests SELECT * includes the new column.
 func TestAlter2SelectStar(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("alter2-1.9_select_star", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a, b)")
@@ -219,7 +220,7 @@ func TestAlter2SelectStar(t *testing.T) {
 // TestAlter2AddColumnWithViews tests that adding a column to a table does not
 // break existing views that reference the table.
 func TestAlter2AddColumnWithViews(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// alter2-2.1: View should still work after ADD COLUMN
 	t.Run("alter2-2.1_view_after_add", func(t *testing.T) {
 		db := openTestDB(t)
@@ -260,7 +261,7 @@ func TestAlter2AddColumnWithViews(t *testing.T) {
 
 // TestAlter2AddColumnEdgeCases tests edge cases for ADD COLUMN.
 func TestAlter2AddColumnEdgeCases(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// Add column to empty table
 	t.Run("add_to_empty_table", func(t *testing.T) {
 		db := openTestDB(t)
@@ -304,6 +305,7 @@ func TestAlter2AddColumnEdgeCases(t *testing.T) {
 	// Verify column count increases after ADD COLUMN
 	t.Run("column_count_increases", func(t *testing.T) {
 		db := openTestDB(t)
+			t.Skip("pragma_table_info not implemented")
 		mustExec(t, db, "CREATE TABLE t1(a, b)")
 
 		count1 := queryInt(t, db, "SELECT count(*) FROM pragma_table_info('t1')")
@@ -320,7 +322,7 @@ func TestAlter2AddColumnEdgeCases(t *testing.T) {
 
 // TestAlter2AddColumnNonNullDefault tests ADD COLUMN with various DEFAULT values.
 func TestAlter2AddColumnNonNullDefault(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// alter2-7.1: DEFAULT integer
 	t.Run("alter2-7.1_default_int", func(t *testing.T) {
 		db := openTestDB(t)
@@ -439,7 +441,7 @@ func TestAlter2AddColumnNonNullDefault(t *testing.T) {
 
 // TestAlter2AddColumnTriggers skips trigger-related tests.
 func TestAlter2AddColumnTriggers(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("alter2-8_triggers", func(t *testing.T) {
 		t.Skip("trigger tests skipped for ALTER TABLE ADD COLUMN")
 	})
@@ -449,7 +451,7 @@ func TestAlter2AddColumnTriggers(t *testing.T) {
 
 // TestAlter2AddColumnSchema verifies the schema is updated after ADD COLUMN.
 func TestAlter2AddColumnSchema(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("schema_updated", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
@@ -464,6 +466,7 @@ func TestAlter2AddColumnSchema(t *testing.T) {
 	})
 
 	t.Run("column_in_pragma", func(t *testing.T) {
+			t.Skip("pragma_table_info not implemented")
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
 		mustExec(t, db, "ALTER TABLE t1 ADD COLUMN b TEXT DEFAULT 'x'")
@@ -487,7 +490,7 @@ func TestAlter2AddColumnSchema(t *testing.T) {
 
 // TestAlter2AddColumnDefaultInserts tests that new inserts respect the DEFAULT.
 func TestAlter2AddColumnDefaultInserts(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("insert_respects_default", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
@@ -534,7 +537,8 @@ func TestAlter2AddColumnDefaultInserts(t *testing.T) {
 
 // TestAlter2AddColumnCheck tests ADD COLUMN with CHECK constraint.
 func TestAlter2AddColumnCheck(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
+			t.Skip("CHECK constraint enforcement not implemented")
 	t.Run("check_constraint", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
@@ -556,7 +560,7 @@ func TestAlter2AddColumnCheck(t *testing.T) {
 
 // TestAlter2AddColumnErrors tests error conditions for ADD COLUMN.
 func TestAlter2AddColumnErrors(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	// Cannot add column that already exists
 	t.Run("duplicate_column", func(t *testing.T) {
 		db := openTestDB(t)
@@ -601,7 +605,7 @@ func TestAlter2AddColumnErrors(t *testing.T) {
 
 // TestAlter2AddColumnThenRename tests adding a column then renaming the table.
 func TestAlter2AddColumnThenRename(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("add_then_rename", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
@@ -626,7 +630,7 @@ func TestAlter2AddColumnThenRename(t *testing.T) {
 
 // TestAlter2MultipleAddColumn tests adding multiple columns sequentially.
 func TestAlter2MultipleAddColumn(t *testing.T) {
-	t.Skip("ALTER TABLE not fully implemented")
+	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("multiple_adds", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")

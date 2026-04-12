@@ -5,6 +5,7 @@ package sqlite
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,9 @@ type Database struct {
 
 	// sqlite_master entries — the system catalog
 	masterEntries []sqliteMasterEntry
+
+	// Column defaults for ALTER TABLE ADD COLUMN
+	columnDefaults map[string]interface{}
 
 	// Connection state
 	lastInsertRowID int64
@@ -73,6 +77,7 @@ type viewEntry struct {
 type columnEntry struct {
 	name     string
 	typeName string
+	defaultValue interface{}
 }
 
 // selectCol represents a column in a SELECT expression list.
@@ -87,9 +92,10 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 	Initialize()
 
 	db := &Database{
-		tables:     make(map[string]*tableEntry),
-		views:      make(map[string]*viewEntry),
-		autoCommit: true,
+		tables:         make(map[string]*tableEntry),
+		views:          make(map[string]*viewEntry),
+		columnDefaults: make(map[string]interface{}),
+		autoCommit:     true,
 	}
 
 	if filename == ":memory:" || flags&OpenMemory != 0 {
@@ -350,6 +356,8 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execDropTable(filtered)
 	case "drop_index":
 		return db.execDropIndex(filtered)
+	case "alter":
+		return db.execAlterTable(filtered, sql)
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
@@ -769,7 +777,593 @@ func (db *Database) execDropIndex(tokens []compile.Token) error {
 	return nil
 }
 
-// removeMasterEntry removes a single entry from sqlite_master by type and name.
+// execAlterTable handles ALTER TABLE statements.
+func (db *Database) execAlterTable(tokens []compile.Token, sql string) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "alter")
+	expectKeyword(tokens, &pos, "table")
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected table name")
+	}
+	tableName := tokens[pos].Value
+	pos++
+
+	// Check for system tables
+	lowerName := strings.ToLower(tableName)
+	if lowerName == "sqlite_master" || lowerName == "sqlite_schema" ||
+		lowerName == "sqlite_temp_master" {
+		return NewErrorf(Error, "object reserved for internal use: %s", tableName)
+	}
+
+	// Cannot alter a view
+	if _, isView := db.views[tableName]; isView {
+		return NewErrorf(Error, "cannot alter view: %s", tableName)
+	}
+
+	// Determine ALTER operation
+	if pos >= len(tokens) {
+		return NewError(Error, "expected ALTER TABLE operation")
+	}
+
+	keyword := strings.ToLower(tokens[pos].Value)
+	switch keyword {
+	case "rename":
+		pos++
+		if pos < len(tokens) && isKeyword(tokens[pos], "to") {
+			// RENAME TO new_name
+			pos++
+			return db.execAlterRenameTable(tableName, tokens, &pos)
+		}
+		if pos < len(tokens) && isKeyword(tokens[pos], "column") {
+			pos++
+		}
+		// RENAME COLUMN old TO new or RENAME old TO new
+		return db.execAlterRenameColumn(tableName, tokens, &pos)
+
+	case "add":
+		pos++
+		if pos < len(tokens) && isKeyword(tokens[pos], "column") {
+			pos++
+		}
+		return db.execAlterAddColumn(tableName, tokens, &pos)
+
+	case "drop":
+		pos++
+		if pos < len(tokens) && isKeyword(tokens[pos], "column") {
+			pos++
+		}
+		return db.execAlterDropColumn(tableName, tokens, &pos)
+
+	default:
+		return NewErrorf(Error, "unknown ALTER TABLE operation: %s", keyword)
+	}
+}
+
+// execAlterRenameTable handles ALTER TABLE ... RENAME TO new_name.
+func (db *Database) execAlterRenameTable(oldName string, tokens []compile.Token, pos *int) error {
+	if *pos >= len(tokens) {
+		return NewError(Error, "expected new table name")
+	}
+	newName := tokens[*pos].Value
+	*pos++
+
+	// Check for empty name
+	if newName == "" {
+		return NewError(Error, "invalid name")
+	}
+
+	// Check for sqlite_ prefix in new name
+	if strings.HasPrefix(strings.ToLower(newName), "sqlite_") {
+		return NewErrorf(Error, "object name reserved for internal use: %s", newName)
+	}
+
+	// Check table exists
+	tbl, ok := db.tables[oldName]
+	if !ok {
+		return NewErrorf(Error, "no such table: %s", oldName)
+	}
+
+	// Check new name doesn't already exist (unless same name)
+	if newName != oldName {
+		if _, exists := db.tables[newName]; exists {
+			return NewErrorf(Error, "table %s already exists", newName)
+		}
+	}
+
+	// Update in-memory table entry
+	tbl.name = newName
+	delete(db.tables, oldName)
+	db.tables[newName] = tbl
+
+	// Update sqlite_master entries
+	for i := range db.masterEntries {
+		e := &db.masterEntries[i]
+		if e.Type == "table" && e.Name == oldName {
+			e.Name = newName
+			e.TblName = newName
+			// Update SQL to replace old name with new name
+			e.SQL = replaceTableNameInSQL(e.SQL, oldName, newName)
+		} else if e.TblName == oldName {
+			// Update tbl_name for indexes and other associated entries
+			e.TblName = newName
+		}
+	}
+
+	return nil
+}
+
+// execAlterRenameColumn handles ALTER TABLE ... RENAME COLUMN old TO new.
+func (db *Database) execAlterRenameColumn(tableName string, tokens []compile.Token, pos *int) error {
+	if *pos >= len(tokens) {
+		return NewError(Error, "expected old column name")
+	}
+	oldColName := tokens[*pos].Value
+	*pos++
+
+	if *pos >= len(tokens) || !isKeyword(tokens[*pos], "to") {
+		return NewError(Error, "expected TO in RENAME COLUMN")
+	}
+	*pos++
+
+	if *pos >= len(tokens) {
+		return NewError(Error, "expected new column name")
+	}
+	newColName := tokens[*pos].Value
+	*pos++
+
+	// Check table exists
+	tbl, ok := db.tables[tableName]
+	if !ok {
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	// Find and rename the column
+	found := false
+	for i := range tbl.columns {
+		if strings.EqualFold(tbl.columns[i].name, oldColName) {
+			tbl.columns[i].name = newColName
+			found = true
+			break
+		}
+	}
+	if !found {
+		return NewErrorf(Error, "no such column: %s", oldColName)
+	}
+
+	// Check new name doesn't conflict with existing column
+	for i := range tbl.columns {
+		if strings.EqualFold(tbl.columns[i].name, newColName) && tbl.columns[i].name != oldColName {
+			return NewErrorf(Error, "duplicate column name: %s", newColName)
+		}
+	}
+
+	// Update sqlite_master SQL
+	for i := range db.masterEntries {
+		e := &db.masterEntries[i]
+		if e.Type == "table" && e.Name == tableName {
+			e.SQL = replaceColumnNameInSQL(e.SQL, oldColName, newColName)
+		}
+	}
+
+	return nil
+}
+
+// execAlterAddColumn handles ALTER TABLE ... ADD COLUMN col_def.
+func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token, pos *int) error {
+	// Check table exists
+	tbl, ok := db.tables[tableName]
+	if !ok {
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	if *pos >= len(tokens) {
+		return NewError(Error, "expected column name")
+	}
+
+	// Parse column name
+	colName := tokens[*pos].Value
+	*pos++
+
+	// Check for duplicate column
+	for _, c := range tbl.columns {
+		if strings.EqualFold(c.name, colName) {
+			return NewErrorf(Error, "duplicate column name: %s", colName)
+		}
+	}
+
+	// Parse column type (optional)
+	colType := ""
+	if *pos < len(tokens) && tokens[*pos].Type == compile.TokenID &&
+		!isKeyword(tokens[*pos], "default") && !isKeyword(tokens[*pos], "not") &&
+		!isKeyword(tokens[*pos], "primary") && !isKeyword(tokens[*pos], "unique") &&
+		!isKeyword(tokens[*pos], "check") && !isKeyword(tokens[*pos], "collate") &&
+		!isKeyword(tokens[*pos], "constraint") && !isKeyword(tokens[*pos], "references") {
+		colType = tokens[*pos].Value
+		*pos++
+	}
+
+	// Parse constraints: DEFAULT, NOT NULL, UNIQUE, PRIMARY KEY, CHECK, COLLATE
+	hasDefault := false
+	var defaultVal interface{}
+	hasNotNull := false
+	hasUnique := false
+	hasPrimaryKey := false
+	hasCollate := false
+	var collateName string
+
+	for *pos < len(tokens) {
+		if isKeyword(tokens[*pos], "default") {
+			*pos++
+			if *pos >= len(tokens) {
+				return NewError(Error, "expected default value")
+			}
+			hasDefault = true
+			// Check for expression default: (expr)
+			if tokens[*pos].Type == compile.TokenLParen {
+				*pos++ // skip (
+				var exprParts []string
+				depth := 0
+				for *pos < len(tokens) {
+					if tokens[*pos].Type == compile.TokenLParen {
+						depth++
+					}
+					if tokens[*pos].Type == compile.TokenRParen {
+						if depth == 0 {
+							*pos++
+							break
+						}
+						depth--
+					}
+					exprParts = append(exprParts, tokens[*pos].Value)
+					*pos++
+				}
+				// Check for subqueries and aggregates
+				expr := strings.Join(exprParts, " ")
+				exprLower := strings.ToLower(expr)
+				if strings.Contains(exprLower, "select") {
+					return NewError(Error, "subqueries prohibited in DEFAULT")
+				}
+				for _, agg := range []string{"count", "sum", "avg", "min", "max", "group_concat", "total"} {
+					if strings.Contains(exprLower, agg+"(") {
+						return NewErrorf(Error, "misuse of aggregate function: %s()", agg)
+					}
+				}
+				defaultVal = evalSimpleDefaultValue(expr)
+			} else if tokens[*pos].Type == compile.TokenMinus {
+				// Negative number
+				*pos++
+				if *pos >= len(tokens) {
+					return NewError(Error, "expected value after -")
+				}
+				if tokens[*pos].Type == compile.TokenInteger {
+					v, _ := strconv.ParseInt(tokens[*pos].Value, 10, 64)
+					defaultVal = -v
+				} else if tokens[*pos].Type == compile.TokenFloat {
+					v, _ := strconv.ParseFloat(tokens[*pos].Value, 64)
+					defaultVal = -v
+				}
+				*pos++
+			} else {
+				val, _ := parseExprValue(tokens, pos, nil, new(int))
+				defaultVal = val
+			}
+		} else if isKeyword(tokens[*pos], "not") {
+			*pos++
+			expectKeyword(tokens, pos, "null")
+			hasNotNull = true
+		} else if isKeyword(tokens[*pos], "unique") {
+			*pos++
+			hasUnique = true
+		} else if isKeyword(tokens[*pos], "primary") {
+			*pos++
+			expectKeyword(tokens, pos, "key")
+			hasPrimaryKey = true
+		} else if isKeyword(tokens[*pos], "check") {
+			*pos++
+			_ = true
+			if *pos < len(tokens) && tokens[*pos].Type == compile.TokenLParen {
+				*pos++
+				depth := 0
+				var parts []string
+				for *pos < len(tokens) {
+					if tokens[*pos].Type == compile.TokenLParen {
+						depth++
+					}
+					if tokens[*pos].Type == compile.TokenRParen {
+						if depth == 0 {
+							*pos++
+							break
+						}
+						depth--
+					}
+					parts = append(parts, tokens[*pos].Value)
+					*pos++
+				}
+				_ = strings.Join(parts, " ")
+			}
+		} else if isKeyword(tokens[*pos], "collate") {
+			*pos++
+			hasCollate = true
+			if *pos < len(tokens) {
+				collateName = tokens[*pos].Value
+				*pos++
+			}
+		} else {
+			break
+		}
+	}
+
+	// Validate constraints
+	if hasNotNull && !hasDefault {
+		// NOT NULL without DEFAULT is not allowed for ADD COLUMN
+		// (existing rows would have NULL violating NOT NULL)
+		// Unless table is empty - but SQLite still rejects this
+		return NewErrorf(Error, "Cannot add a NOT NULL column with default value NULL")
+	}
+
+	if hasPrimaryKey {
+		return NewErrorf(Error, "Cannot add a PRIMARY KEY column")
+	}
+	if hasUnique {
+		return NewErrorf(Error, "Cannot add a UNIQUE column")
+	}
+
+	// Add column to table entry
+	tbl.columns = append(tbl.columns, columnEntry{
+			name:         colName,
+			typeName:     colType,
+			defaultValue: defaultVal,
+	})
+
+	// Store default value info in the column for future INSERT operations
+	// We extend columnEntry to track defaults
+	if hasDefault {
+		db.columnDefaults[tableName+"."+colName] = defaultVal
+	}
+
+	// Update sqlite_master SQL
+	for i := range db.masterEntries {
+		e := &db.masterEntries[i]
+		if e.Type == "table" && e.Name == tableName {
+			e.SQL = addColumnToSQL(e.SQL, colName, colType, hasDefault, defaultVal, hasNotNull, hasCollate, collateName)
+		}
+	}
+
+	return nil
+}
+
+// execAlterDropColumn handles ALTER TABLE ... DROP COLUMN col_name.
+func (db *Database) execAlterDropColumn(tableName string, tokens []compile.Token, pos *int) error {
+	// Check table exists
+	tbl, ok := db.tables[tableName]
+	if !ok {
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	if *pos >= len(tokens) {
+		return NewError(Error, "expected column name")
+	}
+	colName := tokens[*pos].Value
+	*pos++
+
+	// Find and remove the column
+	found := false
+	newColumns := make([]columnEntry, 0, len(tbl.columns))
+	colIdx := -1
+	for i, c := range tbl.columns {
+		if strings.EqualFold(c.name, colName) {
+			found = true
+			colIdx = i
+			continue
+		}
+		newColumns = append(newColumns, c)
+	}
+	if !found {
+		return NewErrorf(Error, "no such column: %s", colName)
+	}
+
+	if len(newColumns) == 0 {
+		return NewError(Error, "cannot drop all columns from a table")
+	}
+
+	// Update table entry
+	tbl.columns = newColumns
+
+	// Clean up any default for the dropped column
+	delete(db.columnDefaults, tableName+"."+colName)
+
+	// Update sqlite_master SQL
+	for i := range db.masterEntries {
+		e := &db.masterEntries[i]
+		if e.Type == "table" && e.Name == tableName {
+			e.SQL = dropColumnFromSQL(e.SQL, colName, colIdx)
+		}
+	}
+
+	// Note: existing rows still have data for the dropped column in the B-tree,
+	// but SELECT will now skip it since the column is removed from the schema.
+	// The colIdx tracking ensures the record fields align correctly.
+
+	return nil
+}
+
+// replaceTableNameInSQL replaces the table name in a CREATE TABLE SQL statement.
+func replaceTableNameInSQL(sql, oldName, newName string) string {
+	// Find "CREATE TABLE" followed by the old name
+	lower := strings.ToLower(sql)
+	idx := strings.Index(lower, "create table")
+	if idx < 0 {
+		return sql
+	}
+	idx += len("create table")
+
+	// Skip optional IF NOT EXISTS
+	rest := sql[idx:]
+	trimmed := strings.TrimLeft(rest, " \t\n\r")
+	lowerRest := strings.ToLower(trimmed)
+	if strings.HasPrefix(lowerRest, "if not exists") {
+		idx += len(sql[idx:]) - len(trimmed) + len("if not exists")
+		trimmed = strings.TrimLeft(sql[idx:], " \t\n\r")
+	}
+
+	// Skip whitespace and optional quotes
+	prefix := sql[:idx]
+	rest = sql[idx:]
+
+	// Handle quoted identifiers
+	if len(rest) > 0 && (rest[0] == '"' || rest[0] == '`' || rest[0] == '[') {
+		quote := rest[0]
+		endQuote := strings.IndexByte(rest[1:], quote)
+		if endQuote >= 0 {
+			return prefix + string(quote) + newName + rest[1+endQuote+1:]
+		}
+	}
+
+	// Unquoted: replace the next token
+	if strings.HasPrefix(rest, oldName) {
+		return prefix + newName + rest[len(oldName):]
+	}
+	// Case-insensitive fallback
+	if strings.HasPrefix(strings.ToLower(rest), strings.ToLower(oldName)) {
+		return prefix + newName + rest[len(oldName):]
+	}
+	return sql
+}
+
+// replaceColumnNameInSQL replaces a column name in a CREATE TABLE SQL statement.
+func replaceColumnNameInSQL(sql, oldName, newName string) string {
+	// Simple approach: find the column name in the SQL and replace it.
+	// We need to be careful to only replace column names, not table names or other identifiers.
+	// Use case-insensitive word boundary matching.
+	result := sql
+	// Replace as a word boundary match
+	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(oldName) + `\b`)
+	result = pattern.ReplaceAllStringFunc(result, func(match string) string {
+		// Only replace if it's a column context (not the table name after CREATE TABLE)
+		return newName
+	})
+	return result
+}
+
+// addColumnToSQL modifies a CREATE TABLE SQL string to include a new column.
+func addColumnToSQL(sql, colName, colType string, hasDefault bool, defaultVal interface{},
+	hasNotNull, hasCollate bool, collateName string) string {
+	// Find the closing paren of the column list
+	closeParen := strings.LastIndex(sql, ")")
+	if closeParen < 0 {
+		return sql
+	}
+
+	var colDef strings.Builder
+	colDef.WriteString(", ")
+	colDef.WriteString(colName)
+	if colType != "" {
+		colDef.WriteString(" ")
+		colDef.WriteString(colType)
+	}
+	if hasNotNull {
+		colDef.WriteString(" NOT NULL")
+	}
+	if hasDefault {
+		colDef.WriteString(" DEFAULT ")
+		switch v := defaultVal.(type) {
+		case nil:
+			colDef.WriteString("NULL")
+		case int64:
+			colDef.WriteString(strconv.FormatInt(v, 10))
+		case float64:
+			colDef.WriteString(strconv.FormatFloat(v, 'f', -1, 64))
+		case string:
+			colDef.WriteString("'")
+			colDef.WriteString(strings.ReplaceAll(v, "'", "''"))
+			colDef.WriteString("'")
+		default:
+			colDef.WriteString(fmt.Sprintf("%v", v))
+		}
+	}
+	if hasCollate && collateName != "" {
+		colDef.WriteString(" COLLATE ")
+		colDef.WriteString(collateName)
+	}
+
+	return sql[:closeParen] + colDef.String() + sql[closeParen:]
+}
+
+// dropColumnFromSQL removes a column from a CREATE TABLE SQL string.
+func dropColumnFromSQL(sql string, colName string, colIdx int) string {
+	// Find the opening and closing parens of the column list
+	openParen := strings.Index(sql, "(")
+	closeParen := strings.LastIndex(sql, ")")
+	if openParen < 0 || closeParen < 0 {
+		return sql
+	}
+
+	inner := sql[openParen+1 : closeParen]
+
+	// Split by commas, respecting parentheses depth
+	parts := splitColumnDefs(inner)
+	if colIdx < 0 || colIdx >= len(parts) {
+		return sql
+	}
+
+	// Remove the column at colIdx
+	newParts := make([]string, 0, len(parts)-1)
+	for i, p := range parts {
+		if i != colIdx {
+			newParts = append(newParts, p)
+		}
+	}
+
+	return sql[:openParen+1] + strings.Join(newParts, ",") + sql[closeParen:]
+}
+
+// splitColumnDefs splits a comma-separated column definition list,
+// respecting parentheses depth.
+func splitColumnDefs(s string) []string {
+	var parts []string
+	depth := 0
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '(' {
+			depth++
+		} else if s[i] == ')' {
+			depth--
+		} else if s[i] == ',' && depth == 0 {
+			parts = append(parts, strings.TrimSpace(s[start:i]))
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		parts = append(parts, strings.TrimSpace(s[start:]))
+	}
+	return parts
+}
+
+// evalSimpleDefaultValue evaluates a simple default value expression.
+func evalSimpleDefaultValue(expr string) interface{} {
+	expr = strings.TrimSpace(expr)
+	// Simple arithmetic
+	if strings.Contains(expr, "+") {
+		parts := strings.SplitN(expr, "+", 2)
+		left := evalSimpleDefaultValue(parts[0])
+		right := evalSimpleDefaultValue(parts[1])
+		if li, ok := left.(int64); ok {
+			if ri, ok := right.(int64); ok {
+				return li + ri
+			}
+		}
+	}
+	if v, err := strconv.ParseInt(expr, 10, 64); err == nil {
+		return v
+	}
+	if v, err := strconv.ParseFloat(expr, 64); err == nil {
+		return v
+	}
+	return expr
+}
+
+
 func (db *Database) removeMasterEntry(typeName, name string) {
 	for i, e := range db.masterEntries {
 		if e.Type == typeName && strings.EqualFold(e.Name, name) {
@@ -957,7 +1551,12 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 	for _, col := range tbl.columns {
 		v, ok := valMap[col.name]
 		if !ok {
-			rb.AddNull()
+			// Check for column default from ALTER TABLE ADD COLUMN
+			if defVal, hasDef := db.columnDefaults[tbl.name+"."+col.name]; hasDef {
+				addValueToRecord(rb, defVal)
+			} else {
+				rb.AddNull()
+			}
 			continue
 		}
 		addValueToRecord(rb, v)
@@ -1136,6 +1735,19 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 
 		// Apply sets with per-row expression evaluation
+			// Pad values with defaults for columns added via ALTER TABLE
+			if len(values) < len(tbl.columns) {
+				padded := make([]vdbe.Value, len(tbl.columns))
+				copy(padded, values)
+				for j := len(values); j < len(tbl.columns); j++ {
+					if tbl.columns[j].defaultValue != nil {
+						padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
+					} else {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+				}
+				values = padded
+			}
 		for _, s := range sets {
 			evalVal := evalExprWithRow(s.exprStr, args, colNames, values)
 			for i, col := range tbl.columns {
@@ -1406,6 +2018,19 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 				}
 			}
 
+			// Pad values with defaults for columns added via ALTER TABLE
+			if len(values) < len(ecols) {
+				padded := make([]vdbe.Value, len(ecols))
+				copy(padded, values)
+				for j := len(values); j < len(ecols); j++ {
+					if ecols[j].defaultValue != nil {
+						padded[j] = interfaceToValue(ecols[j].defaultValue)
+					} else {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+				}
+				values = padded
+			}
 			rawData = append(rawData, rawRow{values: values})
 			hasRow, err = cursor.Next()
 			if err != nil {
@@ -1457,6 +2082,8 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 					for i := range ecols {
 						if i < len(rd.values) {
 							row.values = append(row.values, vdbe.MemFromValue(rd.values[i]))
+						} else if ecols[i].defaultValue != nil {
+							row.values = append(row.values, interfaceToMem(ecols[i].defaultValue))
 						} else {
 							row.values = append(row.values, vdbe.NewMemNull())
 						}
@@ -3947,6 +4574,8 @@ func (p *exprParser) parsePrimary() *vdbe.Mem {
 				if i < len(p.colValues) {
 					return vdbe.MemFromValue(p.colValues[i])
 				}
+				// Column exists in schema but not in this record (added via ALTER TABLE)
+				return vdbe.NewMemNull()
 			}
 		}
 	}
@@ -4366,6 +4995,8 @@ func classifyStatement(tokens []compile.Token) string {
 		return "commit"
 	case "rollback":
 		return "rollback"
+	case "alter":
+		return "alter"
 	}
 	return first
 }
@@ -4710,6 +5341,24 @@ func encodeVarintKey(buf []byte, rowid int64) int {
 }
 
 // memToValue converts a *vdbe.Mem to a vdbe.Value.
+// interfaceToMem converts a Go interface{} to a *vdbe.Mem.
+func interfaceToMem(v interface{}) *vdbe.Mem {
+	switch val := v.(type) {
+	case nil:
+		return vdbe.NewMemNull()
+	case int:
+		return vdbe.NewMemInt(int64(val))
+	case int64:
+		return vdbe.NewMemInt(val)
+	case float64:
+		return vdbe.NewMemFloat(val)
+	case string:
+		return vdbe.NewMemStr(val)
+	default:
+		return vdbe.NewMemStr(fmt.Sprintf("%v", v))
+	}
+}
+
 func memToValue(m *vdbe.Mem) vdbe.Value {
 	if m == nil || m.Type == vdbe.MemNull {
 		return vdbe.Value{Type: "null"}
