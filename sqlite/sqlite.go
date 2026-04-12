@@ -2517,7 +2517,7 @@ func valueToMem(v interface{}) *vdbe.Mem {
 	case float64:
 		return vdbe.NewMemFloat(val)
 	case string:
-		return vdbe.NewMemText(val)
+		return vdbe.NewMemStr(val)
 	case []byte:
 		return vdbe.NewMemBlob(val)
 	default:
