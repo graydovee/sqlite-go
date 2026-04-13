@@ -2043,16 +2043,28 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 			}
 		}
 
-		// Execute
+		// Execute (protected by recover to fall back to hack layer on errors)
 		ctx := context.Background()
-		for {
-			hasRow, err := vm.Step(ctx)
-			if err != nil {
-				return nil, NewErrorf(Error, "execute: %s", err)
+		var stepErr error
+		recoverErr := func() (r interface{}) {
+			defer func() {
+				if r != nil {
+					stepErr = fmt.Errorf("panic during VDBE execution: %v", r)
+				}
+			}()
+			for {
+				hasRow, err := vm.Step(ctx)
+				if err != nil {
+					stepErr = err
+					return nil
+				}
+				if !hasRow {
+					return nil
+				}
 			}
-			if !hasRow {
-				break
-			}
+		}()
+		if recoverErr != nil {
+			return nil, fmt.Errorf("compile pipeline error: %w", stepErr)
 		}
 
 		allRows = append(allRows, rows...)
@@ -2115,15 +2127,10 @@ func exprText(e *compile.Expr) string {
 }
 
 // querySingle executes a SELECT and collects results.
+// NOTE: compile pipeline for SELECT FROM table needs cursor wrapper.
+// All SELECTs go through hack layer until that's fixed.
 func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, error) {
-	// Try the compile pipeline first
-	rs, err := db.executeQuery(sql, args)
-	if err == nil {
-		return rs, nil
-	}
-	// Fall back to hack layer for features not yet supported by compile pipeline
-	_ = err
-
+	// Go through hack layer for now
 	tokens := compile.Tokenize(sql)
 	filtered := filterTokens(tokens)
 	if len(filtered) == 0 {
