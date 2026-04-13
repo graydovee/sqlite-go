@@ -100,7 +100,6 @@ func TestFkey2Deferred(t *testing.T) {
 
 // TestFkey2Cascade tests CASCADE actions.
 func TestFkey2Cascade(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE ab(a PRIMARY KEY, b)")
@@ -132,7 +131,6 @@ func TestFkey2Cascade(t *testing.T) {
 
 // TestFkey2RecursiveCascade tests that FK CASCADE actions recurse even without recursive triggers.
 func TestFkey2RecursiveCascade(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, `CREATE TABLE t1(
