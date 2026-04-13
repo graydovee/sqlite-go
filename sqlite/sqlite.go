@@ -76,6 +76,7 @@ type fkInfo struct {
 	refColumns []string
 	onDelete   string
 	onUpdate   string
+	deferred   bool // DEFERRABLE INITIALLY DEFERRED
 }
 
 type tableEntry struct {
@@ -291,6 +292,15 @@ func (db *Database) Commit() error {
 	}
 	if !db.inTx {
 		return NewError(Error, "cannot commit - no transaction is active")
+	}
+
+	// Check all deferred FK constraints before committing
+	if err := db.fkCheckDeferredConstraints(); err != nil {
+		db.bt.Rollback()
+		db.pgr.Rollback()
+		db.inTx = false
+		db.autoCommit = true
+		return err
 	}
 
 	if err := db.bt.Commit(); err != nil {

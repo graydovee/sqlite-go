@@ -183,6 +183,10 @@ func (db *Database) fkCheckInsert(tbl *tableEntry, valMap map[string]interface{}
 	}
 	for i := range tbl.fks {
 		fk := &tbl.fks[i]
+		// Deferred FKs are checked at COMMIT time when in an explicit transaction
+		if fk.deferred && db.inTx {
+			continue
+		}
 
 		// FK mismatch checks (must happen before all-NULL check)
 		refTbl := db.fkLookupTable(fk.refTable)
@@ -287,6 +291,11 @@ func (db *Database) fkCheckDelete(parentTableName string, oldRowValues map[strin
 
 	referencingFKs := db.fkGetAllReferencingFKs(parentTableName)
 	for _, fk := range referencingFKs {
+		// Deferred FKs are checked at COMMIT time when in an explicit transaction
+		if fk.deferred && db.inTx {
+			continue
+		}
+
 		// Find the child table that owns this FK
 		var childTbl *tableEntry
 		for _, tbl := range db.tables {
@@ -579,6 +588,11 @@ func (db *Database) fkCheckUpdate(parentTableName string, oldRowValues, newRowVa
 
 	referencingFKs := db.fkGetAllReferencingFKs(parentTableName)
 	for _, fk := range referencingFKs {
+		// Deferred FKs are checked at COMMIT time when in explicit transaction
+		if fk.deferred && db.inTx {
+			continue
+		}
+
 		var childTbl *tableEntry
 		for _, tbl := range db.tables {
 			for j := range tbl.fks {
@@ -880,4 +894,84 @@ func (db *Database) updateRowByID(tbl *tableEntry, rowID int64, newVals map[stri
 	keyBuf := make([]byte, 9)
 	keyLen := encodeVarintKey(keyBuf, rowID)
 	return db.bt.Insert(cursor, keyBuf[:keyLen], rb.Build(), btree.RowID(rowID), btree.SeekFound)
+}
+
+// fkCheckDeferredConstraints verifies all deferred FK constraints at COMMIT time.
+// It scans every child table row for deferred FKs and checks that parent rows exist.
+func (db *Database) fkCheckDeferredConstraints() error {
+	if !db.foreignKeys {
+		return nil
+	}
+	for _, tbl := range db.tables {
+		for i := range tbl.fks {
+			fk := &tbl.fks[i]
+			if !fk.deferred {
+				continue
+			}
+
+			refTbl := db.fkLookupTable(fk.refTable)
+			if refTbl == nil {
+				return NewErrorf(ConstraintFK, "foreign key mismatch")
+			}
+			refCols := db.fkResolveRefCols(fk)
+
+			cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), false)
+			if err != nil {
+				return err
+			}
+
+			hasRow, err := cursor.First()
+			if err != nil {
+				cursor.Close()
+				return err
+			}
+			for hasRow {
+				data, derr := cursor.Data()
+				if derr != nil {
+					hasRow, _ = cursor.Next()
+					continue
+				}
+				values, perr := vdbe.ParseRecord(data)
+				if perr != nil {
+					hasRow, _ = cursor.Next()
+					continue
+				}
+
+				// Build value map
+				valMap := make(map[string]interface{})
+				for j, col := range tbl.columns {
+					if j < len(values) {
+						valMap[col.name] = fkValueToInterface(values[j])
+					}
+				}
+
+				// All-NULL FK columns satisfy the constraint
+				allNull := true
+				for _, col := range fk.columns {
+					if valMap[col] != nil {
+						allNull = false
+						break
+					}
+				}
+				if allNull {
+					hasRow, _ = cursor.Next()
+					continue
+				}
+
+				found, err := db.fkRowExists(refTbl, refCols, fk.columns, valMap)
+				if err != nil {
+					cursor.Close()
+					return err
+				}
+				if !found {
+					cursor.Close()
+					return NewErrorf(ConstraintFK, "FOREIGN KEY constraint failed")
+				}
+
+				hasRow, _ = cursor.Next()
+			}
+			cursor.Close()
+		}
+	}
+	return nil
 }
