@@ -50,6 +50,9 @@ type Database struct {
 	// Transaction state
 	inTx bool
 
+	// Foreign key enforcement
+	foreignKeys bool
+
 	// CTE temporary data (populated during WITH query execution)
 	cteData map[string]*cteTable
 }
@@ -65,21 +68,21 @@ type sqliteMasterEntry struct {
 }
 
 // tableEntry stores metadata about a table.
-// FKConstraint represents a single-column foreign key constraint.
-type FKConstraint struct {
-	Col      string // local column
-	RefTable string // referenced table
-	RefCol   string // referenced column (empty = parent PK)
-	OnDelete string // ON DELETE action: CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT
-	OnUpdate string // ON UPDATE action: CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT
+// fkInfo stores metadata about a single foreign key constraint.
+type fkInfo struct {
+	id         int
+	columns    []string
+	refTable   string
+	refColumns []string
+	onDelete   string
+	onUpdate   string
 }
 
 type tableEntry struct {
 	name      string
 	rootPage  int
 	columns   []columnEntry
-	fk        []FKConstraint
-	checks    []string // CHECK constraint expressions
+	fks       []fkInfo
 }
 
 // viewEntry stores metadata about a view.
@@ -90,9 +93,10 @@ type viewEntry struct {
 
 // columnEntry stores metadata about a column.
 type columnEntry struct {
-	name     string
-	typeName string
+	name         string
+	typeName     string
 	defaultValue interface{}
+	isPK         bool
 }
 
 // selectCol represents a column in a SELECT expression list.
@@ -395,13 +399,12 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		err := db.Rollback()
 		db.mu.Lock()
 		return err
-	case "pragma":
-		// Minimal PRAGMA support — accept but ignore
-		return nil
 	case "select":
 		// SELECT via Exec just runs and discards results
 		_, err := db.querySingle(sql, args)
 		return err
+	case "pragma":
+		return db.execPragma(filtered)
 	default:
 		return NewErrorf(Error, "unsupported SQL statement: %s", stmtType)
 	}
@@ -439,170 +442,132 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		return NewErrorf(Error, "table %s already exists", tableName)
 	}
 
-	// Parse column definitions and table-level constraints
+	// Parse column definitions
 	var columns []columnEntry
-	var fkConstraints []FKConstraint
-	var checkConstraints []string
 	// Track which columns have UNIQUE or PRIMARY KEY for auto-index creation
 	var uniqueCols []string
+	var tableFKs []fkInfo
 	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
 		pos++ // skip (
 		for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
-			// Table-level FOREIGN KEY constraint
-			if isKeyword(tokens[pos], "foreign") {
-				pos++ // FOREIGN
-				if pos < len(tokens) && isKeyword(tokens[pos], "key") {
-					pos++ // KEY
-				}
-				// Local column list: (col)
+			// Check for table-level FOREIGN KEY constraint
+			if isKeyword(tokens[pos], "foreign") && pos+1 < len(tokens) && isKeyword(tokens[pos+1], "key") {
+				pos += 2
+				fk := fkInfo{id: len(tableFKs)}
+				// Local columns
 				if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
-					pos++ // (
-				}
-				var localCols []string
-				for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
-					if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
-						localCols = append(localCols, tokens[pos].Value)
-					}
 					pos++
-				}
-				if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
-					pos++ // )
-				}
-				fkStart := len(fkConstraints)
-				// REFERENCES parent(col)
-				if pos < len(tokens) && isKeyword(tokens[pos], "references") {
-					pos++
-					refTable := ""
-					if pos < len(tokens) {
-						refTable = tokens[pos].Value
+					for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+						if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+							fk.columns = append(fk.columns, tokens[pos].Value)
+						}
 						pos++
 					}
-					var refCols []string
+					if pos < len(tokens) {
+						pos++ // skip )
+					}
+				}
+				// REFERENCES
+				if pos < len(tokens) && isKeyword(tokens[pos], "references") {
+					pos++
+					if pos < len(tokens) {
+						fk.refTable = tokens[pos].Value
+						pos++
+					}
 					if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
-						pos++ // (
+						pos++
 						for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
 							if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
-								refCols = append(refCols, tokens[pos].Value)
+								fk.refColumns = append(fk.refColumns, tokens[pos].Value)
 							}
 							pos++
 						}
-						if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
-							pos++ // )
+						if pos < len(tokens) {
+							pos++ // skip )
 						}
-					}
-					// Create one FKConstraint per local column
-					for i, lc := range localCols {
-						fk := FKConstraint{Col: lc, RefTable: refTable}
-						if i < len(refCols) {
-							fk.RefCol = refCols[i]
-						}
-						fkConstraints = append(fkConstraints, fk)
 					}
 				}
-				// Parse ON DELETE / ON UPDATE clauses
-				var onDelete, onUpdate string
+				// ON DELETE / ON UPDATE
 				for pos < len(tokens) &&
 					tokens[pos].Type != compile.TokenComma &&
 					tokens[pos].Type != compile.TokenRParen {
-					if isKeyword(tokens[pos], "on") {
-						pos++ // ON
-						if pos < len(tokens) && isKeyword(tokens[pos], "delete") {
-							pos++ // DELETE
-							if pos < len(tokens) {
-								onDelete = strings.ToUpper(tokens[pos].Value)
-								pos++
-							}
-						} else if pos < len(tokens) && isKeyword(tokens[pos], "update") {
-							pos++ // UPDATE
-							if pos < len(tokens) {
-								onUpdate = strings.ToUpper(tokens[pos].Value)
-								pos++
-							}
+					if isKeyword(tokens[pos], "on") && pos+2 < len(tokens) {
+						action := strings.ToUpper(tokens[pos+2].Value)
+						target := &fk.onDelete
+						if isKeyword(tokens[pos+1], "update") {
+							target = &fk.onUpdate
 						}
-					} else {
+						*target = action
+						pos += 3
+						// Handle multi-word actions: SET NULL, SET DEFAULT, NO ACTION
+						if pos < len(tokens) && (*target == "SET" || *target == "NO") {
+							*target += " " + strings.ToUpper(tokens[pos].Value)
+							pos++
+						}
+						continue
+					}
+					pos++
+				}
+				if fk.onDelete == "" {
+					fk.onDelete = "NO ACTION"
+				}
+				if fk.onUpdate == "" {
+					fk.onUpdate = "NO ACTION"
+				}
+				tableFKs = append(tableFKs, fk)
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+					pos++
+				}
+				continue
+			}
+
+				// Check for table-level constraints
+				if isKeyword(tokens[pos], "primary") && pos+1 < len(tokens) && isKeyword(tokens[pos+1], "key") {
+					// Parse table-level PRIMARY KEY (col, col, ...)
+					pos += 2 // skip PRIMARY KEY
+					if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+						pos++ // skip (
+						for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+							if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+								pkColName := tokens[pos].Value
+								// Mark the column as PK
+								for i := range columns {
+									if strings.EqualFold(columns[i].name, pkColName) {
+										columns[i].isPK = true
+										break
+									}
+								}
+							}
+							pos++
+						}
+						if pos < len(tokens) {
+							pos++ // skip )
+						}
+					}
+					if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
 						pos++
 					}
-				}
-				// Apply actions to the FK constraints just created
-				for i := fkStart; i < len(fkConstraints); i++ {
-					fkConstraints[i].OnDelete = onDelete
-					fkConstraints[i].OnUpdate = onUpdate
-				}
-				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
-					pos++
-				}
-				continue
-			}
-
-			// Table-level CONSTRAINT name FOREIGN KEY ...
-			if isKeyword(tokens[pos], "constraint") {
-				pos++ // CONSTRAINT
-				if pos < len(tokens) {
-					pos++ // constraint name
-				}
-				// If next is FOREIGN KEY, loop back to handle it
-				if pos < len(tokens) && isKeyword(tokens[pos], "foreign") {
 					continue
-				}
-				// Otherwise skip to next comma/rparen
-				for pos < len(tokens) &&
-					tokens[pos].Type != compile.TokenComma &&
-					tokens[pos].Type != compile.TokenRParen {
-					pos++
-				}
-				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
-					pos++
-				}
-				continue
-			}
-
-			// Table-level CHECK — capture expression
-			if isKeyword(tokens[pos], "check") {
-				pos++ // CHECK
-				if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
-					pos++ // (
+				} else if isKeyword(tokens[pos], "unique") ||
+					isKeyword(tokens[pos], "check") || isKeyword(tokens[pos], "constraint") {
+					// Skip to next comma or close paren
 					depth := 0
-					var parts []string
 					for pos < len(tokens) {
 						if tokens[pos].Type == compile.TokenLParen {
 							depth++
 						} else if tokens[pos].Type == compile.TokenRParen {
 							if depth == 0 {
-								pos++
 								break
 							}
 							depth--
-						}
-						parts = append(parts, tokens[pos].Value)
-						pos++
-					}
-					checkConstraints = append(checkConstraints, strings.Join(parts, " "))
-				}
-				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
-					pos++
-				}
-				continue
-			}
-
-			// Table-level PRIMARY KEY/UNIQUE — skip them
-			if isKeyword(tokens[pos], "primary") || isKeyword(tokens[pos], "unique") {
-				depth := 0
-				for pos < len(tokens) {
-					if tokens[pos].Type == compile.TokenLParen {
-						depth++
-					} else if tokens[pos].Type == compile.TokenRParen {
-						if depth == 0 {
+						} else if tokens[pos].Type == compile.TokenComma && depth == 0 {
+							pos++
 							break
 						}
-						depth--
-					} else if tokens[pos].Type == compile.TokenComma && depth == 0 {
 						pos++
-						break
 					}
-					pos++
+					continue
 				}
-				continue
-			}
 
 			colName := tokens[pos].Value
 			pos++
@@ -613,67 +578,115 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				pos++
 			}
 
-			// Parse column constraints (PRIMARY KEY, NOT NULL, UNIQUE, REFERENCES, etc.)
+			// Parse constraints (PRIMARY KEY, NOT NULL, UNIQUE, REFERENCES, DEFAULT, etc.)
 			colHasUnique := false
 			colHasPK := false
+			var colDefault interface{}
+			var colFKs []fkInfo
 			for pos < len(tokens) &&
 				tokens[pos].Type != compile.TokenComma &&
 				tokens[pos].Type != compile.TokenRParen {
 				if isKeyword(tokens[pos], "unique") {
 					colHasUnique = true
-				}
-				if isKeyword(tokens[pos], "primary") {
+					pos++
+				} else if isKeyword(tokens[pos], "primary") {
 					colHasPK = true
-				}
-				// Column-level REFERENCES: parse and store as FK constraint
-				if isKeyword(tokens[pos], "references") {
-					pos++ // REFERENCES
-					refTable := ""
+					pos++
+				} else if isKeyword(tokens[pos], "references") {
+					pos++
+					// Column-level REFERENCES
+					fk := fkInfo{
+						id:      len(tableFKs) + len(colFKs),
+						columns: []string{colName},
+					}
 					if pos < len(tokens) {
-						refTable = tokens[pos].Value
+						fk.refTable = tokens[pos].Value
 						pos++
 					}
-					refCol := ""
 					if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
-						pos++ // (
-						if pos < len(tokens) && (tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword) {
-							refCol = tokens[pos].Value
-							pos++
-						}
-						if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
-							pos++ // )
-						}
-					}
-					fkConstraints = append(fkConstraints, FKConstraint{
-						Col:      colName,
-						RefTable: refTable,
-						RefCol:   refCol,
-					})
-					continue
-				}
-				// Column-level ON DELETE / ON UPDATE
-				if isKeyword(tokens[pos], "on") {
-					pos++ // ON
-					if pos < len(tokens) && isKeyword(tokens[pos], "delete") {
-						pos++ // DELETE
-						if pos < len(tokens) {
-							if len(fkConstraints) > 0 {
-								fkConstraints[len(fkConstraints)-1].OnDelete = strings.ToUpper(tokens[pos].Value)
+						pos++
+						for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+							if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+								fk.refColumns = append(fk.refColumns, tokens[pos].Value)
 							}
 							pos++
 						}
-					} else if pos < len(tokens) && isKeyword(tokens[pos], "update") {
-						pos++ // UPDATE
 						if pos < len(tokens) {
-							if len(fkConstraints) > 0 {
-								fkConstraints[len(fkConstraints)-1].OnUpdate = strings.ToUpper(tokens[pos].Value)
-							}
-							pos++
+							pos++ // skip )
 						}
 					}
-					continue
+					// ON DELETE / ON UPDATE
+					for pos < len(tokens) &&
+						tokens[pos].Type != compile.TokenComma &&
+						tokens[pos].Type != compile.TokenRParen &&
+						!isKeyword(tokens[pos], "references") {
+						if isKeyword(tokens[pos], "on") && pos+2 < len(tokens) {
+							action := strings.ToUpper(tokens[pos+2].Value)
+							target := &fk.onDelete
+							if isKeyword(tokens[pos+1], "update") {
+								target = &fk.onUpdate
+							}
+							*target = action
+							pos += 3
+							// Handle multi-word actions: SET NULL, SET DEFAULT, NO ACTION
+							if pos < len(tokens) && (*target == "SET" || *target == "NO") {
+								*target += " " + strings.ToUpper(tokens[pos].Value)
+								pos++
+							}
+							continue
+						}
+						// DEFERRABLE and other modifiers - skip
+						pos++
+					}
+					if fk.onDelete == "" {
+						fk.onDelete = "NO ACTION"
+					}
+					if fk.onUpdate == "" {
+						fk.onUpdate = "NO ACTION"
+					}
+					colFKs = append(colFKs, fk)
+				} else if isKeyword(tokens[pos], "default") {
+					pos++
+					// Capture default value
+					if pos < len(tokens) {
+						if tokens[pos].Type == compile.TokenLParen {
+							// Expression default: skip for now
+							depth := 1
+							pos++
+							for pos < len(tokens) && depth > 0 {
+								if tokens[pos].Type == compile.TokenLParen {
+									depth++
+								} else if tokens[pos].Type == compile.TokenRParen {
+									depth--
+								}
+								if depth > 0 {
+									pos++
+								}
+							}
+							if pos < len(tokens) {
+								pos++
+							}
+						} else {
+							// Simple default value
+							dv := tokens[pos].Value
+							pos++
+							if v, err := strconv.ParseInt(dv, 10, 64); err == nil {
+								colDefault = v
+							} else if v, err := strconv.ParseFloat(dv, 64); err == nil {
+								colDefault = v
+							} else {
+								colDefault = dv
+							}
+						}
+					}
+				} else if isKeyword(tokens[pos], "not") || isKeyword(tokens[pos], "null") ||
+					isKeyword(tokens[pos], "collate") || isKeyword(tokens[pos], "autoincrement") ||
+					isKeyword(tokens[pos], "deferrable") || isKeyword(tokens[pos], "initially") ||
+					isKeyword(tokens[pos], "deferred") || isKeyword(tokens[pos], "immediate") {
+					pos++
+				} else {
+					pos++
 				}
-				pos++
 			}
 
 			// UNIQUE and PRIMARY KEY both create an auto-index, but only one
@@ -681,7 +694,8 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				uniqueCols = append(uniqueCols, colName)
 			}
 
-			columns = append(columns, columnEntry{name: colName, typeName: colType})
+			columns = append(columns, columnEntry{name: colName, typeName: colType, isPK: colHasPK, defaultValue: colDefault})
+			tableFKs = append(tableFKs, colFKs...)
 
 			if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
 				pos++
@@ -730,8 +744,7 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		name:     tableName,
 		rootPage: int(rootPage),
 		columns:  columns,
-		fk:       fkConstraints,
-		checks:   checkConstraints,
+		fks:      tableFKs,
 	}
 	db.rootPageMap[int(rootPage)] = db.tables[tableName]
 
@@ -892,6 +905,36 @@ func (db *Database) execDropTable(tokens []compile.Token) error {
 			return nil
 		}
 		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	// Check FK constraints: can't drop a table that is referenced by FK constraints with data
+	if db.foreignKeys {
+		childTable := ""
+		for _, tbl := range db.tables {
+			for _, fk := range tbl.fks {
+				if strings.EqualFold(fk.refTable, tableName) {
+					childTable = tbl.name
+					break
+				}
+			}
+			if childTable != "" {
+				break
+			}
+		}
+		if childTable != "" {
+			// Check if the child table has any rows
+			childTbl := db.tables[childTable]
+			if childTbl != nil {
+				cursor, err := db.bt.Cursor(btree.PageNumber(childTbl.rootPage), false)
+				if err == nil {
+					hasRow, _ := cursor.First()
+					cursor.Close()
+					if hasRow {
+						return NewErrorf(ConstraintFK, "FOREIGN KEY constraint failed")
+					}
+				}
+			}
+		}
 	}
 
 	tbl := db.tables[tableName]
@@ -1719,8 +1762,13 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 	// Parse: INSERT INTO table [(cols)] VALUES (vals) or INSERT INTO table VALUES vals
 	pos := 0
 	expectKeyword(tokens, &pos, "insert")
+	isReplace := false
 	if pos < len(tokens) && isKeyword(tokens[pos], "or") {
-		pos += 2 // skip OR ...
+		pos++
+		if pos < len(tokens) && isKeyword(tokens[pos], "replace") {
+			isReplace = true
+		}
+		pos++
 	}
 	expectKeyword(tokens, &pos, "into")
 
@@ -1806,8 +1854,14 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 			}
 		}
 
-		if err := db.insertRow(tbl, colList, values, args); err != nil {
-			return err
+		if isReplace {
+			if err := db.handleReplace(tbl, colList, values, args); err != nil {
+				return err
+			}
+		} else {
+			if err := db.insertRow(tbl, colList, values, args); err != nil {
+				return err
+			}
 		}
 
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
@@ -1856,40 +1910,6 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 		}
 	}
 
-	// Check FK constraints: verify parent row exists
-	if err := db.checkFKInsert(tbl, valMap); err != nil {
-		if needCommit {
-			db.bt.Rollback()
-			db.pgr.Rollback()
-		}
-		return err
-	}
-
-	// Check CHECK constraints
-	if len(tbl.checks) > 0 {
-		colNames := make([]string, len(tbl.columns))
-		checkVals := make([]vdbe.Value, len(tbl.columns))
-		for i, col := range tbl.columns {
-			colNames[i] = col.name
-			if v, ok := valMap[col.name]; ok && v != nil {
-				checkVals[i] = interfaceToValue(v)
-			} else {
-				checkVals[i] = vdbe.Value{Type: "null"}
-			}
-		}
-		for _, check := range tbl.checks {
-			result := evalExprWithRow(check, nil, colNames, checkVals)
-			if result != nil && !isTruthy(result) {
-				if needCommit {
-					db.bt.Rollback()
-					db.pgr.Rollback()
-				}
-				return NewErrorf(Error, "CHECK constraint failed: %s", check)
-			}
-		}
-	}
-
-	// Build the record
 	rb := vdbe.NewRecordBuilder()
 	for _, col := range tbl.columns {
 		v, ok := valMap[col.name]
@@ -1936,6 +1956,19 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 	db.changes = 1
 	db.totalChanges++
 
+	// FK constraint check (after insert so self-referencing rows work)
+	if err := db.fkCheckInsert(tbl, valMap); err != nil {
+		// Rollback: delete the just-inserted row
+		db.deleteRowByID(tbl, newRowID)
+		db.changes = 0
+		db.totalChanges--
+		if needCommit {
+			db.bt.Rollback()
+			db.pgr.Rollback()
+		}
+		return err
+	}
+
 	if needCommit {
 		if err := db.bt.Commit(); err != nil {
 			return NewErrorf(Error, "commit btree: %s", err)
@@ -1945,602 +1978,6 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 		}
 	}
 
-	return nil
-}
-
-// checkConstraints evaluates all CHECK constraints on a table for the given row values.
-// Returns an error if any CHECK constraint is violated.
-func (db *Database) checkConstraints(tbl *tableEntry, values []vdbe.Value) error {
-	if len(tbl.checks) == 0 {
-		return nil
-	}
-	colNames := make([]string, len(tbl.columns))
-	for i, col := range tbl.columns {
-		colNames[i] = col.name
-	}
-	for _, check := range tbl.checks {
-		result := evalExprWithRow(check, nil, colNames, values)
-		if result != nil && !isTruthy(result) {
-			return NewErrorf(Error, "CHECK constraint failed: %s", check)
-		}
-	}
-	return nil
-}
-
-// checkFKInsert verifies that for each FK constraint on the table, a matching
-// parent row exists. Single-column FK only. NULL FK values skip the check.
-func (db *Database) checkFKInsert(tbl *tableEntry, valMap map[string]interface{}) error {
-	for _, fk := range tbl.fk {
-		// NULL FK columns satisfy the constraint (SQLite behavior)
-		if valMap[fk.Col] == nil {
-			continue
-		}
-
-		parentTbl, ok := db.tables[fk.RefTable]
-		if !ok {
-			return NewErrorf(Error, "foreign key mismatch - \"%s\" references nonexistent table \"%s\"",
-				tbl.name, fk.RefTable)
-		}
-
-		// Determine parent column: explicit ref col, or first PK column, or first column
-		refCol := fk.RefCol
-		if refCol == "" {
-			for _, c := range parentTbl.columns {
-				refCol = c.name
-				break
-			}
-		}
-		if refCol == "" {
-			continue
-		}
-
-		// Scan parent table for matching row
-		cursor, err := db.bt.Cursor(btree.PageNumber(parentTbl.rootPage), false)
-		if err != nil {
-			return NewErrorf(Error, "fk check: %s", err)
-		}
-		found := false
-		hasRow, _ := cursor.First()
-		for hasRow {
-			data, derr := cursor.Data()
-			if derr != nil {
-				break
-			}
-			vals, perr := vdbe.ParseRecord(data)
-			if perr != nil {
-				break
-			}
-			// Find the refCol index in parent table
-			for i, c := range parentTbl.columns {
-				if c.name == refCol && i < len(vals) {
-					if fkValuesEqual(vals[i], valMap[fk.Col]) {
-						found = true
-					}
-					break
-				}
-			}
-			if found {
-				break
-			}
-			hasRow, _ = cursor.Next()
-		}
-		cursor.Close()
-
-		if !found {
-			return NewErrorf(ConstraintFK, "foreign key constraint failed")
-		}
-	}
-	return nil
-}
-
-// fkValuesEqual compares a vdbe.Value with a Go interface value for FK matching.
-func fkValuesEqual(v vdbe.Value, want interface{}) bool {
-	switch {
-	case v.Type == "null" && want == nil:
-		return true
-	case v.Type == "null" || want == nil:
-		return false
-	case v.Type == "int":
-		switch w := want.(type) {
-		case int64:
-			return v.IntVal == w
-		case int:
-			return v.IntVal == int64(w)
-		case float64:
-			return float64(v.IntVal) == w
-		}
-	case v.Type == "float":
-		switch w := want.(type) {
-		case float64:
-			return v.FloatVal == w
-		case int64:
-			return v.FloatVal == float64(w)
-		case int:
-			return v.FloatVal == float64(w)
-		}
-	case v.Type == "text":
-		if s, ok := want.(string); ok {
-			return string(v.Bytes) == s
-		}
-	}
-	return fmt.Sprintf("%v", v) == fmt.Sprintf("%v", want)
-}
-
-// valueToInterface converts a vdbe.Value to a Go interface{} for FK matching.
-func valueToInterface(v vdbe.Value) interface{} {
-	switch v.Type {
-	case "int":
-		return v.IntVal
-	case "float":
-		return v.FloatVal
-	case "text":
-		return string(v.Bytes)
-	case "null":
-		return nil
-	}
-	return nil
-}
-
-// cascadeDelete handles ON DELETE actions for FK constraints when a parent row is deleted.
-// It supports CASCADE (recursive delete), RESTRICT/NO ACTION (error), SET NULL, and SET DEFAULT.
-func (db *Database) cascadeDelete(parentTbl *tableEntry, parentValues []vdbe.Value) error {
-	for _, tbl := range db.tables {
-		for _, fk := range tbl.fk {
-			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
-				continue
-			}
-			action := strings.ToUpper(fk.OnDelete)
-			if action == "" {
-				action = "NO ACTION"
-			}
-			// Skip CASCADE if action is something we don't handle yet
-			if action != "CASCADE" && action != "RESTRICT" && action != "NO ACTION" &&
-				action != "SET NULL" && action != "SET DEFAULT" {
-				continue
-			}
-			refCol := fk.RefCol
-			if refCol == "" {
-				for _, c := range parentTbl.columns {
-					refCol = c.name
-					break
-				}
-			}
-			if refCol == "" {
-				continue
-			}
-			var parentKey interface{}
-			for i, c := range parentTbl.columns {
-				if strings.EqualFold(c.name, refCol) && i < len(parentValues) {
-					parentKey = valueToInterface(parentValues[i])
-					break
-				}
-			}
-			if parentKey == nil {
-				continue
-			}
-			// Collect matching child rows
-			type matchEntry struct {
-				vals  []vdbe.Value
-				rowid int64
-			}
-			var matches []matchEntry
-			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
-			if err != nil {
-				return NewErrorf(Error, "cascade delete cursor: %s", err)
-			}
-			hasRow, err := childCursor.First()
-			if err != nil {
-				childCursor.Close()
-				return err
-			}
-			for hasRow {
-				data, err := childCursor.Data()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				childVals, err := vdbe.ParseRecord(data)
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				if len(childVals) < len(tbl.columns) {
-					padded := make([]vdbe.Value, len(tbl.columns))
-					copy(padded, childVals)
-					for j := len(childVals); j < len(tbl.columns); j++ {
-						padded[j] = vdbe.Value{Type: "null"}
-					}
-					childVals = padded
-				}
-				for i, c := range tbl.columns {
-					if strings.EqualFold(c.name, fk.Col) && i < len(childVals) {
-						if fkValuesEqual(childVals[i], parentKey) {
-							matches = append(matches, matchEntry{vals: childVals, rowid: int64(childCursor.RowID())})
-						}
-						break
-					}
-				}
-				hasRow, err = childCursor.Next()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-			}
-			childCursor.Close()
-			if len(matches) == 0 {
-				continue
-			}
-			switch action {
-			case "RESTRICT", "NO ACTION":
-				return NewErrorf(Error, "foreign key constraint failed")
-			case "CASCADE":
-				// Recursively cascade-delete children first
-				for _, m := range matches {
-					if err := db.cascadeDelete(tbl, m.vals); err != nil {
-						return err
-					}
-				}
-				// Now delete the matching rows (re-scan since recursive deletes may have modified the tree)
-				delCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
-				if err != nil {
-					return err
-				}
-				hasRow, err = delCursor.First()
-				if err != nil {
-					delCursor.Close()
-					return err
-				}
-				for hasRow {
-					data, err := delCursor.Data()
-					if err != nil {
-						delCursor.Close()
-						return err
-					}
-					childVals, err := vdbe.ParseRecord(data)
-					if err != nil {
-						delCursor.Close()
-						return err
-					}
-					if len(childVals) < len(tbl.columns) {
-						padded := make([]vdbe.Value, len(tbl.columns))
-						copy(padded, childVals)
-						for j := len(childVals); j < len(tbl.columns); j++ {
-							padded[j] = vdbe.Value{Type: "null"}
-						}
-						childVals = padded
-					}
-					match := false
-					for i, c := range tbl.columns {
-						if strings.EqualFold(c.name, fk.Col) && i < len(childVals) {
-							if fkValuesEqual(childVals[i], parentKey) {
-								match = true
-							}
-							break
-						}
-					}
-					if match {
-						if err := db.bt.Delete(delCursor); err != nil {
-							delCursor.Close()
-							return err
-						}
-						hasRow, err = delCursor.First()
-						if err != nil {
-							delCursor.Close()
-							return err
-						}
-					} else {
-						hasRow, err = delCursor.Next()
-						if err != nil {
-							delCursor.Close()
-							return err
-						}
-					}
-				}
-				delCursor.Close()
-			case "SET NULL":
-				if err := db.cascadeSetColumn(tbl, fk, parentKey, vdbe.Value{Type: "null"}); err != nil {
-					return err
-				}
-			case "SET DEFAULT":
-				var defVal vdbe.Value
-				fkColIdx := -1
-				for i, c := range tbl.columns {
-					if strings.EqualFold(c.name, fk.Col) {
-						fkColIdx = i
-						break
-					}
-				}
-				if fkColIdx >= 0 && fkColIdx < len(tbl.columns) && tbl.columns[fkColIdx].defaultValue != nil {
-					defVal = interfaceToValue(tbl.columns[fkColIdx].defaultValue)
-				} else {
-					defVal = vdbe.Value{Type: "null"}
-				}
-				if err := db.cascadeSetColumn(tbl, fk, parentKey, defVal); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// cascadeSetColumn updates FK column values in child rows matching parentKey.
-// Used by SET NULL and SET DEFAULT ON DELETE actions.
-func (db *Database) cascadeSetColumn(tbl *tableEntry, fk FKConstraint, parentKey interface{}, newVal vdbe.Value) error {
-	fkColIdx := -1
-	for i, c := range tbl.columns {
-		if strings.EqualFold(c.name, fk.Col) {
-			fkColIdx = i
-			break
-		}
-	}
-	if fkColIdx < 0 {
-		return nil
-	}
-	cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
-	if err != nil {
-		return err
-	}
-	hasRow, err := cursor.First()
-	if err != nil {
-		cursor.Close()
-		return err
-	}
-	for hasRow {
-		data, err := cursor.Data()
-		if err != nil {
-			cursor.Close()
-			return err
-		}
-		rowid := cursor.RowID()
-		childVals, err := vdbe.ParseRecord(data)
-		if err != nil {
-			cursor.Close()
-			return err
-		}
-		if len(childVals) < len(tbl.columns) {
-			padded := make([]vdbe.Value, len(tbl.columns))
-			copy(padded, childVals)
-			for j := len(childVals); j < len(tbl.columns); j++ {
-				padded[j] = vdbe.Value{Type: "null"}
-			}
-			childVals = padded
-		}
-		if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], parentKey) {
-			childVals[fkColIdx] = newVal
-			rb := vdbe.NewRecordBuilder()
-			for _, v := range childVals {
-				addValueToRecordFromValue(rb, v)
-			}
-			newData := rb.Build()
-			keyBuf := make([]byte, 9)
-			keyLen := encodeVarintKey(keyBuf, int64(rowid))
-			if err := db.bt.Insert(cursor, keyBuf[:keyLen], newData, btree.RowID(rowid), btree.SeekFound); err != nil {
-				cursor.Close()
-				return err
-			}
-		}
-		hasRow, err = cursor.Next()
-		if err != nil {
-			cursor.Close()
-			return err
-		}
-	}
-	cursor.Close()
-	return nil
-}
-
-// cascadeUpdate propagates ON UPDATE CASCADE to child FK columns.
-// It first validates all CHECK constraints (recursively) before applying any changes.
-func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
-	if err := db.cascadeUpdateCheck(parentTbl, oldVals, newVals); err != nil {
-		return err
-	}
-	return db.cascadeUpdateApply(parentTbl, oldVals, newVals)
-}
-
-// cascadeUpdateCheck validates that all cascade updates would satisfy CHECK constraints.
-// Read-only: does not modify any data.
-func (db *Database) cascadeUpdateCheck(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
-	for _, tbl := range db.tables {
-		for _, fk := range tbl.fk {
-			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
-				continue
-			}
-			if !strings.EqualFold(fk.OnUpdate, "CASCADE") {
-				continue
-			}
-			refCol := fk.RefCol
-			if refCol == "" {
-				for _, c := range parentTbl.columns {
-					refCol = c.name
-					break
-				}
-			}
-			refIdx := -1
-			for i, c := range parentTbl.columns {
-				if strings.EqualFold(c.name, refCol) {
-					refIdx = i
-					break
-				}
-			}
-			if refIdx < 0 || refIdx >= len(oldVals) || refIdx >= len(newVals) {
-				continue
-			}
-			oldKey := valueToInterface(oldVals[refIdx])
-			if oldKey == nil {
-				continue
-			}
-			if fkValuesEqual(oldVals[refIdx], valueToInterface(newVals[refIdx])) {
-				continue
-			}
-			fkColIdx := -1
-			for i, c := range tbl.columns {
-				if strings.EqualFold(c.name, fk.Col) {
-					fkColIdx = i
-					break
-				}
-			}
-			if fkColIdx < 0 {
-				continue
-			}
-			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
-			if err != nil {
-				return NewErrorf(Error, "cascade update check cursor: %s", err)
-			}
-			hasRow, err := childCursor.First()
-			if err != nil {
-				childCursor.Close()
-				return err
-			}
-			for hasRow {
-				data, err := childCursor.Data()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				childVals, err := vdbe.ParseRecord(data)
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				if len(childVals) < len(tbl.columns) {
-					padded := make([]vdbe.Value, len(tbl.columns))
-					copy(padded, childVals)
-					for j := len(childVals); j < len(tbl.columns); j++ {
-						padded[j] = vdbe.Value{Type: "null"}
-					}
-					childVals = padded
-				}
-				if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], oldKey) {
-					newChildVals := make([]vdbe.Value, len(childVals))
-					copy(newChildVals, childVals)
-					newChildVals[fkColIdx] = newVals[refIdx]
-					if err := db.checkConstraints(tbl, newChildVals); err != nil {
-						childCursor.Close()
-						return err
-					}
-					if err := db.cascadeUpdateCheck(tbl, childVals, newChildVals); err != nil {
-						childCursor.Close()
-						return err
-					}
-				}
-				hasRow, err = childCursor.Next()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-			}
-			childCursor.Close()
-		}
-	}
-	return nil
-}
-
-// cascadeUpdateApply applies cascade updates to child FK columns.
-// Should only be called after cascadeUpdateCheck has passed.
-func (db *Database) cascadeUpdateApply(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
-	for _, tbl := range db.tables {
-		for _, fk := range tbl.fk {
-			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
-				continue
-			}
-			if !strings.EqualFold(fk.OnUpdate, "CASCADE") {
-				continue
-			}
-			refCol := fk.RefCol
-			if refCol == "" {
-				for _, c := range parentTbl.columns {
-					refCol = c.name
-					break
-				}
-			}
-			refIdx := -1
-			for i, c := range parentTbl.columns {
-				if strings.EqualFold(c.name, refCol) {
-					refIdx = i
-					break
-				}
-			}
-			if refIdx < 0 || refIdx >= len(oldVals) || refIdx >= len(newVals) {
-				continue
-			}
-			oldKey := valueToInterface(oldVals[refIdx])
-			if oldKey == nil {
-				continue
-			}
-			if fkValuesEqual(oldVals[refIdx], valueToInterface(newVals[refIdx])) {
-				continue
-			}
-			fkColIdx := -1
-			for i, c := range tbl.columns {
-				if strings.EqualFold(c.name, fk.Col) {
-					fkColIdx = i
-					break
-				}
-			}
-			if fkColIdx < 0 {
-				continue
-			}
-			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
-			if err != nil {
-				return NewErrorf(Error, "cascade update cursor: %s", err)
-			}
-			hasRow, err := childCursor.First()
-			if err != nil {
-				childCursor.Close()
-				return err
-			}
-			for hasRow {
-				data, err := childCursor.Data()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				rowid := childCursor.RowID()
-				childVals, err := vdbe.ParseRecord(data)
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-				if len(childVals) < len(tbl.columns) {
-					padded := make([]vdbe.Value, len(tbl.columns))
-					copy(padded, childVals)
-					for j := len(childVals); j < len(tbl.columns); j++ {
-						padded[j] = vdbe.Value{Type: "null"}
-					}
-					childVals = padded
-				}
-				if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], oldKey) {
-					oldChildVals := make([]vdbe.Value, len(childVals))
-					copy(oldChildVals, childVals)
-					childVals[fkColIdx] = newVals[refIdx]
-					rb := vdbe.NewRecordBuilder()
-					for _, v := range childVals {
-						addValueToRecordFromValue(rb, v)
-					}
-					newData := rb.Build()
-					keyBuf := make([]byte, 9)
-					keyLen := encodeVarintKey(keyBuf, int64(rowid))
-					if err := db.bt.Insert(childCursor, keyBuf[:keyLen], newData, btree.RowID(rowid), btree.SeekFound); err != nil {
-						childCursor.Close()
-						return err
-					}
-					// Recursively cascade to children of this child
-					if err := db.cascadeUpdateApply(tbl, oldChildVals, childVals); err != nil {
-						childCursor.Close()
-						return err
-					}
-				}
-				hasRow, err = childCursor.Next()
-				if err != nil {
-					childCursor.Close()
-					return err
-				}
-			}
-			childCursor.Close()
-		}
-	}
 	return nil
 }
 
@@ -2583,9 +2020,15 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 	if err != nil {
 		return NewErrorf(Error, "open cursor: %s", err)
 	}
-	defer cursor.Close()
 
 	var count int64
+	// Collect rows to delete first (needed for FK check)
+	type deleteRow struct {
+		rowID   int64
+		rowVals map[string]interface{}
+	}
+	var rowsToDelete []deleteRow
+
 	hasRow, err := cursor.First()
 	if err != nil {
 		return err
@@ -2622,16 +2065,48 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 				continue
 			}
 		}
-		// ON DELETE CASCADE: delete child rows before deleting parent
-		if err := db.cascadeDelete(tbl, values); err != nil {
+		rowVals := make(map[string]interface{})
+		for i, col := range tbl.columns {
+			if i < len(values) {
+				rowVals[col.name] = fkValueToInterface(values[i])
+			}
+		}
+		rowsToDelete = append(rowsToDelete, deleteRow{rowID: int64(cursor.RowID()), rowVals: rowVals})
+		hasRow, err = cursor.Next()
+		if err != nil {
 			return err
 		}
-		if err := db.bt.Delete(cursor); err != nil {
+	}
+	cursor.Close()
+
+	// Delete rows first, then check FK constraints (so self-referencing works)
+	for _, row := range rowsToDelete {
+		if err := db.deleteRowByID(tbl, row.rowID); err != nil {
 			return err
 		}
 		count++
-		hasRow, err = cursor.First() // restart from beginning after delete
-		if err != nil {
+	}
+	// After all deletes, check FK constraints
+	// (We've already deleted, so self-referencing rows are gone)
+	// If we need to rollback, re-insert deleted rows
+	for _, row := range rowsToDelete {
+		if err := db.fkCheckDelete(tableName, row.rowVals); err != nil {
+			// Rollback: re-insert already-deleted rows
+			for i := len(rowsToDelete) - 1; i >= 0; i-- {
+				rb := vdbe.NewRecordBuilder()
+				for _, col := range tbl.columns {
+					addValueToRecord(rb, rowsToDelete[i].rowVals[col.name])
+				}
+				cursor2, cerr := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
+				if cerr != nil {
+					break
+				}
+				keyBuf := make([]byte, 9)
+				keyLen := encodeVarintKey(keyBuf, rowsToDelete[i].rowID)
+				newRowID := rowsToDelete[i].rowID
+				db.bt.Insert(cursor2, keyBuf[:keyLen], rb.Build(), btree.RowID(newRowID), btree.SeekNotFound)
+				cursor2.Close()
+			}
 			return err
 		}
 	}
@@ -2709,10 +2184,10 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 
 	// Collect all rows first, then apply updates to avoid cursor invalidation
 	type updateEntry struct {
-		rowid   int64
-		newData []byte
-		oldVals []vdbe.Value
-		newVals []vdbe.Value
+		rowid      int64
+		newData    []byte
+		oldVals    map[string]interface{}
+		newVals    map[string]interface{}
 	}
 	var updates []updateEntry
 
@@ -2737,10 +2212,6 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		if err != nil {
 			return err
 		}
-
-		// Save original values for cascade before they are modified
-		oldVals := make([]vdbe.Value, len(values))
-		copy(oldVals, values)
 
 		// Apply sets with per-row expression evaluation
 			// Pad values with defaults for columns added via ALTER TABLE
@@ -2767,6 +2238,13 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 				continue
 			}
 		}
+		// Save old values before applying SETs (for FK checks)
+		oldVals := make(map[string]interface{})
+		for i, col := range tbl.columns {
+			if i < len(values) {
+				oldVals[col.name] = fkValueToInterface(values[i])
+			}
+		}
 		for _, s := range sets {
 			evalVal := evalExprWithRow(s.exprStr, args, colNames, values)
 			for i, col := range tbl.columns {
@@ -2785,20 +2263,22 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 		newData := rb.Build()
 
-		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData, oldVals: oldVals, newVals: values})
+		// Capture new values (old values were saved before SETs)
+
+		newVals := make(map[string]interface{})
+		for i, col := range tbl.columns {
+			if i < len(values) {
+				newVals[col.name] = fkValueToInterface(values[i])
+			}
+		}
+
+		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData, oldVals: oldVals, newVals: newVals})
 		hasRow, err = cursor.Next()
 		if err != nil {
 			return err
 		}
 	}
 
-
-		// Validate all cascade updates before applying any changes
-		for _, upd := range updates {
-			if err := db.cascadeUpdateCheck(tbl, upd.oldVals, upd.newVals); err != nil {
-				return err
-			}
-		}
 
 		// Now apply all updates
 		var count int64
@@ -2809,11 +2289,19 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 			if err := db.bt.Insert(cursor, keyBuf[:keyLen], upd.newData, btree.RowID(upd.rowid), btree.SeekFound); err != nil {
 				return err
 			}
-			// ON UPDATE CASCADE: propagate key changes to child rows
-			if err := db.cascadeUpdateApply(tbl, upd.oldVals, upd.newVals); err != nil {
+			count++
+
+			// FK check after write (so self-referencing works)
+			if err := db.fkCheckUpdate(tableName, upd.oldVals, upd.newVals); err != nil {
+				// Rollback this update
+				db.updateRowByID(tbl, upd.rowid, upd.oldVals)
 				return err
 			}
-			count++
+			if err := db.fkCheckInsert(tbl, upd.newVals); err != nil {
+				// Rollback this update
+				db.updateRowByID(tbl, upd.rowid, upd.oldVals)
+				return err
+			}
 		}
 
 		db.changes = count
@@ -7359,6 +6847,8 @@ func classifyStatement(tokens []compile.Token) string {
 		return "rollback"
 	case "alter":
 		return "alter"
+	case "pragma":
+		return "pragma"
 	}
 	return first
 }

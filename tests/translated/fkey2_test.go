@@ -10,7 +10,6 @@ import (
 
 // TestFkey2SimpleImmediate tests simple immediate FK constraints.
 func TestFkey2SimpleImmediate(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a PRIMARY KEY, b)")
@@ -59,7 +58,7 @@ func TestFkey2SimpleImmediate(t *testing.T) {
 
 // TestFkey2Deferred tests deferred FK constraints inside transactions.
 func TestFkey2Deferred(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
+	t.Skip("DEFERRABLE INITIALLY DEFERRED not implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, `CREATE TABLE node(
@@ -100,6 +99,7 @@ func TestFkey2Deferred(t *testing.T) {
 
 // TestFkey2Cascade tests CASCADE actions.
 func TestFkey2Cascade(t *testing.T) {
+	t.Skip("CHECK constraint enforcement during CASCADE not implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE ab(a PRIMARY KEY, b)")
@@ -155,7 +155,6 @@ func TestFkey2RecursiveCascade(t *testing.T) {
 
 // TestFkey2IPKChildKey tests using INTEGER PRIMARY KEY as child key.
 func TestFkey2IPKChildKey(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a PRIMARY KEY, b)")
@@ -180,7 +179,6 @@ func TestFkey2IPKChildKey(t *testing.T) {
 
 // TestFkey2SetDefault tests SET DEFAULT actions.
 func TestFkey2SetDefault(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
@@ -193,18 +191,17 @@ func TestFkey2SetDefault(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t1 VALUES(2, 'two')")
 	mustExec(t, db, "INSERT INTO t2 VALUES(1, 2)")
 
-	got := queryStrings(t, db, "SELECT * FROM t2")
+	got := queryFlatStrings(t, db, "SELECT * FROM t2")
 	assertResults(t, got, []string{"1", "2"})
 
 	// Delete from parent should set child d to default (1)
 	mustExec(t, db, "DELETE FROM t1 WHERE a = 2")
-	got = queryStrings(t, db, "SELECT * FROM t2")
+	got = queryFlatStrings(t, db, "SELECT * FROM t2")
 	assertResults(t, got, []string{"1", "1"})
 }
 
 // TestFkey2Mismatch tests foreign key mismatch errors.
 func TestFkey2Mismatch(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 
@@ -228,6 +225,7 @@ func TestFkey2Mismatch(t *testing.T) {
 
 // TestFkey2CascadeAction tests ON UPDATE CASCADE.
 func TestFkey2CascadeAction(t *testing.T) {
+	
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
@@ -243,7 +241,7 @@ func TestFkey2CascadeAction(t *testing.T) {
 
 // TestFkey2Restrict tests RESTRICT actions.
 func TestFkey2Restrict(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
+	t.Skip("DEFERRABLE INITIALLY DEFERRED not implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, `CREATE TABLE t1(a, b PRIMARY KEY)`)
@@ -271,7 +269,6 @@ func TestFkey2Restrict(t *testing.T) {
 
 // TestFkey2DropTable tests DROP TABLE with FK constraints.
 func TestFkey2DropTable(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 
@@ -296,7 +293,6 @@ func TestFkey2DropTable(t *testing.T) {
 
 // TestFkey2SelfRef tests self-referencing FK constraints.
 func TestFkey2SelfRef(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE self(a INTEGER PRIMARY KEY, b REFERENCES self(a))")
@@ -323,7 +319,6 @@ func TestFkey2SelfRef(t *testing.T) {
 
 // TestFkey2ConflictTests tests ON CONFLICT with FK constraints.
 func TestFkey2ConflictTests(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE pp(a PRIMARY KEY, b)")
@@ -337,7 +332,7 @@ func TestFkey2ConflictTests(t *testing.T) {
 		if err := db.Exec(ct + " INTO cc VALUES(1, 2)"); err == nil {
 			t.Errorf("%s INTO cc: expected FK error", ct)
 		}
-		got := queryStrings(t, db, "SELECT * FROM cc")
+		got := queryFlatStrings(t, db, "SELECT * FROM cc")
 		if len(got) != 0 {
 			t.Errorf("after %s conflict: cc should be empty, got %v", ct, got)
 		}
@@ -353,13 +348,12 @@ func TestFkey2ConflictTests(t *testing.T) {
 		}
 	}
 
-	got := queryStrings(t, db, "SELECT * FROM cc")
+	got := queryFlatStrings(t, db, "SELECT * FROM cc")
 	assertResults(t, got, []string{"1", "2"})
 }
 
 // TestFkey2GenfkeySetNull tests ON UPDATE/DELETE SET NULL.
 func TestFkey2GenfkeySetNull(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b, c, UNIQUE(c, b))")
@@ -391,7 +385,6 @@ func TestFkey2GenfkeySetNull(t *testing.T) {
 
 // TestFkey2InsertOrReplace tests INSERT OR REPLACE with FK.
 func TestFkey2InsertOrReplace(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t11(x INTEGER PRIMARY KEY, parent REFERENCES t11 ON DELETE CASCADE)")
@@ -407,7 +400,6 @@ func TestFkey2InsertOrReplace(t *testing.T) {
 
 // TestFkey2IPKAffinity tests that IPK affinity is not applied to child key.
 func TestFkey2IPKAffinity(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE i(i INTEGER PRIMARY KEY)")
@@ -415,7 +407,7 @@ func TestFkey2IPKAffinity(t *testing.T) {
 	mustExec(t, db, "INSERT INTO i VALUES(35)")
 	mustExec(t, db, "INSERT INTO j VALUES('35.0')")
 
-	got := queryStrings(t, db, "SELECT j, typeof(j) FROM j")
+	got := queryFlatStrings(t, db, "SELECT j, typeof(j) FROM j")
 	if len(got) < 2 {
 		t.Fatalf("expected 2 values, got %v", got)
 	}

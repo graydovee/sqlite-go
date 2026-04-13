@@ -71,7 +71,6 @@ func TestFkey1_1(t *testing.T) {
 
 // TestFkey1_2 tests creating and dropping multiple tables with FK references.
 func TestFkey1_2(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	// fkey1-2.1: Create tables referencing t4, then drop them in various order
 	t.Run("fkey1-2.1", func(t *testing.T) {
 		db := openTestDB(t)
@@ -96,7 +95,7 @@ func TestFkey1_2(t *testing.T) {
 
 // TestFkey1_3 tests PRAGMA foreign_key_list output.
 func TestFkey1_3(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
+	t.Skip("PRAGMA foreign_key_list not implemented")
 	// fkey1-3.1: Single-column references with column-level FK
 	t.Run("fkey1-3.1", func(t *testing.T) {
 		db := openTestDB(t)
@@ -183,7 +182,7 @@ func TestFkey1_3(t *testing.T) {
 
 // TestFkey1_4 tests foreign key handling with quoted identifiers.
 func TestFkey1_4(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
+	t.Skip("Quoted identifier handling not fully implemented")
 	// fkey1-4.0: Quoted identifiers with "xx" prefix
 	t.Run("fkey1-4.0", func(t *testing.T) {
 		db := openTestDB(t)
@@ -344,7 +343,7 @@ func TestFkey1_5(t *testing.T) {
 
 // TestFkey1_6 tests that foreign key processing is not fooled by partial indexes.
 func TestFkey1_6(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
+	t.Skip("Partial indexes (WHERE clause) not implemented")
 	// 6.0: Create parent table with partial unique index and child table
 	t.Run("fkey1-6.0", func(t *testing.T) {
 		db := openTestDB(t)
