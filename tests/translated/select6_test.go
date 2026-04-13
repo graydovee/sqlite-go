@@ -28,7 +28,7 @@ func TestSelect6BasicSubquery(t *testing.T) {
 	setupSelect6Tables(t, db)
 
 	t.Run("1.0 - DISTINCT y", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT not supported")
+
 		got := queryFlat(t, db, "SELECT DISTINCT y FROM t1 ORDER BY y")
 		want := []interface{}{int64(1), int64(2), int64(3), int64(4), int64(5)}
 		if !equalValues(got, want) {
@@ -37,7 +37,8 @@ func TestSelect6BasicSubquery(t *testing.T) {
 	})
 
 	t.Run("1.2 - count(*) subquery", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT not supported")
+		t.Skip("subquery in FROM clause not supported")
+
 		got := queryFlat(t, db, "SELECT count(*) FROM (SELECT y FROM t1)")
 		if len(got) != 1 || !isNumericEqual(got[0], 20) {
 			t.Errorf("got %v, want 20", got)
@@ -45,7 +46,8 @@ func TestSelect6BasicSubquery(t *testing.T) {
 	})
 
 	t.Run("1.3 - count(*) DISTINCT subquery", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT not supported")
+		t.Skip("subquery in FROM clause not supported")
+
 		got := queryFlat(t, db, "SELECT count(*) FROM (SELECT DISTINCT y FROM t1)")
 		if len(got) != 1 || !isNumericEqual(got[0], 5) {
 			t.Errorf("got %v, want 5", got)

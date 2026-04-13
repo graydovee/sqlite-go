@@ -28,7 +28,7 @@ func TestSelect5Distinct(t *testing.T) {
 	setupSelect5Tables(t, db)
 
 	t.Run("1.0 - DISTINCT y ORDER BY y", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT not supported")
+
 		got := queryFlat(t, db, "SELECT DISTINCT y FROM t1 ORDER BY y")
 		want := []interface{}{int64(5), int64(6), int64(7), int64(8), int64(9), int64(10)}
 		if !equalValues(got, want) {

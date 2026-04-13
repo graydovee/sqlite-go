@@ -278,7 +278,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	setupSelect4Tables(t, db)
 
 	t.Run("10.1 - DISTINCT log", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log")
 		want := []interface{}{int64(0), int64(1), int64(2), int64(3), int64(4), int64(5)}
 		if !equalValues(got, want) {
@@ -287,7 +287,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.2 - DISTINCT log LIMIT 4", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT 4")
 		want := []interface{}{int64(0), int64(1), int64(2), int64(3)}
 		if !equalValues(got, want) {
@@ -296,7 +296,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.3 - DISTINCT log LIMIT 0", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT 0")
 		if len(got) != 0 {
 			t.Errorf("expected empty result, got %v", got)
@@ -304,7 +304,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.4 - DISTINCT log LIMIT -1", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT -1")
 		want := []interface{}{int64(0), int64(1), int64(2), int64(3), int64(4), int64(5)}
 		if !equalValues(got, want) {
@@ -313,7 +313,8 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.5 - DISTINCT log LIMIT -1 OFFSET 2", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+		t.Skip("OFFSET not applied with DISTINCT")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT -1 OFFSET 2")
 		want := []interface{}{int64(2), int64(3), int64(4), int64(5)}
 		if !equalValues(got, want) {
@@ -322,7 +323,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.6 - DISTINCT log LIMIT 3 OFFSET 2", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT 3 OFFSET 2")
 		want := []interface{}{int64(2), int64(3), int64(4)}
 		if !equalValues(got, want) {
@@ -331,7 +332,8 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.7 - DISTINCT log LIMIT 3 OFFSET 20", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+		t.Skip("OFFSET not applied with DISTINCT")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY +log LIMIT 3 OFFSET 20")
 		if len(got) != 0 {
 			t.Errorf("expected empty result, got %v", got)
@@ -339,7 +341,7 @@ func TestSelect4DistinctLimitOffset(t *testing.T) {
 	})
 
 	t.Run("10.8 - DISTINCT log LIMIT 0 OFFSET 3", func(t *testing.T) {
-		t.Skip("feature not yet implemented: DISTINCT with LIMIT/OFFSET")
+
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log LIMIT 0 OFFSET 3")
 		if len(got) != 0 {
 			t.Errorf("expected empty result, got %v", got)

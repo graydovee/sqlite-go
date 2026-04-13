@@ -101,6 +101,7 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 			if err := b.emitOptimizedSingleTable(
 				plan, stmt, resultBase, resultCols,
 				needSorter, sorterCursor, orderByBase,
+				needDistinct, distinctCursor,
 				emptyLabel, loopEndLabel,
 			); err != nil {
 				return err
@@ -108,7 +109,7 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 		} else {
 			// Standard path: Rewind + iterate
 			b.b.EmitJump(vdbe.OpRewind, b.tables[0].cursor, emptyLabel, 0)
-			if err := b.emitJoinLoops(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, emptyLabel, loopEndLabel); err != nil {
+			if err := b.emitJoinLoops(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor, emptyLabel, loopEndLabel); err != nil {
 				return err
 			}
 		}
@@ -1039,20 +1040,20 @@ func (b *Build) expandResultColumns(cols []*ResultCol) ([]*resultColumn, error) 
 
 // emitJoinLoops emits the nested loop join structure for a SELECT.
 func (b *Build) emitJoinLoops(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
-	needSorter bool, sorterCursor, orderByBase int, emptyLabel, loopEndLabel int) error {
+	needSorter bool, sorterCursor, orderByBase int, needDistinct bool, distinctCursor int, emptyLabel, loopEndLabel int) error {
 
 	// For simple single-table query
 	if len(b.tables) == 1 {
-		return b.emitSingleTableLoop(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, emptyLabel, loopEndLabel)
+		return b.emitSingleTableLoop(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor, emptyLabel, loopEndLabel)
 	}
 
 	// For multi-table joins, emit nested loops
-	return b.emitNestedLoopJoin(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, emptyLabel, loopEndLabel)
+	return b.emitNestedLoopJoin(stmt, resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor, emptyLabel, loopEndLabel)
 }
 
 // emitSingleTableLoop emits the loop for a single-table SELECT.
 func (b *Build) emitSingleTableLoop(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
-	needSorter bool, sorterCursor, orderByBase int, emptyLabel, loopEndLabel int) error {
+	needSorter bool, sorterCursor, orderByBase int, needDistinct bool, distinctCursor int, emptyLabel, loopEndLabel int) error {
 
 	cursor := b.tables[0].cursor
 	loopBody := b.b.NewLabel()
@@ -1085,6 +1086,11 @@ func (b *Build) emitSingleTableLoop(stmt *SelectStmt, resultBase int, resultCols
 		recReg := b.b.AllocReg(1)
 		b.emitMakeRecord(resultBase, len(resultCols), recReg)
 		b.emitSorterInsert(sorterCursor, recReg)
+	} else if needDistinct {
+		skipLabel := b.b.NewLabel()
+		b.emitDistinctCheck(distinctCursor, resultBase, len(resultCols), skipLabel)
+		b.emitResultRow(resultBase, len(resultCols))
+		b.b.DefineLabel(skipLabel)
 	} else {
 		b.emitResultRow(resultBase, len(resultCols))
 	}
@@ -1111,7 +1117,7 @@ func (b *Build) emitDistinctCheck(distinctCursor, resultBase, nResult int, skipL
 // emitNestedLoopJoin emits nested loop join code with support for
 // INNER JOIN, LEFT JOIN, NATURAL JOIN, and USING.
 func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
-	needSorter bool, sorterCursor, orderByBase int, emptyLabel, loopEndLabel int) error {
+	needSorter bool, sorterCursor, orderByBase int, needDistinct bool, distinctCursor int, emptyLabel, loopEndLabel int) error {
 
 	nTables := len(b.tables)
 	from := stmt.From
@@ -1198,13 +1204,13 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 		b.b.EmitJump(vdbe.OpIfNot, whereReg, whereSkip, 0)
 
 		// Compute result columns and output
-		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor); err != nil {
 			return err
 		}
 
 		b.b.DefineLabel(whereSkip)
 	} else {
-		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor); err != nil {
 			return err
 		}
 	}
@@ -1233,7 +1239,7 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 			}
 
 			// Emit output row with NULLs for unmatched tables
-			if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase); err != nil {
+			if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor); err != nil {
 				return err
 			}
 
@@ -1254,7 +1260,7 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 
 // emitJoinResultRow computes result columns and emits a ResultRow (or SorterInsert).
 func (b *Build) emitJoinResultRow(resultBase int, resultCols []*resultColumn,
-	needSorter bool, sorterCursor, orderByBase int) error {
+	needSorter bool, sorterCursor, orderByBase int, needDistinct bool, distinctCursor int) error {
 
 	for i, rc := range resultCols {
 		if err := b.compileExpr(rc.Expr, resultBase+i); err != nil {
@@ -1266,6 +1272,11 @@ func (b *Build) emitJoinResultRow(resultBase int, resultCols []*resultColumn,
 		recReg := b.b.AllocReg(1)
 		b.emitMakeRecord(resultBase, len(resultCols), recReg)
 		b.emitSorterInsert(sorterCursor, recReg)
+	} else if needDistinct {
+		skipLabel := b.b.NewLabel()
+		b.emitDistinctCheck(distinctCursor, resultBase, len(resultCols), skipLabel)
+		b.emitResultRow(resultBase, len(resultCols))
+		b.b.DefineLabel(skipLabel)
 	} else {
 		b.emitResultRow(resultBase, len(resultCols))
 	}
@@ -1368,11 +1379,13 @@ func (b *Build) emitSortedOutput(sorterCursor, nResult int) error {
 	sortEmpty := b.b.NewLabel()
 	sortBody := b.emitSorterSort(sorterCursor, sortEmpty)
 
-	// Allocate register for reading sorter data
+	// Allocate registers for reading sorter data
 	dataReg := b.b.AllocReg(nResult)
 
-	// Read and output each row from the sorter
-	b.emitColumn(sorterCursor, 0, dataReg)
+	// Read all columns from the sorter
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(sorterCursor, i, dataReg+i)
+	}
 	b.emitResultRow(dataReg, nResult)
 	b.emitSorterNext(sorterCursor, sortBody)
 	b.b.DefineLabel(sortEmpty)
@@ -1391,8 +1404,10 @@ func (b *Build) emitSortedDistinctOutput(sorterCursor, nResult int) error {
 	loopEnd := b.b.NewLabel()
 	dataReg := b.b.AllocReg(nResult)
 
-	// Read row from sorter
-	b.emitColumn(sorterCursor, 0, dataReg)
+	// Read all columns from the sorter
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(sorterCursor, i, dataReg+i)
+	}
 
 	// Dedup check
 	skipLabel := b.b.NewLabel()
@@ -1577,6 +1592,7 @@ func (b *Build) emitOptimizedSingleTable(
 	resultCols []*resultColumn,
 	needSorter bool,
 	sorterCursor, orderByBase int,
+	needDistinct bool, distinctCursor int,
 	emptyLabel, loopEndLabel int,
 ) error {
 	tplan := plan.TablePlans[0]
@@ -1613,6 +1629,11 @@ func (b *Build) emitOptimizedSingleTable(
 		recReg := b.b.AllocReg(1)
 		b.emitMakeRecord(resultBase, len(resultCols), recReg)
 		b.emitSorterInsert(sorterCursor, recReg)
+	} else if needDistinct {
+		skipLabel := b.b.NewLabel()
+		b.emitDistinctCheck(distinctCursor, resultBase, len(resultCols), skipLabel)
+		b.emitResultRow(resultBase, len(resultCols))
+		b.b.DefineLabel(skipLabel)
 	} else {
 		b.emitResultRow(resultBase, len(resultCols))
 	}
