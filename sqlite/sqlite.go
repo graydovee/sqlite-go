@@ -1865,6 +1865,30 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 		return err
 	}
 
+	// Check CHECK constraints
+	if len(tbl.checks) > 0 {
+		colNames := make([]string, len(tbl.columns))
+		checkVals := make([]vdbe.Value, len(tbl.columns))
+		for i, col := range tbl.columns {
+			colNames[i] = col.name
+			if v, ok := valMap[col.name]; ok && v != nil {
+				checkVals[i] = interfaceToValue(v)
+			} else {
+				checkVals[i] = vdbe.Value{Type: "null"}
+			}
+		}
+		for _, check := range tbl.checks {
+			result := evalExprWithRow(check, nil, colNames, checkVals)
+			if result != nil && !isTruthy(result) {
+				if needCommit {
+					db.bt.Rollback()
+					db.pgr.Rollback()
+				}
+				return NewErrorf(Error, "CHECK constraint failed: %s", check)
+			}
+		}
+	}
+
 	// Build the record
 	rb := vdbe.NewRecordBuilder()
 	for _, col := range tbl.columns {
@@ -2306,13 +2330,19 @@ func (db *Database) cascadeSetColumn(tbl *tableEntry, fk FKConstraint, parentKey
 	return nil
 }
 
-// cascadeUpdate updates child FK columns when a parent key changes,
-// for FK constraints with ON UPDATE CASCADE.
+// cascadeUpdate propagates ON UPDATE CASCADE to child FK columns.
+// It first validates all CHECK constraints (recursively) before applying any changes.
 func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
+	if err := db.cascadeUpdateCheck(parentTbl, oldVals, newVals); err != nil {
+		return err
+	}
+	return db.cascadeUpdateApply(parentTbl, oldVals, newVals)
+}
+
+// cascadeUpdateCheck validates that all cascade updates would satisfy CHECK constraints.
+// Read-only: does not modify any data.
+func (db *Database) cascadeUpdateCheck(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
 	for _, tbl := range db.tables {
-		if tbl == parentTbl {
-			continue
-		}
 		for _, fk := range tbl.fk {
 			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
 				continue
@@ -2341,7 +2371,104 @@ func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe
 			if oldKey == nil {
 				continue
 			}
-			// If value didn't change, skip
+			if fkValuesEqual(oldVals[refIdx], valueToInterface(newVals[refIdx])) {
+				continue
+			}
+			fkColIdx := -1
+			for i, c := range tbl.columns {
+				if strings.EqualFold(c.name, fk.Col) {
+					fkColIdx = i
+					break
+				}
+			}
+			if fkColIdx < 0 {
+				continue
+			}
+			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
+			if err != nil {
+				return NewErrorf(Error, "cascade update check cursor: %s", err)
+			}
+			hasRow, err := childCursor.First()
+			if err != nil {
+				childCursor.Close()
+				return err
+			}
+			for hasRow {
+				data, err := childCursor.Data()
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				childVals, err := vdbe.ParseRecord(data)
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				if len(childVals) < len(tbl.columns) {
+					padded := make([]vdbe.Value, len(tbl.columns))
+					copy(padded, childVals)
+					for j := len(childVals); j < len(tbl.columns); j++ {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+					childVals = padded
+				}
+				if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], oldKey) {
+					newChildVals := make([]vdbe.Value, len(childVals))
+					copy(newChildVals, childVals)
+					newChildVals[fkColIdx] = newVals[refIdx]
+					if err := db.checkConstraints(tbl, newChildVals); err != nil {
+						childCursor.Close()
+						return err
+					}
+					if err := db.cascadeUpdateCheck(tbl, childVals, newChildVals); err != nil {
+						childCursor.Close()
+						return err
+					}
+				}
+				hasRow, err = childCursor.Next()
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+			}
+			childCursor.Close()
+		}
+	}
+	return nil
+}
+
+// cascadeUpdateApply applies cascade updates to child FK columns.
+// Should only be called after cascadeUpdateCheck has passed.
+func (db *Database) cascadeUpdateApply(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
+	for _, tbl := range db.tables {
+		for _, fk := range tbl.fk {
+			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
+				continue
+			}
+			if !strings.EqualFold(fk.OnUpdate, "CASCADE") {
+				continue
+			}
+			refCol := fk.RefCol
+			if refCol == "" {
+				for _, c := range parentTbl.columns {
+					refCol = c.name
+					break
+				}
+			}
+			refIdx := -1
+			for i, c := range parentTbl.columns {
+				if strings.EqualFold(c.name, refCol) {
+					refIdx = i
+					break
+				}
+			}
+			if refIdx < 0 || refIdx >= len(oldVals) || refIdx >= len(newVals) {
+				continue
+			}
+			oldKey := valueToInterface(oldVals[refIdx])
+			if oldKey == nil {
+				continue
+			}
 			if fkValuesEqual(oldVals[refIdx], valueToInterface(newVals[refIdx])) {
 				continue
 			}
@@ -2385,6 +2512,8 @@ func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe
 					childVals = padded
 				}
 				if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], oldKey) {
+					oldChildVals := make([]vdbe.Value, len(childVals))
+					copy(oldChildVals, childVals)
 					childVals[fkColIdx] = newVals[refIdx]
 					rb := vdbe.NewRecordBuilder()
 					for _, v := range childVals {
@@ -2394,6 +2523,11 @@ func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe
 					keyBuf := make([]byte, 9)
 					keyLen := encodeVarintKey(keyBuf, int64(rowid))
 					if err := db.bt.Insert(childCursor, keyBuf[:keyLen], newData, btree.RowID(rowid), btree.SeekFound); err != nil {
+						childCursor.Close()
+						return err
+					}
+					// Recursively cascade to children of this child
+					if err := db.cascadeUpdateApply(tbl, oldChildVals, childVals); err != nil {
 						childCursor.Close()
 						return err
 					}
@@ -2659,6 +2793,13 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 	}
 
 
+		// Validate all cascade updates before applying any changes
+		for _, upd := range updates {
+			if err := db.cascadeUpdateCheck(tbl, upd.oldVals, upd.newVals); err != nil {
+				return err
+			}
+		}
+
 		// Now apply all updates
 		var count int64
 		for _, upd := range updates {
@@ -2669,7 +2810,7 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 				return err
 			}
 			// ON UPDATE CASCADE: propagate key changes to child rows
-			if err := db.cascadeUpdate(tbl, upd.oldVals, upd.newVals); err != nil {
+			if err := db.cascadeUpdateApply(tbl, upd.oldVals, upd.newVals); err != nil {
 				return err
 			}
 			count++

@@ -228,7 +228,6 @@ func TestFkey2Mismatch(t *testing.T) {
 
 // TestFkey2CascadeAction tests ON UPDATE CASCADE.
 func TestFkey2CascadeAction(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
@@ -238,7 +237,7 @@ func TestFkey2CascadeAction(t *testing.T) {
 	mustExec(t, db, "INSERT INTO t2 VALUES(10, 100)")
 	mustExec(t, db, "UPDATE t1 SET a = 15")
 
-	got := queryStrings(t, db, "SELECT * FROM t2")
+	got := queryFlatStrings(t, db, "SELECT * FROM t2")
 	assertResults(t, got, []string{"15", "100"})
 }
 
