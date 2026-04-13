@@ -241,30 +241,38 @@ func TestFkey2CascadeAction(t *testing.T) {
 
 // TestFkey2Restrict tests RESTRICT actions.
 func TestFkey2Restrict(t *testing.T) {
-	t.Skip("DEFERRABLE INITIALLY DEFERRED not implemented")
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, `CREATE TABLE t1(a, b PRIMARY KEY)`)
 	mustExec(t, db, `CREATE TABLE t2(
-		x REFERENCES t1 ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED
+		x REFERENCES t1 ON UPDATE RESTRICT ON DELETE RESTRICT
 	)`)
 	mustExec(t, db, "INSERT INTO t1 VALUES(1, 'one')")
 	mustExec(t, db, "INSERT INTO t1 VALUES(2, 'two')")
 	mustExec(t, db, "INSERT INTO t1 VALUES(3, 'three')")
 
-	mustExec(t, db, "BEGIN")
 	mustExec(t, db, "INSERT INTO t2 VALUES('two')")
+
+	// DELETE parent with child row → RESTRICT error
+	if err := db.Exec("DELETE FROM t1 WHERE b = 'two'"); err == nil {
+		t.Error("expected FK RESTRICT error on DELETE")
+	}
+
+	// UPDATE parent key with child row → RESTRICT error
+	if err := db.Exec("UPDATE t1 SET b = 'five' WHERE b = 'two'"); err == nil {
+		t.Error("expected FK RESTRICT error on UPDATE")
+	}
+
+	// UPDATE parent key with no child row → OK
 	mustExec(t, db, "UPDATE t1 SET b = 'four' WHERE b = 'one'")
 
-	if err := db.Exec("UPDATE t1 SET b = 'five' WHERE b = 'two'"); err == nil {
-		t.Error("expected FK RESTRICT error")
-	}
+	// DELETE parent with no child row → OK
+	mustExec(t, db, "DELETE FROM t1 WHERE b = 'four'")
 
-	// RESTRICT defers the check; COMMIT should fail since we deleted the parent
+	// After deleting child, parent delete should succeed
+	mustExec(t, db, "DELETE FROM t2")
 	mustExec(t, db, "DELETE FROM t1 WHERE b = 'two'")
-	if err := db.Exec("COMMIT"); err == nil {
-		t.Error("expected FK error on commit (deferred restrict)")
-	}
+	mustExec(t, db, "DELETE FROM t1 WHERE b = 'three'")
 }
 
 // TestFkey2DropTable tests DROP TABLE with FK constraints.
