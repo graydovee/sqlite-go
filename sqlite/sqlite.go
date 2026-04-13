@@ -427,6 +427,8 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 
 	// Parse column definitions
 	var columns []columnEntry
+	// Track which columns have UNIQUE or PRIMARY KEY for auto-index creation
+	var uniqueCols []string
 	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
 		pos++ // skip (
 		for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
@@ -439,11 +441,24 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				pos++
 			}
 
-			// Skip constraints (PRIMARY KEY, NOT NULL, etc.)
+			// Parse constraints (PRIMARY KEY, NOT NULL, UNIQUE, etc.)
+			colHasUnique := false
+			colHasPK := false
 			for pos < len(tokens) &&
 				tokens[pos].Type != compile.TokenComma &&
 				tokens[pos].Type != compile.TokenRParen {
+				if isKeyword(tokens[pos], "unique") {
+					colHasUnique = true
+				}
+				if isKeyword(tokens[pos], "primary") {
+					colHasPK = true
+				}
 				pos++
+			}
+
+			// UNIQUE and PRIMARY KEY both create an auto-index, but only one
+			if colHasUnique || colHasPK {
+				uniqueCols = append(uniqueCols, colName)
 			}
 
 			columns = append(columns, columnEntry{name: colName, typeName: colType})
@@ -506,6 +521,18 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		RootPage: int(rootPage),
 		SQL:      sqlText,
 	})
+
+	// Create auto-index entries for UNIQUE/PRIMARY KEY columns
+	for i := range uniqueCols {
+		autoName := fmt.Sprintf("sqlite_autoindex_%s_%d", tableName, i+1)
+		db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+			Type:     "index",
+			Name:     autoName,
+			TblName:  tableName,
+			RootPage: 0,
+			SQL:      "",
+		})
+	}
 
 	return nil
 }
@@ -678,7 +705,7 @@ func (db *Database) execCreateIndex(tokens []compile.Token) error {
 	if pos >= len(tokens) {
 		return NewError(Error, "expected index name")
 	}
-	indexName := tokens[pos].Value
+	indexName := unquoteIdent(tokens[pos].Value)
 	pos++
 
 	// ON keyword
@@ -702,6 +729,48 @@ func (db *Database) execCreateIndex(tokens []compile.Token) error {
 				return nil
 			}
 			return NewErrorf(Error, "index %s already exists", indexName)
+		}
+	}
+
+	// Check index name doesn't conflict with a table name
+	for _, e := range db.masterEntries {
+		if e.Type == "table" && strings.EqualFold(e.Name, indexName) {
+			return NewErrorf(Error, "there is already a table named %s", indexName)
+		}
+	}
+
+	// Validate index columns/expressions
+	tbl := db.tables[tableName]
+	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+		pos++ // skip (
+		for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+			if tokens[pos].Type == compile.TokenComma {
+				pos++
+				continue
+			}
+			// Collect the index column expression tokens
+			startPos := pos
+			for pos < len(tokens) && tokens[pos].Type != compile.TokenComma && tokens[pos].Type != compile.TokenRParen {
+				pos++
+			}
+			// Validate: if single identifier token, check it's a real column
+			if pos-startPos == 1 && tokens[startPos].Type == compile.TokenID {
+				colName := tokens[startPos].Value
+				found := false
+				for _, col := range tbl.columns {
+					if strings.EqualFold(col.name, colName) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return NewErrorf(Error, "no such column: %s", colName)
+				}
+			}
+			// For expressions (multiple tokens or non-ID), skip validation
+		}
+		if pos < len(tokens) {
+			pos++ // skip )
 		}
 	}
 
@@ -762,7 +831,7 @@ func (db *Database) execDropIndex(tokens []compile.Token) error {
 	if pos >= len(tokens) {
 		return NewError(Error, "expected index name")
 	}
-	indexName := tokens[pos].Value
+	indexName := unquoteIdent(tokens[pos].Value)
 	pos++
 
 	// Check if index exists
@@ -772,6 +841,17 @@ func (db *Database) execDropIndex(tokens []compile.Token) error {
 			found = true
 			break
 		}
+	}
+
+	// Protect auto-indexes from being dropped
+	if strings.HasPrefix(strings.ToLower(indexName), "sqlite_autoindex_") {
+		if found {
+			return NewErrorf(Error, "unable to delete/modify system index: %s", indexName)
+		}
+		if ifExists {
+			return NewErrorf(Error, "unable to delete/modify system index: %s", indexName)
+		}
+		return NewErrorf(Error, "no such index: %s", indexName)
 	}
 
 	if !found {
@@ -1398,16 +1478,16 @@ func (db *Database) removeMasterEntriesForTable(tableName string) {
 // rebuildSQL reconstructs a SQL string from tokens.
 func rebuildSQL(tokens []compile.Token) string {
 	var buf strings.Builder
-	prevEnd := -1
 	for i, t := range tokens {
 		if i > 0 {
-			// Add a space between tokens if needed
-			if prevEnd >= 0 {
+			prev := tokens[i-1].Value
+			noSpaceBefore := t.Value == "(" || t.Value == ")" || t.Value == ","
+			noSpaceAfter := prev == "(" || prev == ","
+			if !noSpaceBefore && !noSpaceAfter {
 				buf.WriteByte(' ')
 			}
 		}
 		buf.WriteString(t.Value)
-		prevEnd = len(t.Value)
 	}
 	return buf.String()
 }
@@ -6327,6 +6407,18 @@ func filterTokens(tokens []compile.Token) []compile.Token {
 // isKeyword checks if a token is a specific keyword.
 func isKeyword(t compile.Token, kw string) bool {
 	return t.Type == compile.TokenKeyword && strings.EqualFold(t.Value, kw)
+}
+
+// unquoteIdent strips surrounding quotes from an identifier: [name], "name", `name`.
+func unquoteIdent(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '[' && s[len(s)-1] == ']') ||
+			(s[0] == '"' && s[len(s)-1] == '"') ||
+			(s[0] == '`' && s[len(s)-1] == '`') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
 }
 
 // expectKeyword advances pos past an expected keyword, or returns an error.

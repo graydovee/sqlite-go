@@ -38,7 +38,6 @@ import (
 // Create table and index, verify both appear in sqlite_master.
 func TestIndex1_1(t *testing.T) {
 	t.Run("index-1.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX and sqlite_master querying not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int)")
@@ -52,7 +51,6 @@ func TestIndex1_1(t *testing.T) {
 
 	// index-1.1b: Verify index metadata in sqlite_master
 	t.Run("index-1.1b", func(t *testing.T) {
-		t.Skip("sqlite_master querying not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int)")
@@ -94,7 +92,6 @@ func TestIndex1_1(t *testing.T) {
 
 	// index-1.2: Verify that the index dies with the table
 	t.Run("index-1.2", func(t *testing.T) {
-		t.Skip("DROP TABLE not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int)")
@@ -116,7 +113,6 @@ func TestIndex1_1(t *testing.T) {
 func TestIndex2(t *testing.T) {
 	// index-2.1: Index on nonexistent table
 	t.Run("index-2.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		err := db.Exec("CREATE INDEX index1 ON test1(f1)")
@@ -130,7 +126,6 @@ func TestIndex2(t *testing.T) {
 
 	// index-2.1b: Index on nonexistent column of existing table
 	t.Run("index-2.1b", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int)")
@@ -145,7 +140,6 @@ func TestIndex2(t *testing.T) {
 
 	// index-2.2: Index with mixed valid/invalid columns
 	t.Run("index-2.2", func(t *testing.T) {
-		t.Skip("CREATE INDEX and DROP TABLE not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int)")
@@ -165,7 +159,6 @@ func TestIndex2(t *testing.T) {
 // Create 99 indices on a 5-column table, verify they all exist.
 func TestIndex3(t *testing.T) {
 	t.Run("index-3.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int, f3 int, f4 int, f5 int)")
@@ -191,7 +184,6 @@ func TestIndex3(t *testing.T) {
 
 	// index-3.3: All indices go away when table is dropped
 	t.Run("index-3.3", func(t *testing.T) {
-		t.Skip("DROP TABLE not yet supported")
 	})
 }
 
@@ -202,7 +194,6 @@ func TestIndex3(t *testing.T) {
 // query using indices, drop and recreate indices.
 func TestIndex4(t *testing.T) {
 	t.Run("index-4.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(cnt int, power int)")
@@ -278,7 +269,6 @@ func TestIndex4(t *testing.T) {
 
 	// index-4.5 through 4.12: Drop and recreate indices, verify queries still work
 	t.Run("index-4.5_to_4.12", func(t *testing.T) {
-		t.Skip("DROP INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(cnt int, power int)")
@@ -355,7 +345,6 @@ func TestIndex4(t *testing.T) {
 // TestIndex5 translates index-5.x.
 func TestIndex5(t *testing.T) {
 	t.Run("index-5.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		err := db.Exec("CREATE INDEX index1 ON sqlite_master(name)")
@@ -365,7 +354,6 @@ func TestIndex5(t *testing.T) {
 	})
 
 	t.Run("index-5.2", func(t *testing.T) {
-		t.Skip("sqlite_master querying not yet supported")
 	})
 }
 
@@ -375,7 +363,6 @@ func TestIndex5(t *testing.T) {
 func TestIndex6(t *testing.T) {
 	// index-6.1: Duplicate index name across different tables
 	t.Run("index-6.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int)")
@@ -390,7 +377,6 @@ func TestIndex6(t *testing.T) {
 
 	// index-6.1.1: Same with bracketed name
 	t.Run("index-6.1.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int)")
@@ -405,7 +391,6 @@ func TestIndex6(t *testing.T) {
 
 	// index-6.1c: CREATE INDEX IF NOT EXISTS with existing name should succeed
 	t.Run("index-6.1c", func(t *testing.T) {
-		t.Skip("CREATE INDEX IF NOT EXISTS not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int)")
@@ -420,7 +405,6 @@ func TestIndex6(t *testing.T) {
 
 	// index-6.2: Index name conflicts with table name
 	t.Run("index-6.2", func(t *testing.T) {
-		t.Skip("CREATE INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(f1 int, f2 int)")
@@ -435,7 +419,6 @@ func TestIndex6(t *testing.T) {
 
 	// index-6.4: Create multiple indices, drop table, verify all gone
 	t.Run("index-6.4", func(t *testing.T) {
-		t.Skip("DROP TABLE not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE test1(a, b)")
@@ -495,7 +478,6 @@ func TestIndex7(t *testing.T) {
 
 	// index-7.4: Drop table, verify empty
 	t.Run("index-7.4", func(t *testing.T) {
-		t.Skip("DROP TABLE not yet supported")
 	})
 }
 
@@ -504,7 +486,6 @@ func TestIndex7(t *testing.T) {
 // TestIndex8 translates index-8.x.
 func TestIndex8(t *testing.T) {
 	t.Run("index-8.1", func(t *testing.T) {
-		t.Skip("DROP INDEX not yet supported")
 
 		db := openTestDB(t)
 		err := db.Exec("DROP INDEX index1")
@@ -533,7 +514,6 @@ func TestIndex9(t *testing.T) {
 	})
 
 	t.Run("index-9.2", func(t *testing.T) {
-		t.Skip("CREATE INDEX and sqlite_master querying not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE tab1(a int)")
@@ -810,7 +790,6 @@ func TestIndex13(t *testing.T) {
 
 	// index-13.2: Count auto-indices in sqlite_master
 	t.Run("index-13.2", func(t *testing.T) {
-		t.Skip("sqlite_master querying not yet supported")
 	})
 
 	// index-13.3: Cannot drop auto-indices
@@ -1059,7 +1038,6 @@ func TestIndex15(t *testing.T) {
 func TestIndex16(t *testing.T) {
 	// index-16.1: UNIQUE PRIMARY KEY → single index
 	t.Run("index-16.1", func(t *testing.T) {
-		t.Skip("sqlite_master querying not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE t7(c UNIQUE PRIMARY KEY)")
@@ -1163,7 +1141,6 @@ func TestIndex17(t *testing.T) {
 
 	// index-17.3: DROP INDEX IF EXISTS on auto-index
 	t.Run("index-17.3", func(t *testing.T) {
-		t.Skip("DROP INDEX IF EXISTS not yet supported")
 
 		db := openTestDB(t)
 		err := db.Exec("DROP INDEX IF EXISTS sqlite_autoindex_t7_1")
@@ -1174,7 +1151,6 @@ func TestIndex17(t *testing.T) {
 
 	// index-17.4: DROP INDEX IF EXISTS on nonexistent index → OK
 	t.Run("index-17.4", func(t *testing.T) {
-		t.Skip("DROP INDEX IF EXISTS not yet supported")
 
 		db := openTestDB(t)
 		err := db.Exec("DROP INDEX IF EXISTS no_such_index")
@@ -1227,7 +1203,6 @@ func TestIndex18(t *testing.T) {
 
 	// index-18.5: DROP TABLE t7
 	t.Run("index-18.5", func(t *testing.T) {
-		t.Skip("DROP TABLE not yet supported")
 	})
 }
 
@@ -1289,7 +1264,6 @@ func TestIndex19(t *testing.T) {
 // TestIndex20 translates index-20.x.
 func TestIndex20(t *testing.T) {
 	t.Run("index-20.1", func(t *testing.T) {
-		t.Skip("CREATE INDEX and DROP INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, "CREATE TABLE t6(a, b, c)")
@@ -1298,7 +1272,6 @@ func TestIndex20(t *testing.T) {
 	})
 
 	t.Run("index-20.2", func(t *testing.T) {
-		t.Skip("DROP INDEX not yet supported")
 
 		db := openTestDB(t)
 		execSQL(t, db, `DROP INDEX "t6i1"`)
