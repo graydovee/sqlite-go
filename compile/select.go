@@ -231,6 +231,20 @@ func (b *Build) compileAggregateNoGroup(stmt *SelectStmt, resultCols []*resultCo
 //  3. Iterate sorted rows, detect group boundaries via SorterCompare
 //  4. For each group: accumulate aggregates, finalize, apply HAVING, output
 func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColumn, nResult int) error {
+	// Resolve GROUP BY expressions: aliases and column numbers
+	for i, gExpr := range stmt.GroupBy {
+		resolved, err := b.resolveGroupByExpr(gExpr, resultCols)
+		if err != nil {
+			return err
+		}
+		stmt.GroupBy[i] = resolved
+	}
+
+	// Resolve aliases in HAVING
+	if stmt.Having != nil {
+		stmt.Having = b.resolveHavingAliases(stmt.Having, resultCols)
+	}
+
 	nGroupCols := len(stmt.GroupBy)
 
 	// Count source columns across all tables
@@ -332,12 +346,33 @@ func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColum
 		}
 	}
 
+	// Collect all aggregate Expr nodes from result columns and HAVING
+	var allAggs []*Expr
+	for _, rc := range resultCols {
+		b.collectAggFuncs(rc.Expr, &allAggs)
+	}
+	if stmt.Having != nil {
+		b.collectAggFuncs(stmt.Having, &allAggs)
+	}
+
+	// Allocate dedicated registers for each aggregate function
+	b.aggFuncRegs = make(map[*Expr]int)
+	for _, agg := range allAggs {
+		if _, exists := b.aggFuncRegs[agg]; !exists {
+			reg := b.b.AllocReg(1)
+			b.aggFuncRegs[agg] = reg
+		}
+	}
+
 	// Registers for aggregate accumulators and group key
 	aggBase := b.b.AllocReg(nResult)
 
 	// Initialize accumulators to NULL
 	for i := 0; i < nResult; i++ {
 		b.emitNull(aggBase + i)
+	}
+	for _, reg := range b.aggFuncRegs {
+		b.emitNull(reg)
 	}
 
 	// Register for saved group key values (for comparison)
@@ -353,17 +388,18 @@ func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColum
 	for i := 0; i < nResult; i++ {
 		b.emitNull(aggBase + i)
 	}
+	for _, reg := range b.aggFuncRegs {
+		b.emitNull(reg)
+	}
 
 	// Inner loop: accumulate rows within a group
 	accLoop := b.b.NewLabel()
 	b.b.DefineLabel(accLoop)
 
-	// Run aggregate steps for each result column containing aggregates
-	for i, rc := range resultCols {
-		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
-			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
-				return err
-			}
+	// Run aggregate steps only (not surrounding arithmetic)
+	for agg, reg := range b.aggFuncRegs {
+		if err := b.compileAggregate(agg, reg); err != nil {
+			return err
 		}
 	}
 
@@ -429,6 +465,8 @@ func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColum
 	// Clear GROUP BY mode
 	b.groupSorterCursor = 0
 	b.groupColOffsets = nil
+	b.aggFuncRegs = nil
+	b.inAggOutput = false
 
 	// If ORDER BY, output from outSorter
 	if needOutSorter {
@@ -442,9 +480,20 @@ func (b *Build) compileGroupBySelect(stmt *SelectStmt, resultCols []*resultColum
 
 // emitGroupOutput finalizes aggregates and emits a result row for the current group.
 func (b *Build) emitGroupOutput(stmt *SelectStmt, resultCols []*resultColumn, nResult int, aggBase int, outSorter int, needOutSorter bool) {
-	// Finalize all aggregates
+	// Finalize all aggregate registers
+	for agg, reg := range b.aggFuncRegs {
+		afi := b.makeAggFuncInfo(agg)
+		b.b.EmitP4(vdbe.OpAggFinal, reg, reg, 0, afi, "AGG FINAL")
+	}
+
+	// Evaluate result columns in output mode (aggregates read from registers)
+	b.inAggOutput = true
 	for i, rc := range resultCols {
-		b.emitAggFinalForCol(rc.Expr, aggBase+i)
+		if rc.Expr != nil {
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				_ = err
+			}
+		}
 	}
 
 	// Check HAVING
@@ -470,6 +519,7 @@ func (b *Build) emitGroupOutput(stmt *SelectStmt, resultCols []*resultColumn, nR
 			b.emitResultRow(aggBase, nResult)
 		}
 	}
+	b.inAggOutput = false
 }
 
 // emitAggFinal emits an OpAggFinal for the given register with the correct AggFuncInfo.
@@ -1613,3 +1663,99 @@ func (b *Build) compileWindowSelect(stmt *SelectStmt) error {
 // ensureUnused prevents "imported and not used" errors
 var _ = strings.ToUpper
 var _ SortOrder = SortDefault
+
+// resolveGroupByExpr resolves GROUP BY expressions:
+// - Column number references (e.g., GROUP BY 1) → resolved to result column expression
+// - Alias references (e.g., GROUP BY x where x is SELECT ... AS x) → resolved to aliased expression
+func (b *Build) resolveGroupByExpr(expr *Expr, resultCols []*resultColumn) (*Expr, error) {
+	// Check for column number reference (integer literal)
+	if expr.Kind == ExprLiteral && expr.LiteralType == "integer" {
+		idx := int(expr.IntValue)
+		if idx < 1 || idx > len(resultCols) {
+			return nil, fmt.Errorf("GROUP BY column number %d is out of range (1..%d)", idx, len(resultCols))
+		}
+		// Use the corresponding result column's expression
+		return resultCols[idx-1].Expr, nil
+	}
+
+	// Check for alias reference (column ref matching a result column alias)
+	if expr.Kind == ExprColumnRef && expr.Table == "" {
+		for _, rc := range resultCols {
+			if rc.Alias != "" && strings.EqualFold(rc.Alias, expr.Name) {
+				return rc.Expr, nil
+			}
+		}
+	}
+
+	return expr, nil
+}
+
+// resolveHavingAliases resolves alias references in HAVING expressions.
+// It replaces column references that match result column aliases with the aliased expression.
+func (b *Build) resolveHavingAliases(expr *Expr, resultCols []*resultColumn) *Expr {
+	if expr == nil {
+		return nil
+	}
+
+	// If this is a column ref matching an alias, replace it
+	if expr.Kind == ExprColumnRef && expr.Table == "" {
+		for _, rc := range resultCols {
+			if rc.Alias != "" && strings.EqualFold(rc.Alias, expr.Name) {
+				return rc.Expr
+			}
+		}
+	}
+
+	// Recursively resolve in sub-expressions
+	if expr.Left != nil {
+		expr.Left = b.resolveHavingAliases(expr.Left, resultCols)
+	}
+	if expr.Right != nil {
+		expr.Right = b.resolveHavingAliases(expr.Right, resultCols)
+	}
+	for i, arg := range expr.Args {
+		expr.Args[i] = b.resolveHavingAliases(arg, resultCols)
+	}
+	if expr.Low != nil {
+		expr.Low = b.resolveHavingAliases(expr.Low, resultCols)
+	}
+	if expr.High != nil {
+		expr.High = b.resolveHavingAliases(expr.High, resultCols)
+	}
+	if expr.Pattern != nil {
+		expr.Pattern = b.resolveHavingAliases(expr.Pattern, resultCols)
+	}
+	for _, w := range expr.WhenList {
+		w.Condition = b.resolveHavingAliases(w.Condition, resultCols)
+		w.Result = b.resolveHavingAliases(w.Result, resultCols)
+	}
+	if expr.ElseExpr != nil {
+		expr.ElseExpr = b.resolveHavingAliases(expr.ElseExpr, resultCols)
+	}
+
+	return expr
+}
+
+// collectAggFuncs walks an expression tree and collects all aggregate function Expr nodes.
+func (b *Build) collectAggFuncs(expr *Expr, result *[]*Expr) {
+	if expr == nil {
+		return
+	}
+	if expr.Kind == ExprFunctionCall && isAggregate(expr.FunctionName) {
+		*result = append(*result, expr)
+		return
+	}
+	b.collectAggFuncs(expr.Left, result)
+	b.collectAggFuncs(expr.Right, result)
+	for _, arg := range expr.Args {
+		b.collectAggFuncs(arg, result)
+	}
+	b.collectAggFuncs(expr.Low, result)
+	b.collectAggFuncs(expr.High, result)
+	b.collectAggFuncs(expr.Pattern, result)
+	for _, w := range expr.WhenList {
+		b.collectAggFuncs(w.Condition, result)
+		b.collectAggFuncs(w.Result, result)
+	}
+	b.collectAggFuncs(expr.ElseExpr, result)
+}

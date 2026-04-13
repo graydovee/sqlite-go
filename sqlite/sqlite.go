@@ -2041,6 +2041,32 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		}
 	}
 
+	// Validate non-empty GROUP BY
+	if len(groupByExprs) == 0 && pos >= 2 && isKeyword(filtered[pos-2], "group") {
+		return nil, NewErrorf(Error, "GROUP BY requires at least one expression")
+	}
+
+	// Resolve GROUP BY aliases and column numbers
+	for i, gbExpr := range groupByExprs {
+		trimmed := strings.TrimSpace(gbExpr)
+		// Check for column number reference (e.g., "1", "2")
+		if n, err := strconv.Atoi(trimmed); err == nil {
+			if n < 1 || n > len(cols) {
+				return nil, NewErrorf(Error, "GROUP BY column number %d is out of range", n)
+			}
+			// Use the corresponding result column expression
+			groupByExprs[i] = cols[n-1].expr
+			continue
+		}
+		// Check for alias reference
+		for _, c := range cols {
+			if c.as != "" && strings.EqualFold(c.as, trimmed) {
+				groupByExprs[i] = c.expr
+				break
+			}
+		}
+	}
+
 	// Parse HAVING clause
 	var havingExpr string
 	if pos < len(filtered) && isKeyword(filtered[pos], "having") {
@@ -2064,7 +2090,24 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 			pos++
 		}
 		if pos < len(filtered) {
-			orderByCol = strings.ToLower(filtered[pos].Value)
+			obRaw := filtered[pos].Value
+			// Resolve column number reference
+			if n, err := strconv.Atoi(obRaw); err == nil && n >= 1 && n <= len(cols) {
+				orderByCol = strings.ToLower(cols[n-1].expr)
+			} else {
+				// Check for alias reference
+				resolved := false
+				for _, c := range cols {
+					if c.as != "" && strings.EqualFold(c.as, obRaw) {
+						orderByCol = strings.ToLower(c.expr)
+						resolved = true
+						break
+					}
+				}
+				if !resolved {
+					orderByCol = strings.ToLower(obRaw)
+				}
+			}
 			pos++
 			if pos < len(filtered) && isKeyword(filtered[pos], "desc") {
 				orderDesc = true
@@ -2228,8 +2271,8 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	if hasWin {
 		rows = db.computeWindowFunctions(cols, rawData, colNames, resultCols, ecols, args)
-	} else if hasAgg && len(groupByExprs) > 0 {
-		// GROUP BY: group rows, then compute aggregates per group
+	} else if len(groupByExprs) > 0 {
+		// GROUP BY: group rows (with or without aggregate functions)
 		type group struct {
 			key    string
 			rows   []rawRow
@@ -2266,9 +2309,15 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 					row.values = append(row.values, vdbe.NewMemInt(int64(len(g.rows))))
 					continue
 				}
+				// Check if expression contains an aggregate function
 				agg := parseAggregate(c.expr)
 				if agg != nil {
+					// Pure aggregate expression (e.g., "avg(n)")
 					row.values = append(row.values, computeAggregate(agg, g.rows, colNames))
+				} else if containsAggregate(c.expr) {
+					// Expression containing aggregate (e.g., "avg(n)+1", "avg(n)-min(n)")
+					evaluated := evaluateAggregateExpr(c.expr, g.rows, colNames)
+					row.values = append(row.values, evaluated)
 				} else {
 					row.values = append(row.values, evalExprWithRow(c.expr, args, colNames, g.sample.values))
 				}
@@ -2276,17 +2325,29 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 			// Apply HAVING filter
 			if havingExpr != "" {
-				// Replace aggregate expressions in HAVING with their computed values
+				// Replace aggregate expressions and their aliases in HAVING
 				havingEval := havingExpr
 				for i, c := range cols {
+					if i >= len(row.values) {
+						continue
+					}
+					val := row.values[i]
+					if isNull(val) {
+						continue
+					}
+					// Replace alias reference (e.g., "y" in "y>=4")
+					if c.as != "" {
+						havingEval = strings.ReplaceAll(havingEval, c.as, val.StringValue())
+					}
+					// Replace the aggregate expression itself
 					agg := parseAggregate(c.expr)
-					if agg != nil && i < len(row.values) {
-						val := row.values[i]
-						if !isNull(val) {
-							havingEval = strings.ReplaceAll(havingEval, c.expr, val.StringValue())
-						}
+					if agg != nil {
+						havingEval = strings.ReplaceAll(havingEval, c.expr, val.StringValue())
 					}
 				}
+				// Replace any remaining aggregate expressions in HAVING
+				// that are not in the SELECT list (e.g., "count(*)>=4" in HAVING)
+				havingEval = db.replaceAggregatesInExpr(havingEval, g.rows, colNames)
 				hval := evalExprWithRow(havingEval, args, colNames, g.sample.values)
 				if !isTruthy(hval) {
 					continue
@@ -2821,7 +2882,8 @@ type aggInfo struct {
 	arg string // "*" or column name or expression
 }
 
-// parseAggregate parses an aggregate expression like "count(*)" or "sum(val)".
+// parseAggregate parses a simple aggregate expression like "count(*)" or "sum(val)".
+// Returns nil for compound expressions like "avg(n)+1".
 func parseAggregate(expr string) *aggInfo {
 	// Normalize spaces: "count ( * )" -> "count(*)"
 	normalized := strings.ReplaceAll(expr, " (", "(")
@@ -2831,10 +2893,29 @@ func parseAggregate(expr string) *aggInfo {
 	lower := strings.ToLower(normalized)
 	for _, fn := range []string{"count", "sum", "avg", "min", "max"} {
 		prefix := fn + "("
-		if strings.HasPrefix(lower, prefix) {
-			inner := strings.TrimSpace(normalized[len(prefix) : len(normalized)-1])
-			return &aggInfo{fn: fn, arg: inner}
+		if !strings.HasPrefix(lower, prefix) {
+			continue
 		}
+		// Find the matching closing paren for the function call
+		depth := 1
+		end := -1
+		for i := len(prefix); i < len(normalized); i++ {
+			if normalized[i] == '(' {
+				depth++
+			} else if normalized[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		// Only match if the closing paren is at the end (simple aggregate, not compound)
+		if end != len(normalized)-1 {
+			continue
+		}
+		inner := strings.TrimSpace(normalized[len(prefix) : len(normalized)-1])
+		return &aggInfo{fn: fn, arg: inner}
 	}
 	return nil
 }
@@ -2933,6 +3014,173 @@ func computeAggregate(agg *aggInfo, rawData []rawRow, colNames []string) *vdbe.M
 		return result
 	}
 	return vdbe.NewMemNull()
+}
+
+// evaluateAggregateExpr evaluates an expression containing aggregate functions.
+// It normalizes spaces (e.g. "avg ( n )" → "avg(n)"), replaces each aggregate
+// call with its computed value, then evaluates the resulting expression.
+func evaluateAggregateExpr(expr string, rawData []rawRow, colNames []string) *vdbe.Mem {
+	// Normalize: remove spaces around parens so "avg ( n )" becomes "avg(n)"
+	normalized := strings.ReplaceAll(expr, " (", "(")
+	normalized = strings.ReplaceAll(normalized, "( ", "(")
+	normalized = strings.ReplaceAll(normalized, " )", ")")
+
+	type aggCall struct {
+		start int
+		end   int
+		fn    string
+		arg   string
+	}
+	var calls []aggCall
+
+	lower := strings.ToLower(normalized)
+	for _, fn := range []string{"count", "sum", "avg", "min", "max", "group_concat"} {
+		pattern := fn + "("
+		offset := 0
+		for {
+			idx := strings.Index(lower[offset:], pattern)
+			if idx < 0 {
+				break
+			}
+			pos := offset + idx
+			parenStart := pos + len(pattern)
+			depth := 1
+			end := -1
+			for i := parenStart; i < len(normalized); i++ {
+				if normalized[i] == '(' {
+					depth++
+				} else if normalized[i] == ')' {
+					depth--
+					if depth == 0 {
+						end = i
+						break
+					}
+				}
+			}
+			if end < 0 {
+				break
+			}
+			calls = append(calls, aggCall{start: pos, end: end + 1, fn: fn, arg: strings.TrimSpace(normalized[parenStart:end])})
+			offset = end + 1
+		}
+	}
+
+	if len(calls) == 0 {
+		return vdbe.NewMemNull()
+	}
+
+	// Replace aggregate calls from right to left (to preserve positions)
+	// Skip calls that are contained within other calls (nested aggregates)
+	result := normalized
+	for i := len(calls) - 1; i >= 0; i-- {
+		c := calls[i]
+		// Check if this call is contained within a later (outer) call
+		isNested := false
+		for j := i + 1; j < len(calls); j++ {
+			if calls[j].start <= c.start && calls[j].end >= c.end {
+				isNested = true
+				break
+			}
+		}
+		if isNested {
+			continue
+		}
+		agg := &aggInfo{fn: c.fn, arg: c.arg}
+		val := computeAggregate(agg, rawData, colNames)
+		var rep string
+		if isNull(val) {
+			rep = "NULL"
+		} else {
+			rep = fmt.Sprintf("%v", val.FloatValue())
+		}
+		result = result[:c.start] + rep + result[c.end:]
+	}
+
+	return evalExprWithRow(result, nil, colNames, nil)
+}
+
+func containsAggregate(expr string) bool {
+	lower := strings.ToLower(strings.ReplaceAll(expr, " (", "("))
+	for _, fn := range []string{"count(", "sum(", "avg(", "min(", "max("} {
+		if strings.Contains(lower, fn) {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceAggregatesInExpr finds all aggregate function calls in the expression,
+// computes each one over the given rows, and replaces them with their string values.
+func (db *Database) replaceAggregatesInExpr(expr string, rows []rawRow, colNames []string) string {
+	// Normalize the expression first: remove spaces around parens
+	normalized := strings.ReplaceAll(expr, " (", "(")
+	normalized = strings.ReplaceAll(normalized, "( ", "(")
+	normalized = strings.ReplaceAll(normalized, " )", ")")
+	result := normalized
+	for {
+		lower := strings.ToLower(result)
+		bestIdx := len(lower)
+		bestFn := ""
+		for _, fn := range []string{"count(", "sum(", "avg(", "min(", "max("} {
+			idx := strings.Index(lower, fn)
+			if idx >= 0 && idx < bestIdx {
+				bestIdx = idx
+				bestFn = fn
+			}
+		}
+		if bestFn == "" {
+			break
+		}
+		// Find matching closing paren
+		depth := 1
+		end := -1
+		for j := bestIdx + len(bestFn); j < len(result); j++ {
+			if result[j] == '(' {
+				depth++
+			} else if result[j] == ')' {
+				depth--
+				if depth == 0 {
+					end = j
+					break
+				}
+			}
+		}
+		if end < 0 {
+			break
+		}
+		aggStr := result[bestIdx : end+1]
+		agg := parseAggregate(aggStr)
+		if agg == nil {
+			break
+		}
+		val := computeAggregate(agg, rows, colNames)
+		var replacement string
+		if isNull(val) {
+			replacement = "null"
+		} else {
+			replacement = val.StringValue()
+		}
+		result = result[:bestIdx] + replacement + result[end+1:]
+	}
+	return result
+}
+
+// evalAggregateExpr evaluates a column expression that may contain aggregate functions.
+// Handles simple aggregates like "count(*)", compound expressions like "avg(n)+1",
+// and non-aggregate expressions like "log".
+func (db *Database) evalAggregateExpr(expr string, rows []rawRow, colNames []string, sample rawRow, args []interface{}) *vdbe.Mem {
+	// Simple aggregate
+	agg := parseAggregate(expr)
+	if agg != nil {
+		return computeAggregate(agg, rows, colNames)
+	}
+	// Non-aggregate expression
+	if !containsAggregate(expr) {
+		return evalExprWithRow(expr, args, colNames, sample.values)
+	}
+	// Compound expression with aggregates: replace aggregates with values, then evaluate
+	replaced := db.replaceAggregatesInExpr(expr, rows, colNames)
+	return evalExprWithRow(replaced, args, colNames, sample.values)
 }
 
 // rowKey creates a string key for DISTINCT deduplication.

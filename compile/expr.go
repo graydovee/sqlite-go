@@ -344,6 +344,13 @@ func (b *Build) compileFunctionCall(expr *Expr, targetReg int) error {
 
 	// Handle aggregate functions
 	if isAggregate(fnName) {
+		// In output mode: read from the pre-allocated aggregate register
+		if b.inAggOutput {
+			if reg, ok := b.aggFuncRegs[expr]; ok {
+				b.emitSCopy(reg, targetReg)
+				return nil
+			}
+		}
 		return b.compileAggregate(expr, targetReg)
 	}
 
