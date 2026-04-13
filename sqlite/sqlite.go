@@ -30,8 +30,9 @@ type Database struct {
 	closed   bool
 
 	// Schema tracking (simplified: in-memory schema table)
-	tables map[string]*tableEntry
-	views  map[string]*viewEntry
+	tables      map[string]*tableEntry
+	rootPageMap map[int]*tableEntry
+	views       map[string]*viewEntry
 
 	// sqlite_master entries — the system catalog
 	masterEntries []sqliteMasterEntry
@@ -96,6 +97,7 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 
 	db := &Database{
 		tables:         make(map[string]*tableEntry),
+		rootPageMap:    make(map[int]*tableEntry),
 		views:          make(map[string]*viewEntry),
 		columnDefaults: make(map[string]interface{}),
 		autoCommit:     true,
@@ -494,6 +496,7 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		rootPage: int(rootPage),
 		columns:  columns,
 	}
+	db.rootPageMap[int(rootPage)] = db.tables[tableName]
 
 	// Add entry to sqlite_master
 	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
@@ -642,11 +645,13 @@ func (db *Database) execDropTable(tokens []compile.Token) error {
 		return NewErrorf(Error, "no such table: %s", tableName)
 	}
 
-	delete(db.tables, tableName)
+	tbl := db.tables[tableName]
+		delete(db.tables, tableName)
+		delete(db.rootPageMap, tbl.rootPage)
 
-	// Remove the table entry from sqlite_master and any associated indexes
-	db.removeMasterEntry("table", tableName)
-	db.removeMasterEntriesForTable(tableName)
+		// Remove the table entry from sqlite_master and any associated indexes
+		db.removeMasterEntry("table", tableName)
+		db.removeMasterEntriesForTable(tableName)
 
 	return nil
 }
@@ -1870,31 +1875,34 @@ type vdbeDB struct {
 }
 
 func (v vdbeDB) GetTableInfo(rootPage int) (*vdbe.TableInfo, error) {
-	for _, tbl := range v.db.tables {
-		if tbl.rootPage == rootPage {
-			cols := make([]vdbe.ColumnInfo, len(tbl.columns))
-			for i, c := range tbl.columns {
-				aff := byte('u')
-				switch strings.ToUpper(c.typeName) {
-				case "TEXT":
-					aff = 't'
-				case "INTEGER":
-					aff = 'i'
-				case "REAL":
-					aff = 'n'
-				case "BLOB":
-					aff = 'b'
-				}
-				cols[i] = vdbe.ColumnInfo{Name: c.name, Affinity: aff}
-			}
-			return &vdbe.TableInfo{RootPage: rootPage, Columns: cols, Name: tbl.name}, nil
-		}
+	tbl := v.db.rootPageMap[rootPage]
+	if tbl == nil {
+		return nil, fmt.Errorf("no table with root page %d", rootPage)
 	}
-	return nil, fmt.Errorf("no table with root page %d", rootPage)
+	cols := make([]vdbe.ColumnInfo, len(tbl.columns))
+	for i, c := range tbl.columns {
+		aff := byte('u')
+		switch strings.ToUpper(c.typeName) {
+		case "TEXT":
+			aff = 't'
+		case "INTEGER":
+			aff = 'i'
+		case "REAL":
+			aff = 'n'
+		case "BLOB":
+			aff = 'b'
+		}
+		cols[i] = vdbe.ColumnInfo{Name: c.name, Affinity: aff}
+	}
+	return &vdbe.TableInfo{RootPage: rootPage, Columns: cols, Name: tbl.name}, nil
 }
 
 func (v vdbeDB) GetCursor(rootPage int, write bool) (interface{}, error) {
-	cur, err := v.db.bt.Cursor(btree.PageNumber(rootPage), write)
+	tbl := v.db.rootPageMap[rootPage]
+	if tbl == nil {
+		return nil, fmt.Errorf("no table with root page %d", rootPage)
+	}
+	cur, err := v.db.bt.Cursor(btree.PageNumber(tbl.rootPage), write)
 	if err != nil {
 		return nil, err
 	}
@@ -1991,6 +1999,17 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 	var allRows []Row
 	var resultCols []ResultColumnInfo
 
+	// Extract column names upfront (even if there are 0 result rows)
+	for _, stmt := range stmts {
+		if stmt.SelectStmt != nil && resultCols == nil {
+			colNames := extractResultColNames(stmt)
+			resultCols = make([]ResultColumnInfo, len(colNames))
+			for i, n := range colNames {
+				resultCols[i] = ResultColumnInfo{Name: n, Type: ColNull}
+			}
+		}
+	}
+
 	for _, stmt := range stmts {
 		// Compile
 		prog, err := compile.Compile(stmt, schema)
@@ -2025,7 +2044,7 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 			for i := 0; i < count; i++ {
 				idx := startIdx + i
 				if idx < len(regs) {
-					row.values = append(row.values, &regs[idx])
+					cp := regs[idx]; row.values = append(row.values, &cp)
 				} else {
 					row.values = append(row.values, vdbe.NewMemNull())
 				}
@@ -2046,9 +2065,9 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 		// Execute (protected by recover to fall back to hack layer on errors)
 		ctx := context.Background()
 		var stepErr error
-		recoverErr := func() (r interface{}) {
+		func() {
 			defer func() {
-				if r != nil {
+				if r := recover(); r != nil {
 					stepErr = fmt.Errorf("panic during VDBE execution: %v", r)
 				}
 			}()
@@ -2056,14 +2075,14 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 				hasRow, err := vm.Step(ctx)
 				if err != nil {
 					stepErr = err
-					return nil
+					return
 				}
 				if !hasRow {
-					return nil
+					return
 				}
 			}
 		}()
-		if recoverErr != nil {
+		if stepErr != nil {
 			return nil, fmt.Errorf("compile pipeline error: %w", stepErr)
 		}
 
@@ -2127,10 +2146,13 @@ func exprText(e *compile.Expr) string {
 }
 
 // querySingle executes a SELECT and collects results.
-// NOTE: compile pipeline for SELECT FROM table needs cursor wrapper.
-// All SELECTs go through hack layer until that's fixed.
+// Uses the compile pipeline when results match the hack layer; otherwise
+// falls back to hack layer.
 func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, error) {
-	// Go through hack layer for now
+	// Try compile pipeline
+	compileRS, compileErr := db.executeQuery(sql, args)
+
+	// Run hack layer
 	tokens := compile.Tokenize(sql)
 	filtered := filterTokens(tokens)
 	if len(filtered) == 0 {
@@ -2683,12 +2705,41 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		rows = []Row{}
 	}
 
-	return newResultSet(rows, resultCols), nil
-}
+	hackRS := newResultSet(rows, resultCols)
 
-// queryWithCTE handles queries starting with WITH (common table expressions).
-func (db *Database) queryWithCTE(sql string, args []interface{}) (*ResultSet, error) {
-	// Save and restore CTE data for proper scoping
+	// If compile pipeline succeeded and results match, use compile result
+	if compileErr == nil && compileRS != nil {
+		cRows := compileRS.Rows()
+		hRows := hackRS.Rows()
+		if len(cRows) == len(hRows) {
+			match := true
+			for i := range cRows {
+				if cRows[i].ColumnCount() != hRows[i].ColumnCount() {
+					match = false
+					break
+				}
+				for j := 0; j < cRows[i].ColumnCount(); j++ {
+					if cRows[i].ColumnValue(j) != hRows[i].ColumnValue(j) {
+						match = false
+						break
+					}
+				}
+				if !match {
+					break
+				}
+			}
+			if match {
+				return compileRS, nil
+			}
+		}
+	}
+
+	return hackRS, nil
+	}
+
+	// queryWithCTE handles queries starting with WITH (common table expressions).
+	func (db *Database) queryWithCTE(sql string, args []interface{}) (*ResultSet, error) {
+		// Save and restore CTE data for proper scoping
 	oldCTEData := db.cteData
 	db.cteData = make(map[string]*cteTable)
 	defer func() { db.cteData = oldCTEData }()
