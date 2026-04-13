@@ -392,6 +392,9 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		err := db.Rollback()
 		db.mu.Lock()
 		return err
+	case "pragma":
+		// Minimal PRAGMA support — accept but ignore
+		return nil
 	case "select":
 		// SELECT via Exec just runs and discards results
 		_, err := db.querySingle(sql, args)

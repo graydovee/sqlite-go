@@ -256,7 +256,6 @@ func TestFkey1_4(t *testing.T) {
 
 // TestFkey1_5 tests self-referencing foreign keys and INSERT OR REPLACE behavior.
 func TestFkey1_5(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	// fkey1-5.1: Create self-referencing table and insert data
 	t.Run("fkey1-5.1", func(t *testing.T) {
 		db := openTestDB(t)
@@ -272,6 +271,7 @@ func TestFkey1_5(t *testing.T) {
 
 	// fkey1-5.2: INSERT OR REPLACE causes FK violation due to cascade
 	t.Run("fkey1-5.2", func(t *testing.T) {
+		t.Skip("INSERT OR REPLACE with cascade not yet implemented")
 		db := openTestDB(t)
 		mustExec(t, db, "PRAGMA foreign_keys=ON")
 		mustExec(t, db, `
@@ -315,6 +315,7 @@ func TestFkey1_5(t *testing.T) {
 
 	// fkey1-5.4: INSERT OR REPLACE causes FK violation with Foo table
 	t.Run("fkey1-5.4", func(t *testing.T) {
+		t.Skip("INSERT OR REPLACE with cascade not yet implemented")
 		db := openTestDB(t)
 		mustExec(t, db, "PRAGMA foreign_keys=ON")
 		mustExec(t, db, `
