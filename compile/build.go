@@ -118,6 +118,10 @@ type Build struct {
 	// GROUP BY: aggregate function register mapping and output mode
 	aggFuncRegs map[*Expr]int // aggregate Expr → accumulator register
 	inAggOutput bool          // when true, aggregate calls copy from register instead of stepping
+	// LIMIT/OFFSET
+	limitReg      int // register holding remaining limit count (0 = no limit active)
+	offsetReg     int // register holding remaining offset count (0 = no offset)
+	limitEndLabel int // label to jump to when limit is exhausted (0 = none)
 }
 
 // newBuild creates a new compilation context.
@@ -436,9 +440,32 @@ func (b *Build) emitMakeRecord(startReg, nCol, destReg int) {
 	b.b.Emit(vdbe.OpMakeRecord, startReg, nCol, destReg)
 }
 
-// emitResultRow emits OP_ResultRow.
+// emitResultRow emits OP_ResultRow, with LIMIT/OFFSET checks when active.
 func (b *Build) emitResultRow(startReg, nCol int) {
-	b.b.Emit(vdbe.OpResultRow, startReg, nCol, 0)
+	if b.limitReg != 0 {
+		skipLabel := b.b.NewLabel()
+
+		// OFFSET: if offset counter > 0, decrement and skip this row
+		if b.offsetReg != 0 {
+			b.b.EmitJump(vdbe.OpIfPos, b.offsetReg, skipLabel, 1)
+		}
+
+		// LIMIT: if limit counter <= 0, stop emitting rows
+		limitOk := b.b.NewLabel()
+		b.b.EmitJump(vdbe.OpIfPos, b.limitReg, limitOk, 0)
+		b.b.EmitJump(vdbe.OpGoto, 0, b.limitEndLabel, 0)
+		b.b.DefineLabel(limitOk)
+
+		// Emit the result row
+		b.b.Emit(vdbe.OpResultRow, startReg, nCol, 0)
+
+		// Decrement limit counter; if it reaches zero, stop
+		b.b.EmitJump(vdbe.OpDecrJumpZero, b.limitReg, b.limitEndLabel, 0)
+
+		b.b.DefineLabel(skipLabel)
+	} else {
+		b.b.Emit(vdbe.OpResultRow, startReg, nCol, 0)
+	}
 }
 
 // emitNewRowid generates a new rowid for a table.

@@ -402,7 +402,114 @@ func TestSelectWithOrderBy(t *testing.T) {
 }
 
 func TestSelectWithLimit(t *testing.T) {
-	t.Skip("LIMIT/OFFSET not yet implemented in query engine")
+	db := openTestDB(t)
+
+	db.Exec("CREATE TABLE t (id INTEGER, name TEXT)")
+	db.Exec("INSERT INTO t VALUES (1, 'Alice')")
+	db.Exec("INSERT INTO t VALUES (2, 'Bob')")
+	db.Exec("INSERT INTO t VALUES (3, 'Charlie')")
+	db.Exec("INSERT INTO t VALUES (4, 'Diana')")
+	db.Exec("INSERT INTO t VALUES (5, 'Eve')")
+
+	// Basic LIMIT
+	rs, err := db.Query("SELECT id, name FROM t LIMIT 2")
+	if err != nil {
+		t.Fatalf("SELECT LIMIT: %v", err)
+	}
+	rows := collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 2 {
+		t.Fatalf("LIMIT 2: expected 2 rows, got %d", len(rows))
+	}
+
+	// LIMIT with OFFSET
+	rs, err = db.Query("SELECT id, name FROM t LIMIT 2 OFFSET 1")
+	if err != nil {
+		t.Fatalf("SELECT LIMIT OFFSET: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 2 {
+		t.Fatalf("LIMIT 2 OFFSET 1: expected 2 rows, got %d", len(rows))
+	}
+	if rows[0]["id"] != int64(2) {
+		t.Errorf("OFFSET 1 first row id: got %v, want 2", rows[0]["id"])
+	}
+	if rows[1]["id"] != int64(3) {
+		t.Errorf("OFFSET 1 second row id: got %v, want 3", rows[1]["id"])
+	}
+
+	// LIMIT larger than row count
+	rs, err = db.Query("SELECT id, name FROM t LIMIT 100")
+	if err != nil {
+		t.Fatalf("SELECT LIMIT 100: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 5 {
+		t.Fatalf("LIMIT 100: expected 5 rows, got %d", len(rows))
+	}
+
+	// LIMIT 0 returns no rows
+	rs, err = db.Query("SELECT id, name FROM t LIMIT 0")
+	if err != nil {
+		t.Fatalf("SELECT LIMIT 0: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 0 {
+		t.Fatalf("LIMIT 0: expected 0 rows, got %d", len(rows))
+	}
+
+	// LIMIT with ORDER BY
+	rs, err = db.Query("SELECT id, name FROM t ORDER BY id DESC LIMIT 2")
+	if err != nil {
+		t.Fatalf("SELECT ORDER BY LIMIT: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 2 {
+		t.Fatalf("ORDER BY DESC LIMIT 2: expected 2 rows, got %d", len(rows))
+	}
+	if rows[0]["id"] != int64(5) {
+		t.Errorf("ORDER BY DESC first row id: got %v, want 5", rows[0]["id"])
+	}
+	if rows[1]["id"] != int64(4) {
+		t.Errorf("ORDER BY DESC second row id: got %v, want 4", rows[1]["id"])
+	}
+
+	// OFFSET larger than row count returns no rows
+	rs, err = db.Query("SELECT id, name FROM t LIMIT 2 OFFSET 100")
+	if err != nil {
+		t.Fatalf("SELECT LIMIT OFFSET > rows: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 0 {
+		t.Fatalf("LIMIT 2 OFFSET 100: expected 0 rows, got %d", len(rows))
+	}
+
+	// No FROM clause with LIMIT
+	rs, err = db.Query("SELECT 1 AS one LIMIT 1")
+	if err != nil {
+		t.Fatalf("SELECT 1 LIMIT 1: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 1 {
+		t.Fatalf("SELECT 1 LIMIT 1: expected 1 row, got %d", len(rows))
+	}
+
+	// No FROM clause with LIMIT 0
+	rs, err = db.Query("SELECT 1 AS one LIMIT 0")
+	if err != nil {
+		t.Fatalf("SELECT 1 LIMIT 0: %v", err)
+	}
+	rows = collectRows(t, rs)
+	rs.Close()
+	if len(rows) != 0 {
+		t.Fatalf("SELECT 1 LIMIT 0: expected 0 rows, got %d", len(rows))
+	}
 }
 
 func TestSelectDistinct(t *testing.T) {

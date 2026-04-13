@@ -76,6 +76,11 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 		orderByBase = b.b.AllocReg(len(stmt.OrderBy))
 	}
 
+	// Set up LIMIT/OFFSET registers before the main body
+	if err := b.emitLimit(stmt); err != nil {
+		return err
+	}
+
 	if len(b.tables) == 0 {
 		// No FROM clause: evaluate result columns once and output
 		for i, rc := range resultCols {
@@ -126,11 +131,13 @@ func (b *Build) compileSimpleSelect(stmt *SelectStmt) error {
 		}
 	}
 
-	// Handle LIMIT/OFFSET
-	if stmt.Limit != nil {
-		if err := b.emitLimit(stmt); err != nil {
-			return err
-		}
+	// Define the LIMIT end label (jump target when limit is exhausted)
+	if b.limitEndLabel != 0 {
+		b.b.DefineLabel(b.limitEndLabel)
+		// Reset limit state for clean reuse
+		b.limitReg = 0
+		b.offsetReg = 0
+		b.limitEndLabel = 0
 	}
 
 	b.emitHalt(0)
@@ -1408,20 +1415,20 @@ func (b *Build) emitLimit(stmt *SelectStmt) error {
 		return nil
 	}
 
+	b.limitEndLabel = b.b.NewLabel()
+
 	// Evaluate LIMIT value
-	limitReg := b.b.AllocReg(1)
-	if err := b.compileExpr(stmt.Limit, limitReg); err != nil {
+	b.limitReg = b.b.AllocReg(1)
+	if err := b.compileExpr(stmt.Limit, b.limitReg); err != nil {
 		return err
 	}
 
 	// If there's an OFFSET, evaluate it
 	if stmt.Offset != nil {
-		offsetReg := b.b.AllocReg(1)
-		if err := b.compileExpr(stmt.Offset, offsetReg); err != nil {
+		b.offsetReg = b.b.AllocReg(1)
+		if err := b.compileExpr(stmt.Offset, b.offsetReg); err != nil {
 			return err
 		}
-		// Subtract offset from limit (simplified)
-		_ = offsetReg
 	}
 
 	return nil

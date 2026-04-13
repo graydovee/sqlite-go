@@ -2232,6 +2232,31 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		}
 	}
 
+	// Parse LIMIT/OFFSET early (needed for no-FROM path too)
+	var earlyLimit int = -1
+	var earlyOffset int
+	earlyPos := pos
+	for earlyPos < len(filtered) && !isKeyword(filtered[earlyPos], "limit") {
+		earlyPos++
+	}
+	if earlyPos < len(filtered) && isKeyword(filtered[earlyPos], "limit") {
+		earlyPos++
+		if earlyPos < len(filtered) {
+			if n, err := strconv.Atoi(filtered[earlyPos].Value); err == nil {
+				earlyLimit = n
+			}
+			earlyPos++
+		}
+		if earlyPos < len(filtered) && isKeyword(filtered[earlyPos], "offset") {
+			earlyPos++
+			if earlyPos < len(filtered) {
+				if n, err := strconv.Atoi(filtered[earlyPos].Value); err == nil {
+					earlyOffset = n
+				}
+			}
+		}
+	}
+
 	// Parse FROM clause
 	var tableName string
 	var joinTables []joinTableInfo
@@ -2246,7 +2271,33 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	// For SELECT without FROM (e.g., SELECT 1+2), compute directly
 	if tableName == "" {
-		return db.selectWithoutTable(cols, args)
+		rs, err := db.selectWithoutTable(cols, args)
+		if err != nil {
+			return nil, err
+		}
+		if earlyLimit >= 0 {
+			allRows := rs.Rows()
+			if earlyOffset > 0 {
+				if earlyOffset < len(allRows) {
+					allRows = allRows[earlyOffset:]
+				} else {
+					allRows = []Row{}
+				}
+			}
+			if earlyLimit < len(allRows) {
+				allRows = allRows[:earlyLimit]
+			}
+			if len(allRows) == 0 {
+				allRows = []Row{}
+			}
+			// Preserve column info from original result
+			rc := make([]ResultColumnInfo, rs.ColumnCount())
+			for i := 0; i < rs.ColumnCount(); i++ {
+				rc[i] = *rs.ColumnInfo(i)
+			}
+			rs = newResultSet(allRows, rc)
+		}
+		return rs, nil
 	}
 
 	// Handle sqlite_master / sqlite_schema virtual table
@@ -2402,6 +2453,39 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 				orderDesc = true
 				pos++
 			} else if pos < len(filtered) && isKeyword(filtered[pos], "asc") {
+				pos++
+			}
+		}
+	}
+
+	// Parse LIMIT/OFFSET
+	var limitVal int = -1
+	var offsetVal int
+	if pos < len(filtered) && isKeyword(filtered[pos], "limit") {
+		pos++
+		if pos < len(filtered) {
+			if n, err := strconv.Atoi(filtered[pos].Value); err == nil {
+				limitVal = n
+			}
+			pos++
+		}
+		// OFFSET or comma form
+		if pos < len(filtered) && isKeyword(filtered[pos], "offset") {
+			pos++
+			if pos < len(filtered) {
+				if n, err := strconv.Atoi(filtered[pos].Value); err == nil {
+					offsetVal = n
+				}
+				pos++
+			}
+		} else if pos < len(filtered) && filtered[pos].Type == compile.TokenComma {
+			// LIMIT offset, count (SQLite alternative syntax)
+			pos++
+			if pos < len(filtered) {
+				if n, err := strconv.Atoi(filtered[pos].Value); err == nil {
+					offsetVal = limitVal
+					limitVal = n
+				}
 				pos++
 			}
 		}
@@ -2703,6 +2787,20 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	if rows == nil {
 		rows = []Row{}
+	}
+
+	// Apply LIMIT/OFFSET
+	if limitVal >= 0 {
+		if offsetVal > 0 {
+			if offsetVal < len(rows) {
+				rows = rows[offsetVal:]
+			} else {
+				rows = []Row{}
+			}
+		}
+		if limitVal < len(rows) {
+			rows = rows[:limitVal]
+		}
 	}
 
 	hackRS := newResultSet(rows, resultCols)
