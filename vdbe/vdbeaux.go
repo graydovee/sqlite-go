@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/sqlite-go/sqlite-go/btree"
 )
 
 // OpcodeName returns the human-readable name for an opcode.
@@ -408,7 +410,7 @@ func VdbeList(prog *Program) string {
 func (v *VDBE) CleanupCursors() {
 	for i, vc := range v.cursors {
 		if vc != nil {
-			if cursor, ok := vc.Cursor.(Cursor); ok {
+			if cursor, ok := vc.Cursor.(btree.BTCursor); ok {
 				cursor.Close()
 			}
 			v.cursors[i] = nil

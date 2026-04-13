@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/sqlite-go/sqlite-go/btree"
 )
 
 // ─── Mock Database ────────────────────────────────────────────────────────
@@ -108,7 +110,15 @@ func (m *mockDB) TotalChanges() int64       { return m.totalChanges }
 func (m *mockDB) LastInsertRowID() int64    { return m.lastInsertID }
 func (m *mockDB) SetLastInsertRowID(id int64) { m.lastInsertID = id }
 
-// Mock cursor implementing Cursor interface
+func (m *mockDB) Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error {
+	return nil
+}
+
+func (m *mockDB) Delete(cursor interface{}) error {
+	return nil
+}
+
+// Mock cursor implementing btree.BTCursor interface
 func (c *mockCursor) Close() error       { c.closed = true; c.valid = false; return nil }
 func (c *mockCursor) First() (bool, error) {
 	if len(c.rows) == 0 {
@@ -151,13 +161,17 @@ func (c *mockCursor) Data() ([]byte, error) {
 	}
 	return c.rows[c.current].data, nil
 }
-func (c *mockCursor) RowID() int64 {
+func (c *mockCursor) RowID() btree.RowID {
 	if !c.valid || c.current < 0 || c.current >= len(c.rows) {
 		return 0
 	}
-	return c.rows[c.current].rowid
+	return btree.RowID(c.rows[c.current].rowid)
 }
 func (c *mockCursor) IsValid() bool       { return c.valid }
+func (c *mockCursor) Seek(key []byte) (btree.SeekResult, error) { return btree.SeekNotFound, nil }
+func (c *mockCursor) SeekRowid(rowid btree.RowID) (btree.SeekResult, error) { return btree.SeekNotFound, nil }
+func (c *mockCursor) SeekNear(key []byte) (btree.SeekResult, error) { return btree.SeekNotFound, nil }
+func (c *mockCursor) SetRowID(rowid btree.RowID) error { return nil }
 
 // ─── Helper ──────────────────────────────────────────────────────────────
 

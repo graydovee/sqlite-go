@@ -73,28 +73,9 @@ type Database interface {
 	LastInsertRowID() int64
 	// SetLastInsertRowID sets the last inserted rowid.
 	SetLastInsertRowID(rowid int64)
-}
-
-// Cursor is the interface for B-Tree cursor operations used by VDBE opcodes.
-type Cursor interface {
-	Close() error
-	First() (bool, error)
-	Last() (bool, error)
-	Next() (bool, error)
-	Prev() (bool, error)
-	Key() []byte
-	Data() ([]byte, error)
-	RowID() int64
-	IsValid() bool
-}
-
-// Inserter is the interface for cursor insert operations.
-type Inserter interface {
+	// Insert inserts a row into the database.
 	Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error
-}
-
-// Deleter is the interface for cursor delete operations.
-type Deleter interface {
+	// Delete deletes the row at the cursor position.
 	Delete(cursor interface{}) error
 }
 
@@ -477,7 +458,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 
 		case OpClose:
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					cursor.Close()
 				}
 				v.cursors[pOp.P1] = nil
@@ -487,7 +468,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			hasRow := false
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
 				v.cursors[pOp.P1].NullRow = false
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					var err error
 					hasRow, err = cursor.First()
 					if err != nil {
@@ -503,7 +484,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			hasRow := false
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
 				v.cursors[pOp.P1].NullRow = false
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					var err error
 					hasRow, err = cursor.Last()
 					if err != nil {
@@ -518,7 +499,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 		case OpNext:
 			hasRow := false
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					var err error
 					hasRow, err = cursor.Next()
 					if err != nil {
@@ -533,7 +514,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 		case OpPrev:
 			hasRow := false
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					var err error
 					hasRow, err = cursor.Prev()
 					if err != nil {
@@ -549,7 +530,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			hasRow := false
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
 				v.cursors[pOp.P1].NullRow = false
-				if cursor, ok := v.cursors[pOp.P1].Cursor.(Cursor); ok {
+				if cursor, ok := v.cursors[pOp.P1].Cursor.(btree.BTCursor); ok {
 					var err error
 					hasRow, err = cursor.First()
 					if err != nil {
@@ -1579,8 +1560,8 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			}
 			keyBuf := make([]byte, 9)
 			keyLen := putVarint(keyBuf, rowid)
-			if inserter, ok := v.db.(Inserter); ok && cursor != nil {
-				if err := inserter.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
+			if cursor != nil {
+				if err := v.db.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
 					v.err = err
 					v.rc = ResultError
 				}
@@ -1636,10 +1617,10 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			// Position cursor P1 at end. If already valid, no-op.
 			if pOp.P1 < len(v.cursors) && v.cursors[pOp.P1] != nil {
 				vc := v.cursors[pOp.P1]
-				if cursor, ok := vc.Cursor.(Cursor); ok && cursor.IsValid() {
+				if cursor, ok := vc.Cursor.(btree.BTCursor); ok && cursor.IsValid() {
 					break
 				}
-				if cursor, ok := vc.Cursor.(Cursor); ok {
+				if cursor, ok := vc.Cursor.(btree.BTCursor); ok {
 					cursor.Last()
 					vc.NullRow = false
 				}
@@ -1651,7 +1632,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				vc := v.cursors[pOp.P1]
 				if vc.RootPage == pOp.P2 {
 					vc.NullRow = true
-					if cursor, ok := vc.Cursor.(Cursor); ok {
+					if cursor, ok := vc.Cursor.(btree.BTCursor); ok {
 						cursor.First()
 					}
 					break
@@ -1680,21 +1661,8 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 					}
 					bc.First()
 				}
-			} else if cursor, ok := vc.Cursor.(Cursor); ok {
-				count = 0
-				if hasFirst, _ := cursor.First(); hasFirst {
-					count = 1
-					for {
-						hasNext, err := cursor.Next()
-						if err != nil || !hasNext {
-							break
-						}
-						count++
-					}
-					cursor.First()
-				}
-			}
 			if pOp.P3 != 0 && count > 0 {
+			}
 				est := int64(1)
 				for est < count {
 					est *= 2
@@ -1760,7 +1728,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 				if vc.NullRow {
 					typeMask = 0x10
 				} else {
-					cursor, ok := vc.Cursor.(Cursor)
+					cursor, ok := vc.Cursor.(btree.BTCursor)
 					if !ok || !cursor.IsValid() {
 						typeMask = 0x10
 					} else {
@@ -2011,7 +1979,7 @@ func (v *VDBE) execColumn(pOp *Instruction) {
 		return
 	}
 
-	cursor, ok := vc.Cursor.(Cursor)
+	cursor, ok := vc.Cursor.(btree.BTCursor)
 	if !ok || !cursor.IsValid() {
 		v.regs[destIdx].SetNull()
 		return
@@ -2069,11 +2037,11 @@ func (v *VDBE) execNewRowId(pOp *Instruction) {
 	var newRowID int64 = 1
 
 	if cursorIdx < len(v.cursors) && v.cursors[cursorIdx] != nil {
-		cursor, ok := v.cursors[cursorIdx].Cursor.(Cursor)
+		cursor, ok := v.cursors[cursorIdx].Cursor.(btree.BTCursor)
 		if ok {
 			// Try to find a new row ID by going to last and incrementing
 			if hasRow, _ := cursor.Last(); hasRow {
-				lastID := cursor.RowID()
+				lastID := int64(cursor.RowID())
 				newRowID = lastID + 1
 			}
 		}
@@ -2119,9 +2087,9 @@ func (v *VDBE) execInsert(pOp *Instruction) {
 	keyBuf := make([]byte, 9)
 	keyLen := putVarint(keyBuf, rowid)
 
-	// Try using Inserter interface
-	if inserter, ok := v.db.(Inserter); ok && cursor != nil {
-		if err := inserter.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
+	// Insert the row
+	if cursor != nil {
+		if err := v.db.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
 			v.err = err
 			v.rc = ResultError
 			return
@@ -2144,8 +2112,8 @@ func (v *VDBE) execDelete(pOp *Instruction) {
 	vc := v.cursors[cursorIdx]
 	cursor := vc.Cursor
 
-	if deleter, ok := v.db.(Deleter); ok && cursor != nil {
-		if err := deleter.Delete(cursor); err != nil {
+	if cursor != nil {
+		if err := v.db.Delete(cursor); err != nil {
 			v.err = err
 			v.rc = ResultError
 		}
@@ -2228,12 +2196,10 @@ func (v *VDBE) execIdxInsert(pOp *Instruction) {
 		key = []byte{}
 	}
 
-	// For index inserts, we use the Inserter interface on db
-	if inserter, ok := v.db.(Inserter); ok {
-		if err := inserter.Insert(vc.Cursor, key, nil, 0, 0); err != nil {
-			v.err = err
-			v.rc = ResultError
-		}
+	// For index inserts, use Insert method on db
+	if err := v.db.Insert(vc.Cursor, key, nil, 0, 0); err != nil {
+		v.err = err
+		v.rc = ResultError
 	}
 }
 
@@ -2283,8 +2249,8 @@ func (v *VDBE) execIdxDelete(pOp *Instruction) {
 	}
 
 	// Delete at current position
-	if deleter, ok := v.db.(Deleter); ok && bc.IsValid() {
-		if err := deleter.Delete(vc.Cursor); err != nil {
+	if bc.IsValid() {
+		if err := v.db.Delete(vc.Cursor); err != nil {
 			v.err = err
 			v.rc = ResultError
 		}
@@ -3599,7 +3565,7 @@ func typeMaskFromMem(m *Mem) int {
 
 // typeMaskFromCursor reads column colIdx from the cursor's current row
 // and returns the type mask. Falls back to NULL if column cannot be read.
-func typeMaskFromCursor(cursor Cursor, colIdx int) int {
+func typeMaskFromCursor(cursor btree.BTCursor, colIdx int) int {
 	data, err := cursor.Data()
 	if err != nil || data == nil {
 		return 0x10

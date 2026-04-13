@@ -686,6 +686,8 @@ func (m *fuzzMockDB) Changes() int64                                          { 
 func (m *fuzzMockDB) TotalChanges() int64                                     { return 0 }
 func (m *fuzzMockDB) LastInsertRowID() int64                                  { return 0 }
 func (m *fuzzMockDB) SetLastInsertRowID(id int64)                             {}
+func (m *fuzzMockDB) Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error { return nil }
+func (m *fuzzMockDB) Delete(cursor interface{}) error                         { return nil }
 
 // Suppress unused import warnings
 var _ = utf8.RuneLen
