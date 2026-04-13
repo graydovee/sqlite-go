@@ -645,7 +645,18 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 							}
 							continue
 						}
-						// DEFERRABLE and other modifiers - skip
+						if isKeyword(tokens[pos], "deferrable") {
+							fk.deferred = true
+							pos++
+							// Skip optional INITIALLY DEFERRED / INITIALLY IMMEDIATE
+							if pos < len(tokens) && isKeyword(tokens[pos], "initially") {
+								pos++
+								if pos < len(tokens) && (isKeyword(tokens[pos], "deferred") || isKeyword(tokens[pos], "immediate")) {
+									pos++
+								}
+							}
+							continue
+						}
 						pos++
 					}
 					if fk.onDelete == "" {

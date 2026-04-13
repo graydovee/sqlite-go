@@ -58,7 +58,7 @@ func TestFkey2SimpleImmediate(t *testing.T) {
 
 // TestFkey2Deferred tests deferred FK constraints inside transactions.
 func TestFkey2Deferred(t *testing.T) {
-	t.Skip("DEFERRABLE INITIALLY DEFERRED not implemented")
+	// DEFERRABLE INITIALLY DEFERRED
 	db := openTestDB(t)
 	mustExec(t, db, "PRAGMA foreign_keys = on")
 	mustExec(t, db, `CREATE TABLE node(
