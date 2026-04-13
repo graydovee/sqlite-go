@@ -115,6 +115,9 @@ type Build struct {
 	// GROUP BY: direct sorter column access
 	groupSorterCursor int            // sorter cursor during GROUP BY (0 = not active)
 	groupColOffsets   map[string]int // table name (upper) -> flat column offset in sorter data
+	// GROUP BY: aggregate function register mapping and output mode
+	aggFuncRegs map[*Expr]int // aggregate Expr → accumulator register
+	inAggOutput bool          // when true, aggregate calls copy from register instead of stepping
 }
 
 // newBuild creates a new compilation context.

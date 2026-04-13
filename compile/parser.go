@@ -423,6 +423,9 @@ func (p *Parser) parseSelectCore() *SelectStmt {
 		p.advance() // GROUP
 		p.expectKw(KwBy)
 		sel.GroupBy = p.parseExprList()
+		if len(sel.GroupBy) == 0 {
+			p.errorf("GROUP BY requires at least one expression")
+		}
 	}
 
 	// HAVING
