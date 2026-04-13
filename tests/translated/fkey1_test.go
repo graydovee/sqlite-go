@@ -28,7 +28,6 @@ import (
 
 // TestFkey1_1 tests creating tables with various foreign key references.
 func TestFkey1_1(t *testing.T) {
-	t.Skip("Foreign key support not fully implemented")
 	// fkey1-1.0: Create t1 with self-reference and reference to t2
 	t.Run("fkey1-1.0", func(t *testing.T) {
 		db := openTestDB(t)

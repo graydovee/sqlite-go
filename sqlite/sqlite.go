@@ -65,10 +65,18 @@ type sqliteMasterEntry struct {
 }
 
 // tableEntry stores metadata about a table.
+// FKConstraint represents a single-column foreign key constraint.
+type FKConstraint struct {
+	Col      string // local column
+	RefTable string // referenced table
+	RefCol   string // referenced column (empty = parent PK)
+}
+
 type tableEntry struct {
 	name      string
 	rootPage  int
 	columns   []columnEntry
+	fk        []FKConstraint
 }
 
 // viewEntry stores metadata about a view.
@@ -425,13 +433,118 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		return NewErrorf(Error, "table %s already exists", tableName)
 	}
 
-	// Parse column definitions
+	// Parse column definitions and table-level constraints
 	var columns []columnEntry
+	var fkConstraints []FKConstraint
 	// Track which columns have UNIQUE or PRIMARY KEY for auto-index creation
 	var uniqueCols []string
 	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
 		pos++ // skip (
 		for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+			// Table-level FOREIGN KEY constraint
+			if isKeyword(tokens[pos], "foreign") {
+				pos++ // FOREIGN
+				if pos < len(tokens) && isKeyword(tokens[pos], "key") {
+					pos++ // KEY
+				}
+				// Local column list: (col)
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+					pos++ // (
+				}
+				var localCols []string
+				for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+					if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+						localCols = append(localCols, tokens[pos].Value)
+					}
+					pos++
+				}
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
+					pos++ // )
+				}
+				// REFERENCES parent(col)
+				if pos < len(tokens) && isKeyword(tokens[pos], "references") {
+					pos++
+					refTable := ""
+					if pos < len(tokens) {
+						refTable = tokens[pos].Value
+						pos++
+					}
+					var refCols []string
+					if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+						pos++ // (
+						for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+							if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+								refCols = append(refCols, tokens[pos].Value)
+							}
+							pos++
+						}
+						if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
+							pos++ // )
+						}
+					}
+					// Create one FKConstraint per local column
+					for i, lc := range localCols {
+						fk := FKConstraint{Col: lc, RefTable: refTable}
+						if i < len(refCols) {
+							fk.RefCol = refCols[i]
+						}
+						fkConstraints = append(fkConstraints, fk)
+					}
+				}
+				// Skip ON DELETE/ON UPDATE clauses
+				for pos < len(tokens) &&
+					tokens[pos].Type != compile.TokenComma &&
+					tokens[pos].Type != compile.TokenRParen {
+					pos++
+				}
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+					pos++
+				}
+				continue
+			}
+
+			// Table-level CONSTRAINT name FOREIGN KEY ...
+			if isKeyword(tokens[pos], "constraint") {
+				pos++ // CONSTRAINT
+				if pos < len(tokens) {
+					pos++ // constraint name
+				}
+				// If next is FOREIGN KEY, loop back to handle it
+				if pos < len(tokens) && isKeyword(tokens[pos], "foreign") {
+					continue
+				}
+				// Otherwise skip to next comma/rparen
+				for pos < len(tokens) &&
+					tokens[pos].Type != compile.TokenComma &&
+					tokens[pos].Type != compile.TokenRParen {
+					pos++
+				}
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+					pos++
+				}
+				continue
+			}
+
+			// Table-level PRIMARY KEY/UNIQUE/CHECK — skip them
+			if isKeyword(tokens[pos], "primary") || isKeyword(tokens[pos], "unique") || isKeyword(tokens[pos], "check") {
+				depth := 0
+				for pos < len(tokens) {
+					if tokens[pos].Type == compile.TokenLParen {
+						depth++
+					} else if tokens[pos].Type == compile.TokenRParen {
+						if depth == 0 {
+							break
+						}
+						depth--
+					} else if tokens[pos].Type == compile.TokenComma && depth == 0 {
+						pos++
+						break
+					}
+					pos++
+				}
+				continue
+			}
+
 			colName := tokens[pos].Value
 			pos++
 
@@ -441,7 +554,7 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				pos++
 			}
 
-			// Parse constraints (PRIMARY KEY, NOT NULL, UNIQUE, etc.)
+			// Parse column constraints (PRIMARY KEY, NOT NULL, UNIQUE, REFERENCES, etc.)
 			colHasUnique := false
 			colHasPK := false
 			for pos < len(tokens) &&
@@ -452,6 +565,32 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				}
 				if isKeyword(tokens[pos], "primary") {
 					colHasPK = true
+				}
+				// Column-level REFERENCES: parse and store as FK constraint
+				if isKeyword(tokens[pos], "references") {
+					pos++ // REFERENCES
+					refTable := ""
+					if pos < len(tokens) {
+						refTable = tokens[pos].Value
+						pos++
+					}
+					refCol := ""
+					if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+						pos++ // (
+						if pos < len(tokens) && (tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword) {
+							refCol = tokens[pos].Value
+							pos++
+						}
+						if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
+							pos++ // )
+						}
+					}
+					fkConstraints = append(fkConstraints, FKConstraint{
+						Col:      colName,
+						RefTable: refTable,
+						RefCol:   refCol,
+					})
+					continue
 				}
 				pos++
 			}
@@ -510,6 +649,7 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		name:     tableName,
 		rootPage: int(rootPage),
 		columns:  columns,
+		fk:       fkConstraints,
 	}
 	db.rootPageMap[int(rootPage)] = db.tables[tableName]
 
@@ -1634,6 +1774,15 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 		}
 	}
 
+	// Check FK constraints: verify parent row exists
+	if err := db.checkFKInsert(tbl, valMap); err != nil {
+		if needCommit {
+			db.bt.Rollback()
+			db.pgr.Rollback()
+		}
+		return err
+	}
+
 	// Build the record
 	rb := vdbe.NewRecordBuilder()
 	for _, col := range tbl.columns {
@@ -1691,6 +1840,105 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 	}
 
 	return nil
+}
+
+// checkFKInsert verifies that for each FK constraint on the table, a matching
+// parent row exists. Single-column FK only. NULL FK values skip the check.
+func (db *Database) checkFKInsert(tbl *tableEntry, valMap map[string]interface{}) error {
+	for _, fk := range tbl.fk {
+		// NULL FK columns satisfy the constraint (SQLite behavior)
+		if valMap[fk.Col] == nil {
+			continue
+		}
+
+		parentTbl, ok := db.tables[fk.RefTable]
+		if !ok {
+			return NewErrorf(Error, "foreign key mismatch - \"%s\" references nonexistent table \"%s\"",
+				tbl.name, fk.RefTable)
+		}
+
+		// Determine parent column: explicit ref col, or first PK column, or first column
+		refCol := fk.RefCol
+		if refCol == "" {
+			for _, c := range parentTbl.columns {
+				refCol = c.name
+				break
+			}
+		}
+		if refCol == "" {
+			continue
+		}
+
+		// Scan parent table for matching row
+		cursor, err := db.bt.Cursor(btree.PageNumber(parentTbl.rootPage), false)
+		if err != nil {
+			return NewErrorf(Error, "fk check: %s", err)
+		}
+		found := false
+		hasRow, _ := cursor.First()
+		for hasRow {
+			data, derr := cursor.Data()
+			if derr != nil {
+				break
+			}
+			vals, perr := vdbe.ParseRecord(data)
+			if perr != nil {
+				break
+			}
+			// Find the refCol index in parent table
+			for i, c := range parentTbl.columns {
+				if c.name == refCol && i < len(vals) {
+					if fkValuesEqual(vals[i], valMap[fk.Col]) {
+						found = true
+					}
+					break
+				}
+			}
+			if found {
+				break
+			}
+			hasRow, _ = cursor.Next()
+		}
+		cursor.Close()
+
+		if !found {
+			return NewErrorf(ConstraintFK, "foreign key constraint failed")
+		}
+	}
+	return nil
+}
+
+// fkValuesEqual compares a vdbe.Value with a Go interface value for FK matching.
+func fkValuesEqual(v vdbe.Value, want interface{}) bool {
+	switch {
+	case v.Type == "null" && want == nil:
+		return true
+	case v.Type == "null" || want == nil:
+		return false
+	case v.Type == "int":
+		switch w := want.(type) {
+		case int64:
+			return v.IntVal == w
+		case int:
+			return v.IntVal == int64(w)
+		case float64:
+			return float64(v.IntVal) == w
+		}
+	case v.Type == "float":
+		switch w := want.(type) {
+		case float64:
+			return v.FloatVal == w
+		case int64:
+			return v.FloatVal == float64(w)
+		case int:
+			return v.FloatVal == float64(w)
+		}
+	case v.Type == "text":
+		if s, ok := want.(string); ok {
+			return string(v.Bytes) == s
+		}
+	}
+	return fmt.Sprintf("%v", v) == fmt.Sprintf("%v", want)
 }
 
 // execDelete handles DELETE statements.
