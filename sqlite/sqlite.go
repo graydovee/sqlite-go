@@ -50,10 +50,6 @@ type Database struct {
 	// Transaction state
 	inTx bool
 
-	// Foreign key state
-	foreignKeys bool
-	fkStateData *fkState
-
 	// CTE temporary data (populated during WITH query execution)
 	cteData map[string]*cteTable
 }
@@ -373,8 +369,6 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execDelete(filtered, args)
 	case "update":
 		return db.execUpdate(filtered, args)
-	case "pragma":
-		return db.execPragma(filtered)
 	case "begin":
 		db.mu.Unlock()
 		err := db.Begin()
@@ -518,9 +512,6 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 		columns:  columns,
 	}
 	db.rootPageMap[int(rootPage)] = db.tables[tableName]
-
-		// Parse foreign key constraints from the CREATE TABLE tokens
-		db.parseFKFromCreate(tokens, tableName)
 
 	// Add entry to sqlite_master
 	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
@@ -1643,15 +1634,6 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 		}
 	}
 
-	// Enforce foreign key constraints on INSERT
-	if err := db.enforceFKInsert(tbl.name, valMap); err != nil {
-		if needCommit {
-			db.bt.Rollback()
-			db.pgr.Rollback()
-		}
-		return NewError(Constraint, err.Error())
-	}
-
 	// Build the record
 	rb := vdbe.NewRecordBuilder()
 	for _, col := range tbl.columns {
@@ -1758,30 +1740,28 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 		return err
 	}
 	for hasRow {
-		// Read current row data for FK and WHERE checks
-		data, err := cursor.Data()
-		if err != nil {
-			return err
-		}
-		values, err := vdbe.ParseRecord(data)
-		if err != nil {
-			return err
-		}
-		// Pad values for columns added via ALTER TABLE
-		if len(values) < len(tbl.columns) {
-			padded := make([]vdbe.Value, len(tbl.columns))
-			copy(padded, values)
-			for j := len(values); j < len(tbl.columns); j++ {
-				if tbl.columns[j].defaultValue != nil {
-					padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
-				} else {
-					padded[j] = vdbe.Value{Type: "null"}
-				}
-			}
-			values = padded
-		}
-
 		if whereExpr != "" {
+			data, err := cursor.Data()
+			if err != nil {
+				return err
+			}
+			values, err := vdbe.ParseRecord(data)
+			if err != nil {
+				return err
+			}
+			// Pad values for columns added via ALTER TABLE
+			if len(values) < len(tbl.columns) {
+				padded := make([]vdbe.Value, len(tbl.columns))
+				copy(padded, values)
+				for j := len(values); j < len(tbl.columns); j++ {
+					if tbl.columns[j].defaultValue != nil {
+						padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
+					} else {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+				}
+				values = padded
+			}
 			wval := evalExprWithRow(whereExpr, args, colNames, values)
 			if !isTruthy(wval) {
 				hasRow, err = cursor.Next()
@@ -1791,18 +1771,6 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 				continue
 			}
 		}
-
-		// Enforce FK constraints before deleting this row
-		deletedValues := make(map[string]interface{})
-		for i, col := range tbl.columns {
-			if i < len(values) {
-				deletedValues[col.name] = fkValueToInterface(values[i])
-			}
-		}
-		if err := db.enforceFKDelete(tableName, deletedValues); err != nil {
-			return NewError(Constraint, err.Error())
-		}
-
 		if err := db.bt.Delete(cursor); err != nil {
 			return err
 		}
@@ -1886,10 +1854,8 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 
 	// Collect all rows first, then apply updates to avoid cursor invalidation
 	type updateEntry struct {
-		rowid     int64
-		newData   []byte
-		oldValues map[string]interface{}
-		newValues map[string]interface{}
+		rowid   int64
+		newData []byte
 	}
 	var updates []updateEntry
 
@@ -1940,13 +1906,6 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 				continue
 			}
 		}
-		// Save old values for FK enforcement
-		oldVals := make(map[string]interface{})
-		for i, col := range tbl.columns {
-			if i < len(values) {
-				oldVals[col.name] = fkValueToInterface(values[i])
-			}
-		}
 		for _, s := range sets {
 			evalVal := evalExprWithRow(s.exprStr, args, colNames, values)
 			for i, col := range tbl.columns {
@@ -1965,15 +1924,7 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 		newData := rb.Build()
 
-		// Capture new values for FK enforcement
-		newVals := make(map[string]interface{})
-		for i, col := range tbl.columns {
-			if i < len(values) {
-				newVals[col.name] = fkValueToInterface(values[i])
-			}
-		}
-
-		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData, oldValues: oldVals, newValues: newVals})
+		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData})
 		hasRow, err = cursor.Next()
 		if err != nil {
 			return err
@@ -2295,13 +2246,6 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 	// Check for compound SELECT (UNION / UNION ALL / INTERSECT / EXCEPT)
 	if compoundParts := splitCompoundSelect(filtered); len(compoundParts) > 1 {
 		return db.queryCompoundSelect(compoundParts, args)
-	}
-
-	// Handle PRAGMA queries
-	if isKeyword(filtered[0], "pragma") {
-		if rs, handled, err := db.queryPragmaFK(filtered); handled {
-			return rs, err
-		}
 	}
 
 	if !isKeyword(filtered[0], "select") {
@@ -6512,9 +6456,6 @@ func classifyStatement(tokens []compile.Token) string {
 	case "create":
 		if len(tokens) > 1 {
 			second := strings.ToLower(tokens[1].Value)
-			if second == "unique" && len(tokens) > 2 {
-				second = strings.ToLower(tokens[2].Value)
-			}
 			switch second {
 			case "table":
 				return "create_table"
@@ -6546,8 +6487,6 @@ func classifyStatement(tokens []compile.Token) string {
 		return "rollback"
 	case "alter":
 		return "alter"
-	case "pragma":
-		return "pragma"
 	}
 	return first
 }
