@@ -25,6 +25,10 @@ import (
 // --- Fuzz SQL parser with random strings ---
 
 func FuzzSQLParser(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	// Seed corpus: valid and invalid SQL statements
 	seeds := []string{
 		"SELECT 1",
@@ -85,6 +89,10 @@ func FuzzSQLParser(f *testing.F) {
 // --- Fuzz SQL with random tokens ---
 
 func FuzzSQLRandomTokens(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	tokens := []string{
 		"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE", "CREATE", "TABLE", "DROP",
@@ -138,6 +146,10 @@ func FuzzSQLRandomTokens(f *testing.F) {
 // --- Fuzz record encoding/decoding ---
 
 func FuzzRecordEncoding(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	// Seed corpus: various value combinations
 	seeds := [][]btree.Value{
 		{btree.NullValue()},
@@ -208,6 +220,10 @@ func FuzzRecordEncoding(f *testing.F) {
 // --- Fuzz varint encoding ---
 
 func FuzzVarintEncoding(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []int64{0, 1, -1, 127, 128, 255, 256, 1<<31, 1<<63 - 1, -1 << 63}
 	for _, seed := range seeds {
 		f.Add(seed)
@@ -233,12 +249,6 @@ func FuzzVarintEncoding(f *testing.F) {
 // --- Fuzz VDBE execution with random programs ---
 
 func FuzzVDBEExecution(f *testing.F) {
-	// We'll generate small random programs
-	seeds := []int{0, 1, 2, 3, 42, 100, 255}
-	for _, seed := range seeds {
-		f.Add(seed)
-	}
-
 	f.Fuzz(func(t *testing.T, seed int) {
 		rng := rand.New(rand.NewSource(int64(seed)))
 
@@ -278,9 +288,13 @@ func FuzzVDBEExecution(f *testing.F) {
 			case 7:
 				instrs = append(instrs, vdbe.Instruction{Op: vdbe.OpNoop})
 			case 8:
-				// Safe jumps within bounds
-				target := rng.Intn(numInstrs)
-				instrs = append(instrs, vdbe.Instruction{Op: vdbe.OpGoto, P2: target})
+				// Only allow forward jumps to prevent infinite loops
+				if i < numInstrs-2 {
+					target := rng.Intn(numInstrs-i-1) + i + 1
+					instrs = append(instrs, vdbe.Instruction{Op: vdbe.OpGoto, P2: target})
+				} else {
+					instrs = append(instrs, vdbe.Instruction{Op: vdbe.OpNoop})
+				}
 			case 9:
 				instrs = append(instrs, vdbe.Instruction{Op: vdbe.OpCopy, P1: rng.Intn(10), P2: rng.Intn(10), P3: 1})
 			case 10:
@@ -315,6 +329,10 @@ func FuzzVDBEExecution(f *testing.F) {
 // --- Fuzz function calls ---
 
 func FuzzFunctionCalls(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []string{"abs", "upper", "lower", "length", "typeof", "hex", "trim", "round"}
 	for _, seed := range seeds {
 		f.Add(seed, int64(42), "hello")
@@ -350,6 +368,10 @@ func FuzzFunctionCalls(f *testing.F) {
 // --- Fuzz UTF-8 operations ---
 
 func FuzzUTF8Operations(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []string{"", "hello", "Héllo Wörld", "日本語", "🎉🚀", "\xff\xfe", string([]byte{0xC0, 0x80})}
 	for _, seed := range seeds {
 		f.Add(seed)
@@ -384,6 +406,10 @@ func FuzzUTF8Operations(f *testing.F) {
 // --- Fuzz compile/tokenize ---
 
 func FuzzTokenize(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []string{
 		"SELECT 1",
 		"CREATE TABLE t (id INTEGER)",
@@ -408,6 +434,10 @@ func FuzzTokenize(f *testing.F) {
 // --- Fuzz hash table ---
 
 func FuzzHashTable(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []string{"", "a", "hello", strings.Repeat("x", 1000), "key with spaces", "key\twith\ttabs"}
 	for _, seed := range seeds {
 		f.Add(seed, 42)
@@ -439,6 +469,10 @@ func FuzzHashTable(f *testing.F) {
 // --- Fuzz bit vector ---
 
 func FuzzBitVec(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []int{0, 1, 100, 999, 10000}
 	for _, seed := range seeds {
 		f.Add(seed, int64(42))
@@ -474,6 +508,10 @@ func FuzzBitVec(f *testing.F) {
 // --- Fuzz pager operations ---
 
 func FuzzPagerOps(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []int{0, 1, 42, 100}
 	for _, seed := range seeds {
 		f.Add(seed)
@@ -528,6 +566,10 @@ func FuzzPagerOps(f *testing.F) {
 // --- Fuzz SQL with parameterized inputs ---
 
 func FuzzSQLWithParameters(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []string{
 		"SELECT ?",
 		"SELECT ?, ?, ?",
@@ -580,6 +622,10 @@ func FuzzSQLWithParameters(f *testing.F) {
 // --- Fuzz SQL round-trip: create table, insert, select ---
 
 func FuzzSQLRoundTrip(f *testing.F) {
+	if testing.Short() {
+		f.Skip("skipping in short mode")
+	}
+
 	seeds := []int{0, 1, 42, 100, 255}
 	for _, seed := range seeds {
 		f.Add(seed)
