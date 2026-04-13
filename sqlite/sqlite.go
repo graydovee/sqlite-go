@@ -70,6 +70,8 @@ type FKConstraint struct {
 	Col      string // local column
 	RefTable string // referenced table
 	RefCol   string // referenced column (empty = parent PK)
+	OnDelete string // ON DELETE action: CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT
+	OnUpdate string // ON UPDATE action: CASCADE, RESTRICT, NO ACTION, SET NULL, SET DEFAULT
 }
 
 type tableEntry struct {
@@ -464,6 +466,7 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 				if pos < len(tokens) && tokens[pos].Type == compile.TokenRParen {
 					pos++ // )
 				}
+				fkStart := len(fkConstraints)
 				// REFERENCES parent(col)
 				if pos < len(tokens) && isKeyword(tokens[pos], "references") {
 					pos++
@@ -494,11 +497,34 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 						fkConstraints = append(fkConstraints, fk)
 					}
 				}
-				// Skip ON DELETE/ON UPDATE clauses
+				// Parse ON DELETE / ON UPDATE clauses
+				var onDelete, onUpdate string
 				for pos < len(tokens) &&
 					tokens[pos].Type != compile.TokenComma &&
 					tokens[pos].Type != compile.TokenRParen {
-					pos++
+					if isKeyword(tokens[pos], "on") {
+						pos++ // ON
+						if pos < len(tokens) && isKeyword(tokens[pos], "delete") {
+							pos++ // DELETE
+							if pos < len(tokens) {
+								onDelete = strings.ToUpper(tokens[pos].Value)
+								pos++
+							}
+						} else if pos < len(tokens) && isKeyword(tokens[pos], "update") {
+							pos++ // UPDATE
+							if pos < len(tokens) {
+								onUpdate = strings.ToUpper(tokens[pos].Value)
+								pos++
+							}
+						}
+					} else {
+						pos++
+					}
+				}
+				// Apply actions to the FK constraints just created
+				for i := fkStart; i < len(fkConstraints); i++ {
+					fkConstraints[i].OnDelete = onDelete
+					fkConstraints[i].OnUpdate = onUpdate
 				}
 				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
 					pos++
@@ -593,6 +619,28 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 						RefTable: refTable,
 						RefCol:   refCol,
 					})
+					continue
+				}
+				// Column-level ON DELETE / ON UPDATE
+				if isKeyword(tokens[pos], "on") {
+					pos++ // ON
+					if pos < len(tokens) && isKeyword(tokens[pos], "delete") {
+						pos++ // DELETE
+						if pos < len(tokens) {
+							if len(fkConstraints) > 0 {
+								fkConstraints[len(fkConstraints)-1].OnDelete = strings.ToUpper(tokens[pos].Value)
+							}
+							pos++
+						}
+					} else if pos < len(tokens) && isKeyword(tokens[pos], "update") {
+						pos++ // UPDATE
+						if pos < len(tokens) {
+							if len(fkConstraints) > 0 {
+								fkConstraints[len(fkConstraints)-1].OnUpdate = strings.ToUpper(tokens[pos].Value)
+							}
+							pos++
+						}
+					}
 					continue
 				}
 				pos++
@@ -1944,6 +1992,220 @@ func fkValuesEqual(v vdbe.Value, want interface{}) bool {
 	return fmt.Sprintf("%v", v) == fmt.Sprintf("%v", want)
 }
 
+// valueToInterface converts a vdbe.Value to a Go interface{} for FK matching.
+func valueToInterface(v vdbe.Value) interface{} {
+	switch v.Type {
+	case "int":
+		return v.IntVal
+	case "float":
+		return v.FloatVal
+	case "text":
+		return string(v.Bytes)
+	case "null":
+		return nil
+	}
+	return nil
+}
+
+// cascadeDelete removes child rows that reference a parent key being deleted,
+// for FK constraints with ON DELETE CASCADE.
+func (db *Database) cascadeDelete(parentTbl *tableEntry, parentValues []vdbe.Value) error {
+	for _, tbl := range db.tables {
+		if tbl == parentTbl {
+			continue
+		}
+		for _, fk := range tbl.fk {
+			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
+				continue
+			}
+			if !strings.EqualFold(fk.OnDelete, "CASCADE") {
+				continue
+			}
+			refCol := fk.RefCol
+			if refCol == "" {
+				for _, c := range parentTbl.columns {
+					refCol = c.name
+					break
+				}
+			}
+			if refCol == "" {
+				continue
+			}
+			var parentKey interface{}
+			for i, c := range parentTbl.columns {
+				if strings.EqualFold(c.name, refCol) && i < len(parentValues) {
+					parentKey = valueToInterface(parentValues[i])
+					break
+				}
+			}
+			if parentKey == nil {
+				continue
+			}
+			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
+			if err != nil {
+				return NewErrorf(Error, "cascade delete cursor: %s", err)
+			}
+			hasRow, err := childCursor.First()
+			if err != nil {
+				childCursor.Close()
+				return err
+			}
+			for hasRow {
+				data, err := childCursor.Data()
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				childVals, err := vdbe.ParseRecord(data)
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				if len(childVals) < len(tbl.columns) {
+					padded := make([]vdbe.Value, len(tbl.columns))
+					copy(padded, childVals)
+					for j := len(childVals); j < len(tbl.columns); j++ {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+					childVals = padded
+				}
+				match := false
+				for i, c := range tbl.columns {
+					if strings.EqualFold(c.name, fk.Col) && i < len(childVals) {
+						if fkValuesEqual(childVals[i], parentKey) {
+							match = true
+						}
+						break
+					}
+				}
+				if match {
+					if err := db.bt.Delete(childCursor); err != nil {
+						childCursor.Close()
+						return err
+					}
+					hasRow, err = childCursor.First()
+					if err != nil {
+						childCursor.Close()
+						return err
+					}
+				} else {
+					hasRow, err = childCursor.Next()
+					if err != nil {
+						childCursor.Close()
+						return err
+					}
+				}
+			}
+			childCursor.Close()
+		}
+	}
+	return nil
+}
+
+// cascadeUpdate updates child FK columns when a parent key changes,
+// for FK constraints with ON UPDATE CASCADE.
+func (db *Database) cascadeUpdate(parentTbl *tableEntry, oldVals, newVals []vdbe.Value) error {
+	for _, tbl := range db.tables {
+		if tbl == parentTbl {
+			continue
+		}
+		for _, fk := range tbl.fk {
+			if !strings.EqualFold(fk.RefTable, parentTbl.name) {
+				continue
+			}
+			if !strings.EqualFold(fk.OnUpdate, "CASCADE") {
+				continue
+			}
+			refCol := fk.RefCol
+			if refCol == "" {
+				for _, c := range parentTbl.columns {
+					refCol = c.name
+					break
+				}
+			}
+			refIdx := -1
+			for i, c := range parentTbl.columns {
+				if strings.EqualFold(c.name, refCol) {
+					refIdx = i
+					break
+				}
+			}
+			if refIdx < 0 || refIdx >= len(oldVals) || refIdx >= len(newVals) {
+				continue
+			}
+			oldKey := valueToInterface(oldVals[refIdx])
+			if oldKey == nil {
+				continue
+			}
+			// If value didn't change, skip
+			if fkValuesEqual(oldVals[refIdx], valueToInterface(newVals[refIdx])) {
+				continue
+			}
+			fkColIdx := -1
+			for i, c := range tbl.columns {
+				if strings.EqualFold(c.name, fk.Col) {
+					fkColIdx = i
+					break
+				}
+			}
+			if fkColIdx < 0 {
+				continue
+			}
+			childCursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
+			if err != nil {
+				return NewErrorf(Error, "cascade update cursor: %s", err)
+			}
+			hasRow, err := childCursor.First()
+			if err != nil {
+				childCursor.Close()
+				return err
+			}
+			for hasRow {
+				data, err := childCursor.Data()
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				rowid := childCursor.RowID()
+				childVals, err := vdbe.ParseRecord(data)
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+				if len(childVals) < len(tbl.columns) {
+					padded := make([]vdbe.Value, len(tbl.columns))
+					copy(padded, childVals)
+					for j := len(childVals); j < len(tbl.columns); j++ {
+						padded[j] = vdbe.Value{Type: "null"}
+					}
+					childVals = padded
+				}
+				if fkColIdx < len(childVals) && fkValuesEqual(childVals[fkColIdx], oldKey) {
+					childVals[fkColIdx] = newVals[refIdx]
+					rb := vdbe.NewRecordBuilder()
+					for _, v := range childVals {
+						addValueToRecordFromValue(rb, v)
+					}
+					newData := rb.Build()
+					keyBuf := make([]byte, 9)
+					keyLen := encodeVarintKey(keyBuf, int64(rowid))
+					if err := db.bt.Insert(childCursor, keyBuf[:keyLen], newData, btree.RowID(rowid), btree.SeekFound); err != nil {
+						childCursor.Close()
+						return err
+					}
+				}
+				hasRow, err = childCursor.Next()
+				if err != nil {
+					childCursor.Close()
+					return err
+				}
+			}
+			childCursor.Close()
+		}
+	}
+	return nil
+}
+
 // execDelete handles DELETE statements.
 func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error {
 	pos := 0
@@ -1991,28 +2253,28 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 		return err
 	}
 	for hasRow {
-		if whereExpr != "" {
-			data, err := cursor.Data()
-			if err != nil {
-				return err
-			}
-			values, err := vdbe.ParseRecord(data)
-			if err != nil {
-				return err
-			}
-			// Pad values for columns added via ALTER TABLE
-			if len(values) < len(tbl.columns) {
-				padded := make([]vdbe.Value, len(tbl.columns))
-				copy(padded, values)
-				for j := len(values); j < len(tbl.columns); j++ {
-					if tbl.columns[j].defaultValue != nil {
-						padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
-					} else {
-						padded[j] = vdbe.Value{Type: "null"}
-					}
+		data, err := cursor.Data()
+		if err != nil {
+			return err
+		}
+		values, err := vdbe.ParseRecord(data)
+		if err != nil {
+			return err
+		}
+		// Pad values for columns added via ALTER TABLE
+		if len(values) < len(tbl.columns) {
+			padded := make([]vdbe.Value, len(tbl.columns))
+			copy(padded, values)
+			for j := len(values); j < len(tbl.columns); j++ {
+				if tbl.columns[j].defaultValue != nil {
+					padded[j] = interfaceToValue(tbl.columns[j].defaultValue)
+				} else {
+					padded[j] = vdbe.Value{Type: "null"}
 				}
-				values = padded
 			}
+			values = padded
+		}
+		if whereExpr != "" {
 			wval := evalExprWithRow(whereExpr, args, colNames, values)
 			if !isTruthy(wval) {
 				hasRow, err = cursor.Next()
@@ -2021,6 +2283,10 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 				}
 				continue
 			}
+		}
+		// ON DELETE CASCADE: delete child rows before deleting parent
+		if err := db.cascadeDelete(tbl, values); err != nil {
+			return err
 		}
 		if err := db.bt.Delete(cursor); err != nil {
 			return err
@@ -2107,6 +2373,8 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 	type updateEntry struct {
 		rowid   int64
 		newData []byte
+		oldVals []vdbe.Value
+		newVals []vdbe.Value
 	}
 	var updates []updateEntry
 
@@ -2131,6 +2399,10 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		if err != nil {
 			return err
 		}
+
+		// Save original values for cascade before they are modified
+		oldVals := make([]vdbe.Value, len(values))
+		copy(oldVals, values)
 
 		// Apply sets with per-row expression evaluation
 			// Pad values with defaults for columns added via ALTER TABLE
@@ -2175,7 +2447,7 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		}
 		newData := rb.Build()
 
-		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData})
+		updates = append(updates, updateEntry{rowid: int64(rowid), newData: newData, oldVals: oldVals, newVals: values})
 		hasRow, err = cursor.Next()
 		if err != nil {
 			return err
@@ -2190,6 +2462,10 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 			keyLen := encodeVarintKey(keyBuf, upd.rowid)
 
 			if err := db.bt.Insert(cursor, keyBuf[:keyLen], upd.newData, btree.RowID(upd.rowid), btree.SeekFound); err != nil {
+				return err
+			}
+			// ON UPDATE CASCADE: propagate key changes to child rows
+			if err := db.cascadeUpdate(tbl, upd.oldVals, upd.newVals); err != nil {
 				return err
 			}
 			count++
