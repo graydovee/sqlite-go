@@ -3,6 +3,7 @@
 package sqlite
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"regexp"
@@ -1862,8 +1863,267 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 		db.totalChanges += count
 		return nil
 	}
+
+// vdbeDB adapts *Database to implement the vdbe.Database interface.
+type vdbeDB struct {
+	db *Database
+}
+
+func (v vdbeDB) GetTableInfo(rootPage int) (*vdbe.TableInfo, error) {
+	for _, tbl := range v.db.tables {
+		if tbl.rootPage == rootPage {
+			cols := make([]vdbe.ColumnInfo, len(tbl.columns))
+			for i, c := range tbl.columns {
+				aff := byte('u')
+				switch strings.ToUpper(c.typeName) {
+				case "TEXT":
+					aff = 't'
+				case "INTEGER":
+					aff = 'i'
+				case "REAL":
+					aff = 'n'
+				case "BLOB":
+					aff = 'b'
+				}
+				cols[i] = vdbe.ColumnInfo{Name: c.name, Affinity: aff}
+			}
+			return &vdbe.TableInfo{RootPage: rootPage, Columns: cols, Name: tbl.name}, nil
+		}
+	}
+	return nil, fmt.Errorf("no table with root page %d", rootPage)
+}
+
+func (v vdbeDB) GetCursor(rootPage int, write bool) (interface{}, error) {
+	cur, err := v.db.bt.Cursor(btree.PageNumber(rootPage), write)
+	if err != nil {
+		return nil, err
+	}
+	return cur, nil
+}
+
+func (v vdbeDB) BeginTransaction(write bool) error {
+	if err := v.db.pgr.Begin(write); err != nil {
+		return err
+	}
+	return v.db.bt.Begin(write)
+}
+
+func (v vdbeDB) Commit() error {
+	if err := v.db.bt.Commit(); err != nil {
+		return err
+	}
+	return v.db.pgr.Commit()
+}
+
+func (v vdbeDB) Rollback() error {
+	v.db.bt.Rollback()
+	v.db.pgr.Rollback()
+	return nil
+}
+
+func (v vdbeDB) AutoCommit() bool       { return v.db.autoCommit }
+func (v vdbeDB) SetAutoCommit(on bool)   { v.db.autoCommit = on }
+func (v vdbeDB) Changes() int64         { return v.db.changes }
+func (v vdbeDB) TotalChanges() int64    { return v.db.totalChanges }
+func (v vdbeDB) LastInsertRowID() int64 { return v.db.lastInsertRowID }
+func (v vdbeDB) SetLastInsertRowID(id int64) { v.db.lastInsertRowID = id }
+
+// Insert adapts btree insert for vdbe.Inserter interface.
+func (v vdbeDB) Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error {
+	cur, ok := cursor.(btree.BTCursor)
+	if !ok {
+		return fmt.Errorf("invalid cursor type for insert")
+	}
+	return v.db.bt.Insert(cur, key, data, btree.RowID(rowid), btree.SeekResult(seekResult))
+}
+
+// Delete adapts btree delete for vdbe.Deleter interface.
+func (v vdbeDB) Delete(cursor interface{}) error {
+	cur, ok := cursor.(btree.BTCursor)
+	if !ok {
+		return fmt.Errorf("invalid cursor type for delete")
+	}
+	return v.db.bt.Delete(cur)
+}
+
+// CreateBTree implements vdbe.BTreeCreator.
+func (v vdbeDB) CreateBTree(flags int) (int, error) {
+	pn, err := v.db.bt.CreateBTree(btree.CreateFlags(flags))
+	return int(pn), err
+}
+
+// DestroyBTree implements vdbe.BTreeDestroyer.
+func (v vdbeDB) DestroyBTree(rootPage int) error {
+	return v.db.bt.Drop(btree.PageNumber(rootPage))
+}
+
+// buildCompileSchema converts in-memory table metadata into a compile.Schema.
+func (db *Database) buildCompileSchema() *compile.Schema {
+	schema := compile.NewSchema()
+	for name, tbl := range db.tables {
+		cols := make([]compile.ColumnInfo, len(tbl.columns))
+		for i, c := range tbl.columns {
+			cols[i] = compile.ColumnInfo{Name: c.name, Type: c.typeName}
+		}
+		schema.AddTable(&compile.TableInfo{
+			Name:     name,
+			Columns:  cols,
+			HasRowid: true,
+			RootPage: tbl.rootPage,
+		})
+	}
+	return schema
+}
+
+// executeQuery runs a SQL query through the compile pipeline and VDBE.
+func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, error) {
+	// Parse
+	stmts, err := compile.Parse(sql)
+	if err != nil {
+		return nil, NewErrorf(Error, "parse: %s", err)
+	}
+	if len(stmts) == 0 {
+		return nil, NewError(Error, "empty SQL statement")
+	}
+
+	schema := db.buildCompileSchema()
+
+	var allRows []Row
+	var resultCols []ResultColumnInfo
+
+	for _, stmt := range stmts {
+		// Compile
+		prog, err := compile.Compile(stmt, schema)
+		if err != nil {
+			return nil, NewErrorf(Error, "compile: %s", err)
+		}
+
+		// Convert compile.Program → vdbe.Program
+		vprog := &vdbe.Program{
+			Instructions: prog.Instructions,
+			NumRegs:      prog.NumRegs,
+			NumCursors:   prog.NumCursors,
+			SQL:          sql,
+		}
+
+		// Create VDBE and load program
+		vm := vdbe.NewVDBE(vdbeDB{db: db})
+		vm.SetProgram(vprog)
+
+		// Set up result row callback to collect rows
+		var rows []Row
+		var colNames []string
+		vm.SetResultRowCallback(func(regs []vdbe.Mem, startIdx, count int) {
+			if colNames == nil {
+				colNames = extractResultColNames(stmt)
+				resultCols = make([]ResultColumnInfo, len(colNames))
+				for i, n := range colNames {
+					resultCols[i] = ResultColumnInfo{Name: n, Type: ColNull}
+				}
+			}
+			row := Row{cols: resultCols}
+			for i := 0; i < count; i++ {
+				idx := startIdx + i
+				if idx < len(regs) {
+					row.values = append(row.values, &regs[idx])
+				} else {
+					row.values = append(row.values, vdbe.NewMemNull())
+				}
+			}
+			rows = append(rows, row)
+		})
+
+		// Bind parameters
+		if len(args) > 0 {
+			vmRegs := vm.Registers()
+			for i, arg := range args {
+				if i+1 < len(vmRegs) {
+					vmRegs[i+1] = *vdbe.MakeMem(arg)
+				}
+			}
+		}
+
+		// Execute
+		ctx := context.Background()
+		for {
+			hasRow, err := vm.Step(ctx)
+			if err != nil {
+				return nil, NewErrorf(Error, "execute: %s", err)
+			}
+			if !hasRow {
+				break
+			}
+		}
+
+		allRows = append(allRows, rows...)
+	}
+
+	if allRows == nil {
+		allRows = []Row{}
+	}
+	if resultCols == nil {
+		resultCols = []ResultColumnInfo{}
+	}
+	return newResultSet(allRows, resultCols), nil
+}
+
+// extractResultColNames extracts column names from a compiled statement's AST.
+func extractResultColNames(stmt *compile.Statement) []string {
+	if stmt.SelectStmt == nil {
+		return nil
+	}
+	var names []string
+	for _, rc := range stmt.SelectStmt.Columns {
+		if rc.As != "" {
+			names = append(names, rc.As)
+		} else if rc.Star {
+			names = append(names, "*")
+		} else if rc.Expr != nil {
+			names = append(names, exprText(rc.Expr))
+		} else {
+			names = append(names, "?")
+		}
+	}
+	return names
+}
+
+// exprText converts an expression AST node back to a readable column name.
+func exprText(e *compile.Expr) string {
+	if e == nil {
+		return ""
+	}
+	switch e.Kind {
+	case compile.ExprColumnRef:
+		if e.Table != "" {
+			return e.Table + "." + e.Name
+		}
+		return e.Name
+	case compile.ExprLiteral:
+		return e.StringValue
+	case compile.ExprFunctionCall:
+		var args []string
+		for _, a := range e.Args {
+			args = append(args, exprText(a))
+		}
+		return e.FunctionName + "(" + strings.Join(args, ",") + ")"
+	default:
+		if e.Name != "" {
+			return e.Name
+		}
+		return "?"
+	}
+}
+
 // querySingle executes a SELECT and collects results.
 func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, error) {
+	// Try the compile pipeline first
+	rs, err := db.executeQuery(sql, args)
+	if err == nil {
+		return rs, nil
+	}
+	// Fall back to hack layer for features not yet supported by compile pipeline
+	_ = err
+
 	tokens := compile.Tokenize(sql)
 	filtered := filterTokens(tokens)
 	if len(filtered) == 0 {

@@ -10,6 +10,7 @@ import (
 type Program struct {
 	Instructions []vdbe.Instruction
 	NumRegs      int
+	NumCursors   int
 	Comment      string
 }
 
@@ -157,6 +158,7 @@ func (b *Builder) BuildProgram() (*Program, error) {
 	return &Program{
 		Instructions: instrs,
 		NumRegs:      b.regCounter,
+		NumCursors:   b.curCounter,
 	}, nil
 }
 

@@ -526,7 +526,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			if !hasRow {
+			if hasRow {
 				nextPC = pOp.P2
 			}
 
@@ -541,7 +541,7 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			if !hasRow {
+			if hasRow {
 				nextPC = pOp.P2
 			}
 
