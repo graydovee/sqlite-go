@@ -461,6 +461,8 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execAttach(filtered)
 	case "detach":
 		return db.execDetach(filtered)
+	case "analyze":
+		return db.execAnalyze(filtered)
 	default:
 		return NewErrorf(Error, "unsupported SQL statement: %s", stmtType)
 	}
@@ -7938,6 +7940,8 @@ func classifyStatement(tokens []compile.Token) string {
 		return "attach"
 	case "detach":
 		return "detach"
+	case "analyze":
+		return "analyze"
 	}
 	return first
 }
@@ -8680,4 +8684,318 @@ func trigEventMatches(triggerEvent, actualEvent string, updateCols []string) boo
 		return true
 	}
 	return false
+}
+
+// execAnalyze handles ANALYZE statements.
+// ANALYZE collects statistics about tables and indices and stores them
+// in the sqlite_stat1 table. The statistics format is "rows cols..." where
+// rows is the total row count and cols are the number of distinct values
+// for each column in the index (estimated as equal to rows for now).
+func (db *Database) execAnalyze(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "analyze")
+
+	// Parse optional target: table-name, schema.table-name, or index-name
+	target := ""
+	if pos < len(tokens) && tokens[pos].Type != compile.TokenSemi {
+		target = unquoteIdent(tokens[pos].Value)
+		pos++
+		if pos < len(tokens) && tokens[pos].Type == compile.TokenDot {
+			pos++
+			if pos < len(tokens) {
+				// schema.table -> use table name
+				target = unquoteIdent(tokens[pos].Value)
+				pos++
+			}
+		}
+	}
+
+	// Ensure sqlite_stat1 table exists
+	if err := db.ensureStat1Table(); err != nil {
+		return err
+	}
+
+	// Clear existing statistics for the target (or all if no target)
+	if err := db.clearStat1(target); err != nil {
+		return err
+	}
+
+	if target == "" {
+		// ANALYZE with no target: analyze all tables and their indexes
+		for _, entry := range db.masterEntries {
+			if entry.Type == "table" {
+				if err := db.analyzeTable(entry.Name); err != nil {
+					return err
+				}
+			}
+		}
+	} else {
+		// Check if target is an index
+		isIndex := false
+		for _, entry := range db.masterEntries {
+			if entry.Type == "index" && strings.EqualFold(entry.Name, target) {
+				isIndex = true
+				break
+			}
+		}
+
+		if isIndex {
+			if err := db.analyzeIndex(target); err != nil {
+				return err
+			}
+		} else {
+			// Target is a table (or doesn't exist)
+			if db.tables[target] == nil {
+				return NewErrorf(Error, "no such table: %s", target)
+			}
+			if err := db.analyzeTable(target); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// ensureStat1Table creates the sqlite_stat1 table if it doesn't exist.
+func (db *Database) ensureStat1Table() error {
+	if db.tables["sqlite_stat1"] != nil {
+		return nil
+	}
+
+	// Create the table internally (bypass normal CREATE TABLE)
+	if !db.inTx {
+		if err := db.pgr.Begin(true); err != nil {
+			return NewErrorf(IOError, "begin transaction: %s", err)
+		}
+		if err := db.bt.Begin(true); err != nil {
+			db.pgr.Rollback()
+			return NewErrorf(Error, "begin btree: %s", err)
+		}
+	}
+
+	rootPage, err := db.bt.CreateBTree(btree.CreateTable)
+	if err != nil {
+		if !db.inTx {
+			db.bt.Rollback()
+			db.pgr.Rollback()
+		}
+		return NewErrorf(IOError, "create btree: %s", err)
+	}
+
+	if !db.inTx {
+		if err := db.bt.Commit(); err != nil {
+			return NewErrorf(IOError, "commit btree: %s", err)
+		}
+		if err := db.pgr.Commit(); err != nil {
+			return NewErrorf(IOError, "commit pager: %s", err)
+		}
+	}
+
+	db.tables["sqlite_stat1"] = &tableEntry{
+		name:     "sqlite_stat1",
+		rootPage: int(rootPage),
+		columns: []columnEntry{
+			{name: "tbl", typeName: "TEXT"},
+			{name: "idx", typeName: "TEXT"},
+			{name: "stat", typeName: "TEXT"},
+		},
+	}
+
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:     "table",
+		Name:     "sqlite_stat1",
+		TblName:  "sqlite_stat1",
+		RootPage: int(rootPage),
+		SQL:      "CREATE TABLE sqlite_stat1(tbl TEXT, idx TEXT, stat TEXT)",
+	})
+
+	return nil
+}
+
+// clearStat1 removes statistics rows for the given target (or all if target is empty).
+func (db *Database) clearStat1(target string) error {
+	tbl, ok := db.tables["sqlite_stat1"]
+	if !ok {
+		return nil
+	}
+
+	cursor, err := db.bt.Cursor(btree.PageNumber(tbl.rootPage), true)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+
+	// Collect all rows first, then delete matching ones
+	type statRow struct {
+		rowID int64
+		tbl   string
+		idx   string
+	}
+	var rows []statRow
+
+	hasRow, err := cursor.First()
+	if err != nil {
+		return err
+	}
+	for hasRow {
+		data, _ := cursor.Data()
+		rec, parseErr := vdbe.ParseRecord(data)
+		if parseErr == nil && len(rec) >= 2 {
+			tblName := ""
+			idxName := ""
+			if rec[0].Type == "text" {
+				tblName = string(rec[0].Bytes)
+			}
+			if rec[1].Type == "text" {
+				idxName = string(rec[1].Bytes)
+			}
+			rows = append(rows, statRow{rowID: int64(cursor.RowID()), tbl: tblName, idx: idxName})
+		}
+		hasRow, err = cursor.Next()
+		if err != nil {
+			break
+		}
+	}
+
+	// Delete matching rows
+	for _, r := range rows {
+		if target == "" || strings.EqualFold(r.tbl, target) || strings.EqualFold(r.idx, target) {
+			keyBuf := make([]byte, 9)
+			keyLen := encodeVarintKey(keyBuf, r.rowID)
+			_, seekErr := cursor.Seek(keyBuf[:keyLen])
+			if seekErr == nil {
+				db.bt.Delete(cursor)
+			}
+		}
+	}
+
+	return nil
+}
+
+// analyzeTable gathers statistics for a table and all its indexes.
+func (db *Database) analyzeTable(tableName string) error {
+	tbl, ok := db.tables[tableName]
+	if !ok {
+		return nil
+	}
+
+	// Count rows in the table
+	rowCount, err := db.bt.Count(btree.PageNumber(tbl.rootPage))
+	if err != nil {
+		return err
+	}
+
+	// Insert table-level stat row (idx is the table name itself for table stats)
+	stat := fmt.Sprintf("%d", rowCount)
+	if err := db.insertStat1Row(tableName, tableName, stat); err != nil {
+		return err
+	}
+
+	// Gather stats for all indexes on this table
+	for _, entry := range db.masterEntries {
+		if entry.Type == "index" && strings.EqualFold(entry.TblName, tableName) {
+			if err := db.analyzeIndex(entry.Name); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// analyzeIndex gathers statistics for a specific index.
+func (db *Database) analyzeIndex(indexName string) error {
+	// Find the index entry
+	var idxEntry *sqliteMasterEntry
+	var tableName string
+	for i := range db.masterEntries {
+		if db.masterEntries[i].Type == "index" && strings.EqualFold(db.masterEntries[i].Name, indexName) {
+			idxEntry = &db.masterEntries[i]
+			tableName = idxEntry.TblName
+			break
+		}
+	}
+	if idxEntry == nil {
+		return nil
+	}
+
+	// Count entries in the index B-tree
+	indexCount, err := db.bt.Count(btree.PageNumber(idxEntry.RootPage))
+	if err != nil {
+		return err
+	}
+
+	// Count the parent table rows for the stat format
+	tbl, ok := db.tables[tableName]
+	if !ok {
+		return nil
+	}
+	tableCount, err := db.bt.Count(btree.PageNumber(tbl.rootPage))
+	if err != nil {
+		return err
+	}
+
+	// Stat format: "tableCount indexCount" (or just "tableCount" if same as index)
+	// SQLite's format is typically "rows ndv1 ndv2..." where ndv = number of distinct values
+	// For simplicity, we estimate ndv as equal to the index count for single-column indexes
+	stat := fmt.Sprintf("%d %d", tableCount, indexCount)
+
+	return db.insertStat1Row(tableName, indexName, stat)
+}
+
+// insertStat1Row inserts a row into the sqlite_stat1 table.
+func (db *Database) insertStat1Row(tblName, idxName, stat string) error {
+	statTbl, ok := db.tables["sqlite_stat1"]
+	if !ok {
+		return fmt.Errorf("sqlite_stat1 table not found")
+	}
+
+	needCommit := false
+	if !db.inTx {
+		if err := db.pgr.Begin(true); err != nil {
+			return err
+		}
+		if err := db.bt.Begin(true); err != nil {
+			db.pgr.Rollback()
+			return err
+		}
+		needCommit = true
+	}
+
+	rb := vdbe.NewRecordBuilder()
+	rb.AddText(tblName)
+	rb.AddText(idxName)
+	rb.AddText(stat)
+	data := rb.Build()
+
+	cursor, err := db.bt.Cursor(btree.PageNumber(statTbl.rootPage), true)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+
+	var newRowID int64 = 1
+	if hasRow, _ := cursor.Last(); hasRow {
+		newRowID = int64(cursor.RowID()) + 1
+	}
+
+	keyBuf := make([]byte, 9)
+	keyLen := encodeVarintKey(keyBuf, newRowID)
+
+	err = db.bt.Insert(cursor, keyBuf[:keyLen], data, btree.RowID(newRowID), btree.SeekNotFound)
+	if err != nil {
+		return err
+	}
+
+	if needCommit {
+		if err := db.bt.Commit(); err != nil {
+			return err
+		}
+		if err := db.pgr.Commit(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

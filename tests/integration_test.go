@@ -1809,3 +1809,144 @@ func TestCRUDLifecycle(t *testing.T) {
 		t.Errorf("expected 0 rows after DELETE, got %d", len(rows))
 	}
 }
+
+// =============================================================================
+// ANALYZE tests
+// =============================================================================
+
+func TestAnalyzeBasic(t *testing.T) {
+	db := openTestDB(t)
+
+	if err := db.Exec("CREATE TABLE t1(x INTEGER, y TEXT)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	db.Exec("INSERT INTO t1 VALUES(1, 'a')")
+	db.Exec("INSERT INTO t1 VALUES(2, 'b')")
+	db.Exec("INSERT INTO t1 VALUES(3, 'c')")
+
+	if err := db.Exec("ANALYZE"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	// Verify sqlite_stat1 was populated
+	rs, err := db.Query("SELECT tbl, idx, stat FROM sqlite_stat1")
+	if err != nil {
+		t.Fatalf("SELECT from sqlite_stat1: %v", err)
+	}
+	rows := collectRows(t, rs)
+	rs.Close()
+
+	if len(rows) == 0 {
+		t.Fatal("expected rows in sqlite_stat1 after ANALYZE")
+	}
+
+	// Check that the table stat row has the correct count
+	found := false
+	for _, r := range rows {
+		if r["tbl"].(string) == "t1" && r["idx"].(string) == "t1" {
+			found = true
+			stat := r["stat"].(string)
+			if stat != "3" {
+				t.Errorf("stat for t1 = %q, want '3'", stat)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected stat row for table t1")
+	}
+}
+
+func TestAnalyzeTable(t *testing.T) {
+	db := openTestDB(t)
+
+	db.Exec("CREATE TABLE t1(x INTEGER)")
+	db.Exec("INSERT INTO t1 VALUES(1)")
+	db.Exec("CREATE TABLE t2(y INTEGER)")
+	db.Exec("INSERT INTO t2 VALUES(1)")
+	db.Exec("INSERT INTO t2 VALUES(2)")
+
+	if err := db.Exec("ANALYZE t2"); err != nil {
+		t.Fatalf("ANALYZE t2: %v", err)
+	}
+
+	rs, err := db.Query("SELECT tbl, stat FROM sqlite_stat1")
+	if err != nil {
+		t.Fatalf("SELECT from sqlite_stat1: %v", err)
+	}
+	rows := collectRows(t, rs)
+	rs.Close()
+
+	// Only t2 should be analyzed
+	for _, r := range rows {
+		if r["tbl"].(string) == "t1" {
+			t.Error("t1 should not be analyzed when only t2 is targeted")
+		}
+	}
+
+	foundT2 := false
+	for _, r := range rows {
+		if r["tbl"].(string) == "t2" {
+			foundT2 = true
+		}
+	}
+	if !foundT2 {
+		t.Error("expected stat row for t2")
+	}
+}
+
+func TestAnalyzeIndex(t *testing.T) {
+	db := openTestDB(t)
+
+	db.Exec("CREATE TABLE t1(x INTEGER, y TEXT)")
+	db.Exec("INSERT INTO t1 VALUES(1, 'a')")
+	db.Exec("INSERT INTO t1 VALUES(2, 'b')")
+	db.Exec("INSERT INTO t1 VALUES(3, 'c')")
+	db.Exec("CREATE INDEX idx_t1_x ON t1(x)")
+
+	if err := db.Exec("ANALYZE"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+
+	rs, err := db.Query("SELECT tbl, idx, stat FROM sqlite_stat1")
+	if err != nil {
+		t.Fatalf("SELECT from sqlite_stat1: %v", err)
+	}
+	rows := collectRows(t, rs)
+	rs.Close()
+
+	// Should have both table and index entries
+	foundTable := false
+	foundIndex := false
+	for _, r := range rows {
+		tbl := r["tbl"].(string)
+		idx := r["idx"].(string)
+		if tbl == "t1" && idx == "t1" {
+			foundTable = true
+		}
+		if tbl == "t1" && idx == "idx_t1_x" {
+			foundIndex = true
+		}
+	}
+	if !foundTable {
+		t.Error("expected table stat row for t1")
+	}
+	if !foundIndex {
+		t.Error("expected index stat row for idx_t1_x")
+	}
+}
+
+func TestAnalyzeNonexistentTable(t *testing.T) {
+	db := openTestDB(t)
+	err := db.Exec("ANALYZE nonexistent")
+	if err == nil {
+		t.Error("expected error for ANALYZE on nonexistent table")
+	}
+}
+
+func TestAnalyzeEmptyDatabase(t *testing.T) {
+	db := openTestDB(t)
+	// ANALYZE on empty database should succeed
+	if err := db.Exec("ANALYZE"); err != nil {
+		t.Fatalf("ANALYZE empty db: %v", err)
+	}
+}

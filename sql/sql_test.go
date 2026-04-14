@@ -512,6 +512,43 @@ func TestAnalyzeSchemaTable(t *testing.T) {
 	}
 }
 
+func TestAnalyzeStat1TableCreated(t *testing.T) {
+	e := newTestEngine(t)
+	createTestTable(t, e, "t1", "x INTEGER")
+	if err := e.ExecSQL("ANALYZE"); err != nil {
+		t.Fatalf("ANALYZE: %v", err)
+	}
+	ti, ok := e.GetTableInfo("sqlite_stat1")
+	if !ok {
+		t.Fatal("sqlite_stat1 table should exist after ANALYZE")
+	}
+	if len(ti.Columns) != 3 {
+		t.Errorf("sqlite_stat1 has %d columns, want 3", len(ti.Columns))
+	}
+	if ti.Columns[0].Name != "tbl" {
+		t.Errorf("column 0 = %q, want tbl", ti.Columns[0].Name)
+	}
+}
+
+func TestAnalyzeTableNotFound(t *testing.T) {
+	e := newTestEngine(t)
+	if err := e.ExecSQL("ANALYZE nonexistent"); err == nil {
+		t.Error("expected error for nonexistent table")
+	}
+}
+
+func TestAnalyzeIdempotent(t *testing.T) {
+	e := newTestEngine(t)
+	createTestTable(t, e, "t1", "x INTEGER")
+	if err := e.ExecSQL("ANALYZE"); err != nil {
+		t.Fatalf("first ANALYZE: %v", err)
+	}
+	// Running ANALYZE again should succeed (clears and re-populates)
+	if err := e.ExecSQL("ANALYZE"); err != nil {
+		t.Fatalf("second ANALYZE: %v", err)
+	}
+}
+
 func TestParseAnalyze(t *testing.T) {
 	tests := []struct {
 		sql    string
