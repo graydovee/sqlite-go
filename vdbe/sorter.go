@@ -4,6 +4,8 @@ package vdbe
 
 import (
 	"sort"
+
+	"github.com/sqlite-go/sqlite-go/btree"
 )
 
 // SorterRecord holds a single record in the sorter.
@@ -267,6 +269,68 @@ func formatFloat64(v float64) string {
 	_ = s
 	return ""
 }
+
+// Seek searches for a record with the given key.
+// This enables OpFound/OpNotFound to work with ephemeral tables.
+func (s *Sorter) Seek(key []byte) (btree.SeekResult, error) {
+	cmp := s.compare
+	if cmp == nil {
+		cmp = defaultCompare
+	}
+	for _, rec := range s.records {
+		if cmp(rec.Key, key) == 0 {
+			return btree.SeekFound, nil
+		}
+	}
+	return btree.SeekNotFound, nil
+}
+
+// Delete removes the record with the given key from the sorter.
+func (s *Sorter) Delete(key []byte) {
+	cmp := s.compare
+	if cmp == nil {
+		cmp = defaultCompare
+	}
+	for i, rec := range s.records {
+		if cmp(rec.Key, key) == 0 {
+			s.records = append(s.records[:i], s.records[i+1:]...)
+			s.sorted = false
+			return
+		}
+	}
+}
+
+// Remaining btree.BTCursor interface methods for Sorter.
+
+func (s *Sorter) Close() error   { return nil }
+func (s *Sorter) First() (bool, error) {
+	s.Sort()
+	s.iterIdx = 0
+	return s.Next(), nil
+}
+func (s *Sorter) Last() (bool, error) {
+	s.Sort()
+	if len(s.records) == 0 {
+		return false, nil
+	}
+	s.iterIdx = len(s.records)
+	return true, nil
+}
+func (s *Sorter) Prev() (bool, error) {
+	s.iterIdx--
+	return s.iterIdx >= 1, nil
+}
+func (s *Sorter) SeekRowid(rowid btree.RowID) (btree.SeekResult, error) {
+	return btree.SeekNotFound, nil
+}
+func (s *Sorter) SeekNear(key []byte) (btree.SeekResult, error) {
+	return s.Seek(key)
+}
+func (s *Sorter) IsValid() bool { return s.iterIdx >= 1 && s.iterIdx <= len(s.records) }
+func (s *Sorter) RowID() btree.RowID {
+	return btree.RowID(s.iterIdx)
+}
+func (s *Sorter) SetRowID(rowid btree.RowID) error { return nil }
 
 // MergeSort performs a k-way merge of multiple sorted runs.
 // This is used when data spills to temporary files.

@@ -776,8 +776,6 @@ func (b *Build) makeAggFuncInfo(expr *Expr) *vdbe.AggFuncInfo {
 
 // compileCompoundSelect compiles compound SELECT (UNION, INTERSECT, EXCEPT).
 func (b *Build) compileCompoundSelect(stmt *SelectStmt) error {
-	// For compound selects, each sub-select produces rows into an
-	// ephemeral table, then we deduplicate as needed.
 	b.emitInit()
 	b.emitTransaction(0, false)
 
@@ -787,57 +785,377 @@ func (b *Build) compileCompoundSelect(stmt *SelectStmt) error {
 	}
 	nResult := len(resultCols)
 
-	// Open ephemeral table for union results
-	unionCursor := b.b.AllocCursor()
-	b.emitOpenEphemeral(unionCursor, nResult)
+	// Determine what compound ops we have
+	allUnionAll := true
+	hasExcept := false
+	hasIntersect := false
+	for _, op := range stmt.CompoundOps {
+		switch op {
+		case CompoundUnionAll:
+			// ok
+		case CompoundUnion:
+			allUnionAll = false
+		case CompoundExcept:
+			allUnionAll = false
+			hasExcept = true
+		case CompoundIntersect:
+			allUnionAll = false
+			hasIntersect = true
+		}
+	}
 
-	// Compile the first SELECT
-	savedTables := b.tables
-	savedTableMap := b.tableMap
-	b.tables = nil
-	b.tableMap = make(map[string]*tableEntry)
+	// Open ephemeral table for results
+	resultCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(resultCursor, nResult)
 
-	if err := b.compileSelectInner(stmt, unionCursor); err != nil {
-		b.tables = savedTables
-		b.tableMap = savedTableMap
+	if allUnionAll {
+		// Simple UNION ALL: insert all rows, output all
+		b.compileCompoundInner(stmt, resultCursor)
+	} else if hasExcept || hasIntersect {
+		// EXCEPT / INTERSECT: process left-to-right
+		b.compileCompoundExceptIntersect(stmt, resultCursor, nResult)
+	} else {
+		// UNION (with dedup): insert with dedup check
+		b.compileCompoundUnion(stmt, resultCursor, nResult)
+	}
+
+	// Handle ORDER BY on the compound result
+	needSorter := len(stmt.OrderBy) > 0
+	var sorterCursor int
+	if needSorter {
+		sorterCursor = b.b.AllocCursor()
+		b.emitSorterOpen(sorterCursor, nResult)
+	}
+
+	// Set up LIMIT/OFFSET
+	if err := b.emitLimit(stmt); err != nil {
 		return err
 	}
 
+	// Output from result cursor
+	if needSorter {
+		// Read from result cursor, insert into sorter
+		emptyLabel := b.b.NewLabel()
+		outLoop := b.b.NewLabel()
+		b.b.EmitJump(vdbe.OpRewind, resultCursor, emptyLabel, 0)
+		b.b.DefineLabel(outLoop)
+		dataReg := b.b.AllocReg(nResult)
+		for i := 0; i < nResult; i++ {
+			b.emitColumn(resultCursor, i, dataReg+i)
+		}
+		recReg := b.b.AllocReg(1)
+		b.emitMakeRecord(dataReg, nResult, recReg)
+		b.emitSorterInsert(sorterCursor, recReg)
+		b.emitNext(resultCursor, outLoop)
+		b.b.DefineLabel(emptyLabel)
+		b.emitClose(resultCursor)
+		// Sort and output
+		b.emitSortedOutput(sorterCursor, nResult)
+	} else {
+		emptyLabel := b.b.NewLabel()
+		outLoop := b.b.NewLabel()
+		b.b.EmitJump(vdbe.OpRewind, resultCursor, emptyLabel, 0)
+		b.b.DefineLabel(outLoop)
+		dataReg := b.b.AllocReg(nResult)
+		for i := 0; i < nResult; i++ {
+			b.emitColumn(resultCursor, i, dataReg+i)
+		}
+		b.emitResultRow(dataReg, nResult)
+		b.emitNext(resultCursor, outLoop)
+		b.b.DefineLabel(emptyLabel)
+		b.emitClose(resultCursor)
+	}
+
+	// Define LIMIT end label
+	if b.limitEndLabel != 0 {
+		b.b.DefineLabel(b.limitEndLabel)
+		b.limitReg = 0
+		b.offsetReg = 0
+		b.limitEndLabel = 0
+	}
+
+	b.emitHalt(0)
+	return nil
+}
+
+// compileCompoundInner compiles all sub-selects of a compound query,
+// inserting all rows into destCursor (UNION ALL behavior).
+func (b *Build) compileCompoundInner(stmt *SelectStmt, destCursor int) {
+	savedTables := b.tables
+	savedTableMap := b.tableMap
+
+	// First sub-select
+	b.tables = nil
+	b.tableMap = make(map[string]*tableEntry)
+	if err := b.compileSelectInner(stmt, destCursor); err != nil {
+		b.tables = savedTables
+		b.tableMap = savedTableMap
+		return
+	}
 	b.tables = savedTables
 	b.tableMap = savedTableMap
 
-	// Compile subsequent compound SELECTs
-	for i, op := range stmt.CompoundOps {
-		savedTables := b.tables
-		savedTableMap := b.tableMap
+	// Subsequent sub-selects
+	for i := range stmt.CompoundOps {
 		b.tables = nil
 		b.tableMap = make(map[string]*tableEntry)
-
-		if err := b.compileSelectInner(stmt.CompoundSelects[i], unionCursor); err != nil {
+		if err := b.compileSelectInner(stmt.CompoundSelects[i], destCursor); err != nil {
 			b.tables = savedTables
 			b.tableMap = savedTableMap
-			return err
+			return
 		}
-
 		b.tables = savedTables
 		b.tableMap = savedTableMap
+	}
+}
 
-		// For EXCEPT/INTERSECT, would need additional logic
-		_ = op
+// compileCompoundUnion handles UNION (with dedup) compound selects.
+// Each row is checked before insertion; duplicates are skipped.
+func (b *Build) compileCompoundUnion(stmt *SelectStmt, resultCursor int, nResult int) {
+	savedTables := b.tables
+	savedTableMap := b.tableMap
+
+	// First sub-select: insert with dedup
+	b.tables = nil
+	b.tableMap = make(map[string]*tableEntry)
+	if err := b.compileSelectInnerUnion(stmt, resultCursor, nResult); err != nil {
+		b.tables = savedTables
+		b.tableMap = savedTableMap
+		return
+	}
+	b.tables = savedTables
+	b.tableMap = savedTableMap
+
+	// Subsequent sub-selects: insert with dedup
+	for i := range stmt.CompoundOps {
+		b.tables = nil
+		b.tableMap = make(map[string]*tableEntry)
+		if err := b.compileSelectInnerUnion(stmt.CompoundSelects[i], resultCursor, nResult); err != nil {
+			b.tables = savedTables
+			b.tableMap = savedTableMap
+			return
+		}
+		b.tables = savedTables
+		b.tableMap = savedTableMap
+	}
+}
+
+// compileSelectInnerUnion compiles a SELECT and inserts rows into destCursor,
+// but skips rows that already exist in destCursor (dedup for UNION).
+func (b *Build) compileSelectInnerUnion(stmt *SelectStmt, destCursor int, nResult int) error {
+	// Use a wrapper around compileSelectInner that adds dedup logic.
+	// We do this by compiling into a temp cursor first, then merging with dedup.
+	tempCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(tempCursor, nResult)
+
+	if err := b.compileSelectInner(stmt, tempCursor); err != nil {
+		return err
 	}
 
-	// Output from ephemeral table
+	// Now iterate temp cursor, inserting into destCursor with dedup
 	emptyLabel := b.b.NewLabel()
-	b.b.EmitJump(vdbe.OpRewind, unionCursor, emptyLabel, 0)
-	outLoop := b.b.NewLabel()
-	b.b.DefineLabel(outLoop)
-	b.emitColumn(unionCursor, 0, b.b.AllocReg(nResult))
-	b.emitResultRow(b.b.CurrentAddr()-nResult, nResult)
-	b.emitNext(unionCursor, outLoop)
-	b.b.DefineLabel(emptyLabel)
-	b.emitClose(unionCursor)
+	loopBody := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpRewind, tempCursor, emptyLabel, 0)
+	b.b.DefineLabel(loopBody)
 
-	b.emitHalt(0)
+	dataReg := b.b.AllocReg(nResult)
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(tempCursor, i, dataReg+i)
+	}
+
+	// Make record and check if already exists
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(dataReg, nResult, recReg)
+
+	skipLabel := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpNotFound, destCursor, skipLabel, recReg)
+	// Not found: insert
+	b.emitIdxInsert(destCursor, recReg)
+	b.b.DefineLabel(skipLabel)
+
+	b.emitNext(tempCursor, loopBody)
+	b.b.DefineLabel(emptyLabel)
+	b.emitClose(tempCursor)
+	return nil
+}
+
+// compileCompoundExceptIntersect handles EXCEPT and INTERSECT compound selects.
+// It processes operations left-to-right.
+func (b *Build) compileCompoundExceptIntersect(stmt *SelectStmt, resultCursor int, nResult int) {
+	savedTables := b.tables
+	savedTableMap := b.tableMap
+
+	// First sub-select: insert all rows (with dedup for consistency)
+	b.tables = nil
+	b.tableMap = make(map[string]*tableEntry)
+	if err := b.compileSelectInnerUnion(stmt, resultCursor, nResult); err != nil {
+		b.tables = savedTables
+		b.tableMap = savedTableMap
+		return
+	}
+	b.tables = savedTables
+	b.tableMap = savedTableMap
+
+	// Process each compound operation
+	for i, op := range stmt.CompoundOps {
+		switch op {
+		case CompoundUnionAll:
+			// UNION ALL: just add all rows
+			b.tables = nil
+			b.tableMap = make(map[string]*tableEntry)
+			if err := b.compileSelectInner(stmt.CompoundSelects[i], resultCursor); err != nil {
+				b.tables = savedTables
+				b.tableMap = savedTableMap
+				return
+			}
+			b.tables = savedTables
+			b.tableMap = savedTableMap
+
+		case CompoundUnion:
+			// UNION: add with dedup
+			b.tables = nil
+			b.tableMap = make(map[string]*tableEntry)
+			if err := b.compileSelectInnerUnion(stmt.CompoundSelects[i], resultCursor, nResult); err != nil {
+				b.tables = savedTables
+				b.tableMap = savedTableMap
+				return
+			}
+			b.tables = savedTables
+			b.tableMap = savedTableMap
+
+		case CompoundExcept:
+			// EXCEPT: remove matching rows from result
+			b.tables = nil
+			b.tableMap = make(map[string]*tableEntry)
+			if err := b.compileSelectInnerExcept(stmt.CompoundSelects[i], resultCursor, nResult); err != nil {
+				b.tables = savedTables
+				b.tableMap = savedTableMap
+				return
+			}
+			b.tables = savedTables
+			b.tableMap = savedTableMap
+
+		case CompoundIntersect:
+			// INTERSECT: keep only rows that exist in both
+			b.tables = nil
+			b.tableMap = make(map[string]*tableEntry)
+			if err := b.compileSelectInnerIntersect(stmt.CompoundSelects[i], resultCursor, nResult); err != nil {
+				b.tables = savedTables
+				b.tableMap = savedTableMap
+				return
+			}
+			b.tables = savedTables
+			b.tableMap = savedTableMap
+		}
+	}
+}
+
+// compileSelectInnerExcept compiles a SELECT and deletes matching rows from resultCursor.
+// Used for EXCEPT: rows found in both result and this select are removed.
+func (b *Build) compileSelectInnerExcept(stmt *SelectStmt, resultCursor int, nResult int) error {
+	tempCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(tempCursor, nResult)
+
+	if err := b.compileSelectInner(stmt, tempCursor); err != nil {
+		return err
+	}
+
+	// Iterate temp cursor, deleting matching rows from resultCursor
+	emptyLabel := b.b.NewLabel()
+	loopBody := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpRewind, tempCursor, emptyLabel, 0)
+	b.b.DefineLabel(loopBody)
+
+	dataReg := b.b.AllocReg(nResult)
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(tempCursor, i, dataReg+i)
+	}
+
+	// Make record key and try to delete from resultCursor
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(dataReg, nResult, recReg)
+
+	// Use IdxDelete to remove matching row
+	b.b.Emit(vdbe.OpIdxDelete, resultCursor, recReg, 0)
+
+	b.emitNext(tempCursor, loopBody)
+	b.b.DefineLabel(emptyLabel)
+	b.emitClose(tempCursor)
+	return nil
+}
+
+// compileSelectInnerIntersect compiles a SELECT for INTERSECT.
+// Rows from resultCursor that don't match any row in this select are removed.
+func (b *Build) compileSelectInnerIntersect(stmt *SelectStmt, resultCursor int, nResult int) error {
+	// Strategy:
+	// 1. Compile this select into tempCursor
+	// 2. Open a new result cursor
+	// 3. Iterate resultCursor: for each row, check if it exists in tempCursor
+	// 4. If found in tempCursor, insert into new result cursor
+	// 5. Replace resultCursor with new result cursor
+
+	tempCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(tempCursor, nResult)
+
+	if err := b.compileSelectInner(stmt, tempCursor); err != nil {
+		return err
+	}
+
+	// Open new result cursor for the intersection
+	newResultCursor := b.b.AllocCursor()
+	b.emitOpenEphemeral(newResultCursor, nResult)
+
+	// Iterate resultCursor, keeping only rows that also exist in tempCursor
+	emptyLabel := b.b.NewLabel()
+	loopBody := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpRewind, resultCursor, emptyLabel, 0)
+	b.b.DefineLabel(loopBody)
+
+	dataReg := b.b.AllocReg(nResult)
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(resultCursor, i, dataReg+i)
+	}
+
+	// Make record key
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(dataReg, nResult, recReg)
+
+	// Check if this row exists in tempCursor
+	skipLabel := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpNotFound, tempCursor, skipLabel, recReg)
+	// Found: insert into new result cursor
+	b.emitIdxInsert(newResultCursor, recReg)
+	b.b.DefineLabel(skipLabel)
+
+	b.emitNext(resultCursor, loopBody)
+	b.b.DefineLabel(emptyLabel)
+	b.emitClose(resultCursor)
+	b.emitClose(tempCursor)
+
+	// Copy new result cursor data to resultCursor by re-opening it
+	// Actually, we can't reassign cursors. Instead, iterate newResultCursor
+	// and insert into resultCursor (which we'll close and reopen).
+	b.emitClose(resultCursor)
+	b.emitOpenEphemeral(resultCursor, nResult)
+
+	emptyLabel2 := b.b.NewLabel()
+	loopBody2 := b.b.NewLabel()
+	b.b.EmitJump(vdbe.OpRewind, newResultCursor, emptyLabel2, 0)
+	b.b.DefineLabel(loopBody2)
+
+	dataReg2 := b.b.AllocReg(nResult)
+	for i := 0; i < nResult; i++ {
+		b.emitColumn(newResultCursor, i, dataReg2+i)
+	}
+
+	recReg2 := b.b.AllocReg(1)
+	b.emitMakeRecord(dataReg2, nResult, recReg2)
+	b.emitIdxInsert(resultCursor, recReg2)
+
+	b.emitNext(newResultCursor, loopBody2)
+	b.b.DefineLabel(emptyLabel2)
+	b.emitClose(newResultCursor)
+
 	return nil
 }
 
