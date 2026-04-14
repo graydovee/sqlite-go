@@ -6746,6 +6746,79 @@ func (p *exprParser) evalFunction(name string) *vdbe.Mem {
 				return vdbe.NewMemNull()
 			}
 			return evalSubstr(args)
+	case "replace":
+		if len(args) >= 3 && !isNull(args[0]) && !isNull(args[1]) && !isNull(args[2]) {
+			return vdbe.NewMemStr(strings.ReplaceAll(memStr(args[0]), memStr(args[1]), memStr(args[2])))
+		}
+	case "trim":
+		if len(args) >= 1 && !isNull(args[0]) {
+			s := memStr(args[0])
+			if len(args) >= 2 && !isNull(args[1]) {
+				return vdbe.NewMemStr(strings.Trim(s, memStr(args[1])))
+			}
+			return vdbe.NewMemStr(strings.TrimSpace(s))
+		}
+	case "ltrim":
+		if len(args) >= 1 && !isNull(args[0]) {
+			s := memStr(args[0])
+			if len(args) >= 2 && !isNull(args[1]) {
+				return vdbe.NewMemStr(strings.TrimLeft(s, memStr(args[1])))
+			}
+			return vdbe.NewMemStr(strings.TrimLeft(s, " \t\n\r\x0b\x0c"))
+		}
+	case "rtrim":
+		if len(args) >= 1 && !isNull(args[0]) {
+			s := memStr(args[0])
+			if len(args) >= 2 && !isNull(args[1]) {
+				return vdbe.NewMemStr(strings.TrimRight(s, memStr(args[1])))
+			}
+			return vdbe.NewMemStr(strings.TrimRight(s, " \t\n\r\x0b\x0c"))
+		}
+	case "unicode":
+		if len(args) >= 1 && !isNull(args[0]) {
+			s := memStr(args[0])
+			if len(s) > 0 {
+				r, _ := utf8.DecodeRuneInString(s)
+				return vdbe.NewMemInt(int64(r))
+			}
+		}
+	case "round":
+		if len(args) >= 1 && !isNull(args[0]) {
+			v := args[0].FloatValue()
+			n := int64(0)
+			if len(args) >= 2 && !isNull(args[1]) {
+				n = args[1].IntValue()
+			}
+			if n < 0 {
+				n = 0
+			}
+			if n > 30 {
+				n = 30
+			}
+			scale := 1.0
+			for i := int64(0); i < n; i++ {
+				scale *= 10.0
+			}
+			v = v * scale
+			if v < 0 {
+				v = float64(int64(v - 0.5))
+			} else {
+				v = float64(int64(v + 0.5))
+			}
+			v = v / scale
+			return vdbe.NewMemFloat(v)
+		}
+	case "char":
+		var sb strings.Builder
+		for _, a := range args {
+			if !isNull(a) {
+				v := a.IntValue()
+				if v > 0 && v <= utf8.MaxRune {
+					sb.WriteRune(rune(v))
+				}
+			}
+		}
+		return vdbe.NewMemStr(sb.String())
 	}
 	return vdbe.NewMemNull()
 }
