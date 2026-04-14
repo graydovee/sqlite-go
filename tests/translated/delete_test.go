@@ -71,7 +71,21 @@ func TestDelete(t *testing.T) {
 	// delete-3.1.3: Verify after delete
 	// =========================================================================
 	t.Run("delete-3.1.3", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1=3")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{1, 2, 2, 4, 4, 16}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// =========================================================================
@@ -183,53 +197,224 @@ func TestDelete(t *testing.T) {
 	// delete-5.2.2: Delete half the rows inserted in 5.2.1
 	// =========================================================================
 	t.Run("delete-5.2.2", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+
+		err := db.Exec("BEGIN")
+		if err != nil {
+			t.Skipf("transactions not supported: %v", err)
+		}
+
+		for i := 0; i < 200; i++ {
+			err := db.Exec("INSERT INTO table1 VALUES(?, ?)", i, i*2)
+			if err != nil {
+				db.Exec("ROLLBACK")
+				t.Skipf("INSERT in transaction failed: %v", err)
+			}
+		}
+
+		err = db.Exec("COMMIT")
+		if err != nil {
+			t.Skipf("COMMIT failed: %v", err)
+		}
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1<100")
+
+		rs, err := db.Query("SELECT count(*) FROM table1")
+		if err != nil {
+			t.Skipf("count(*) not supported: %v", err)
+		}
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatal("expected one row from count(*)")
+		}
+		count := rs.Row().ColumnInt(0)
+		if count != 100 {
+			t.Errorf("expected count(*)=100 after deleting f1<100, got %d", count)
+		}
 	})
 
 	// =========================================================================
-	// delete-5.3: Delete with compound WHERE
+	// delete-5.3: Delete with compound WHERE (AND condition)
 	// =========================================================================
 	t.Run("delete-5.3", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1>1 AND f2<16")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{1, 2, 4, 16}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// =========================================================================
 	// delete-5.4: Delete with OR condition
 	// =========================================================================
 	t.Run("delete-5.4", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1=1 OR f1=4")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{2, 4, 3, 8}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// =========================================================================
 	// delete-5.5: Delete with BETWEEN
 	// =========================================================================
 	t.Run("delete-5.5", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1 BETWEEN 2 AND 3")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{1, 2, 4, 16}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// =========================================================================
 	// delete-5.6: Delete with IN clause
 	// =========================================================================
 	t.Run("delete-5.6", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1 IN (1,3)")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{2, 4, 4, 16}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// =========================================================================
 	// delete-5.7: Delete all rows with f1 != f1 (no rows should be deleted)
 	// =========================================================================
 	t.Run("delete-5.7", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(1,2)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(2,4)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(3,8)")
+		mustExec(t, db, "INSERT INTO table1 VALUES(4,16)")
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1!=f1")
+
+		got := queryFlatInts(t, db, "SELECT * FROM table1 ORDER BY f1")
+		want := []int64{1, 2, 2, 4, 3, 8, 4, 16}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v (no rows should be deleted)", got, want)
+		}
 	})
 
 	// =========================================================================
 	// delete-6.x: Large data tests (3000 rows) - try, skip if count(*) fails
 	// =========================================================================
 	t.Run("delete-6.1", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE with large datasets not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+
+		err := db.Exec("BEGIN")
+		if err != nil {
+			t.Skipf("transactions not supported: %v", err)
+		}
+		for i := 0; i < 3000; i++ {
+			err := db.Exec("INSERT INTO table1 VALUES(?, ?)", i, i*2)
+			if err != nil {
+				db.Exec("ROLLBACK")
+				t.Skipf("INSERT failed: %v", err)
+			}
+		}
+		err = db.Exec("COMMIT")
+		if err != nil {
+			t.Skipf("COMMIT failed: %v", err)
+		}
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1>=1000")
+
+		rs, err := db.Query("SELECT count(*) FROM table1")
+		if err != nil {
+			t.Skipf("count(*) not supported: %v", err)
+		}
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatal("expected one row from count(*)")
+		}
+		count := rs.Row().ColumnInt(0)
+		if count != 1000 {
+			t.Errorf("expected count(*)=1000 after deleting f1>=1000, got %d", count)
+		}
 	})
 
 	t.Run("delete-6.2", func(t *testing.T) {
-		t.Skip("WHERE clause in DELETE with large datasets not fully implemented")
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE table1(f1 int, f2 int)")
+
+		err := db.Exec("BEGIN")
+		if err != nil {
+			t.Skipf("transactions not supported: %v", err)
+		}
+		for i := 0; i < 3000; i++ {
+			err := db.Exec("INSERT INTO table1 VALUES(?, ?)", i, i*2)
+			if err != nil {
+				db.Exec("ROLLBACK")
+				t.Skipf("INSERT failed: %v", err)
+			}
+		}
+		err = db.Exec("COMMIT")
+		if err != nil {
+			t.Skipf("COMMIT failed: %v", err)
+		}
+
+		mustExec(t, db, "DELETE FROM table1 WHERE f1 BETWEEN 500 AND 1499")
+
+		rs, err := db.Query("SELECT count(*) FROM table1")
+		if err != nil {
+			t.Skipf("count(*) not supported: %v", err)
+		}
+		defer rs.Close()
+		if !rs.Next() {
+			t.Fatal("expected one row from count(*)")
+		}
+		count := rs.Row().ColumnInt(0)
+		if count != 2000 {
+			t.Errorf("expected count(*)=2000 after deleting f1 BETWEEN 500 AND 1499, got %d", count)
+		}
 	})
 
 	// =========================================================================
