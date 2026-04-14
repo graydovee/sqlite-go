@@ -538,7 +538,6 @@ func TestAlter2AddColumnDefaultInserts(t *testing.T) {
 // TestAlter2AddColumnCheck tests ADD COLUMN with CHECK constraint.
 func TestAlter2AddColumnCheck(t *testing.T) {
 	// t.Skip("ALTER TABLE not fully implemented")
-			t.Skip("CHECK constraint enforcement not implemented")
 	t.Run("check_constraint", func(t *testing.T) {
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")

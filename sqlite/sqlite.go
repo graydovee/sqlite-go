@@ -101,6 +101,7 @@ type columnEntry struct {
 	typeName     string
 	defaultValue interface{}
 	isPK         bool
+	checkExpr    string // CHECK constraint expression (empty if none)
 }
 
 // selectCol represents a column in a SELECT expression list.
@@ -392,6 +393,8 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execDropIndex(filtered)
 	case "alter":
 		return db.execAlterTable(filtered, sql)
+	case "rename_table":
+		return db.execRenameTableStmt(filtered)
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
@@ -1218,6 +1221,67 @@ func (db *Database) execAlterTable(tokens []compile.Token, sql string) error {
 	}
 }
 
+// execRenameTableStmt handles RENAME TABLE old_name TO new_name.
+func (db *Database) execRenameTableStmt(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "rename")
+	expectKeyword(tokens, &pos, "table")
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected table name")
+	}
+	oldName := tokens[pos].Value
+	pos++
+
+	if pos >= len(tokens) || !isKeyword(tokens[pos], "to") {
+		return NewError(Error, "expected TO in RENAME TABLE")
+	}
+	pos++
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected new table name")
+	}
+	newName := tokens[pos].Value
+
+	// Delegate to execAlterRenameTable by constructing the right call
+	pos = len(tokens) // no more tokens to read
+	return db.execAlterRenameTableDirect(oldName, newName)
+}
+
+// execAlterRenameTableDirect renames a table given the old and new names.
+func (db *Database) execAlterRenameTableDirect(oldName, newName string) error {
+	unquoted := unquoteIdent(newName)
+	if unquoted == "" {
+		return NewError(Error, "invalid name")
+	}
+	if strings.HasPrefix(strings.ToLower(newName), "sqlite_") {
+		return NewErrorf(Error, "object name reserved for internal use: %s", newName)
+	}
+	tbl, ok := db.tables[oldName]
+	if !ok {
+		return NewErrorf(Error, "no such table: %s", oldName)
+	}
+	if newName != oldName {
+		if _, exists := db.tables[newName]; exists {
+			return NewErrorf(Error, "table %s already exists", newName)
+		}
+	}
+	tbl.name = newName
+	delete(db.tables, oldName)
+	db.tables[newName] = tbl
+	for i := range db.masterEntries {
+		e := &db.masterEntries[i]
+		if e.Type == "table" && e.Name == oldName {
+			e.Name = newName
+			e.TblName = newName
+			e.SQL = replaceTableNameInSQL(e.SQL, oldName, newName)
+		} else if e.TblName == oldName {
+			e.TblName = newName
+		}
+	}
+	return nil
+}
+
 // execAlterRenameTable handles ALTER TABLE ... RENAME TO new_name.
 func (db *Database) execAlterRenameTable(oldName string, tokens []compile.Token, pos *int) error {
 	if *pos >= len(tokens) {
@@ -1226,8 +1290,12 @@ func (db *Database) execAlterRenameTable(oldName string, tokens []compile.Token,
 	newName := tokens[*pos].Value
 	*pos++
 
-	// Check for empty name
-	if newName == "" {
+	// Check for empty name (handle quoted empty strings like '')
+	unquoted := unquoteIdent(newName)
+	if len(newName) >= 2 && newName[0] == '\'' && newName[len(newName)-1] == '\'' {
+		unquoted = newName[1 : len(newName)-1]
+	}
+	if unquoted == "" {
 		return NewError(Error, "invalid name")
 	}
 
@@ -1364,6 +1432,7 @@ func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token,
 	// Parse constraints: DEFAULT, NOT NULL, UNIQUE, PRIMARY KEY, CHECK, COLLATE
 	hasDefault := false
 	var defaultVal interface{}
+	var checkExpression string
 	hasNotNull := false
 	hasUnique := false
 	hasPrimaryKey := false
@@ -1403,7 +1472,7 @@ func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token,
 					return NewError(Error, "subqueries prohibited in DEFAULT")
 				}
 				for _, agg := range []string{"count", "sum", "avg", "min", "max", "group_concat", "total"} {
-					if strings.Contains(exprLower, agg+"(") {
+					if strings.Contains(strings.ReplaceAll(exprLower, " ", ""), agg+"(") {
 						return NewErrorf(Error, "misuse of aggregate function: %s()", agg)
 					}
 				}
@@ -1439,7 +1508,6 @@ func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token,
 			hasPrimaryKey = true
 		} else if isKeyword(tokens[*pos], "check") {
 			*pos++
-			_ = true
 			if *pos < len(tokens) && tokens[*pos].Type == compile.TokenLParen {
 				*pos++
 				depth := 0
@@ -1458,7 +1526,7 @@ func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token,
 					parts = append(parts, tokens[*pos].Value)
 					*pos++
 				}
-				_ = strings.Join(parts, " ")
+				checkExpression = strings.Join(parts, " ")
 			}
 		} else if isKeyword(tokens[*pos], "collate") {
 			*pos++
@@ -1492,6 +1560,7 @@ func (db *Database) execAlterAddColumn(tableName string, tokens []compile.Token,
 			name:         colName,
 			typeName:     colType,
 			defaultValue: defaultVal,
+			checkExpr:    checkExpression,
 	})
 
 	// Store default value info in the column for future INSERT operations
@@ -1932,6 +2001,37 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 			valMap[name] = values[i]
 		} else {
 			valMap[name] = nil
+		}
+	}
+
+	// Fill in defaults for missing columns before CHECK evaluation
+	for _, col := range tbl.columns {
+		if _, ok := valMap[col.name]; !ok {
+			if defVal, hasDef := db.columnDefaults[tbl.name+"."+col.name]; hasDef {
+				valMap[col.name] = defVal
+			}
+		}
+	}
+
+	// Evaluate CHECK constraints
+	for _, col := range tbl.columns {
+		if col.checkExpr == "" {
+			continue
+		}
+		colNames := make([]string, len(tbl.columns))
+		colValues := make([]vdbe.Value, len(tbl.columns))
+		for j, c := range tbl.columns {
+			colNames[j] = c.name
+			if v, ok := valMap[c.name]; ok {
+				colValues[j] = interfaceToValue(v)
+			}
+		}
+		result := evalExprWithRow(col.checkExpr, nil, colNames, colValues)
+
+		if result != nil && !result.IsNullField() {
+			if !result.Bool() {
+				return NewErrorf(Constraint, "CHECK constraint failed: %s", col.checkExpr)
+			}
 		}
 	}
 
@@ -7006,6 +7106,8 @@ func classifyStatement(tokens []compile.Token) string {
 		return "rollback"
 	case "alter":
 		return "alter"
+	case "rename":
+		return "rename_table"
 	case "pragma":
 		return "pragma"
 	}

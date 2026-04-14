@@ -302,7 +302,6 @@ func TestAlterAddColumnDefault(t *testing.T) {
 
 	// alter-8.6: ADD COLUMN with aggregate in DEFAULT should fail
 	t.Run("alter-8.6_no_aggregate_default", func(t *testing.T) {
-		t.Skip("aggregate in DEFAULT error detection not implemented")
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
 		mustExec(t, db, "INSERT INTO t1 VALUES(1)")
@@ -686,7 +685,6 @@ func TestAlterRenameMoreErrors(t *testing.T) {
 
 	// Empty table name should fail
 	t.Run("rename_to_empty", func(t *testing.T) {
-		t.Skip("empty name error detection not implemented")
 		db := openTestDB(t)
 		mustExec(t, db, "CREATE TABLE t1(a)")
 

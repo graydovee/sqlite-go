@@ -263,6 +263,8 @@ func (p *Parser) parseStatement() *Statement {
 			return p.parseDrop()
 		case "alter":
 			return p.parseAlterTable()
+		case "rename":
+			return p.parseRenameTable()
 		case "begin":
 			return p.parseBegin()
 		case "commit", "end":
@@ -2073,6 +2075,23 @@ func (p *Parser) parseAlterTable() *Statement {
 		p.errorf("expected ADD, RENAME, or DROP after ALTER TABLE")
 		return nil
 	}
+
+	return &Statement{
+		Type:       StmtAlterTable,
+		AlterTable: stmt,
+	}
+}
+
+// parseRenameTable parses RENAME TABLE old_name TO new_name.
+func (p *Parser) parseRenameTable() *Statement {
+	p.expectKw(KwRename)
+	p.expectKw(KwTable)
+
+	stmt := &AlterTableStmt{}
+	stmt.Table = p.parseName()
+	p.expectKw(KwTo)
+	stmt.NewName = p.parseName()
+	stmt.Type = AlterRenameTable
 
 	return &Statement{
 		Type:       StmtAlterTable,
