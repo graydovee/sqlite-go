@@ -15,7 +15,6 @@ const func2Str = "Supercalifragilisticexpialidocious" // 34 characters
 //
 //	func2-1.*: substr with ASCII, 2-arg form
 func TestFunc2Substr2Arg(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	execOrFail(t, db, "CREATE TABLE t1(s TEXT)")
@@ -60,7 +59,6 @@ func TestFunc2Substr2Arg(t *testing.T) {
 //
 //	func2-1.11 through func2-1.21: substr with ASCII, 3-arg form
 func TestFunc2Substr3Arg(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	execOrFail(t, db, "CREATE TABLE t1(s TEXT)")
@@ -106,7 +104,6 @@ func TestFunc2Substr3Arg(t *testing.T) {
 //
 //	func2-1.21 through func2-1.26
 func TestFunc2SubstrNegativeP2(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	execOrFail(t, db, "CREATE TABLE t1(s TEXT)")
@@ -147,7 +144,6 @@ func TestFunc2SubstrNegativeP2(t *testing.T) {
 //
 //	func2-2.*: wrong number of args
 func TestFunc2SubstrWrongArgCount(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	tests := []struct {
@@ -171,7 +167,6 @@ func TestFunc2SubstrWrongArgCount(t *testing.T) {
 
 // TestFunc2SubstrLiteral tests substr() with literal string arguments (no table).
 func TestFunc2SubstrLiteral(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	t.Run("literal_2arg", func(t *testing.T) {
@@ -219,7 +214,6 @@ func TestFunc2SubstrLiteral(t *testing.T) {
 
 // TestFunc2SubstrNull tests substr() behavior with NULL inputs.
 func TestFunc2SubstrNull(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	t.Run("null_string_2arg", func(t *testing.T) {
@@ -281,7 +275,6 @@ func TestFunc2SubstrNull(t *testing.T) {
 
 // TestFunc2SubstrEmptyString tests substr() with an empty string.
 func TestFunc2SubstrEmptyString(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	tests := []struct {
@@ -314,7 +307,6 @@ func TestFunc2SubstrEmptyString(t *testing.T) {
 
 // TestFunc2SubstrEdgeCases tests additional edge cases for substr().
 func TestFunc2SubstrEdgeCases(t *testing.T) {
-	t.Skip("substr() not yet functional through SQL query engine")
 	db := openTestDB(t)
 
 	t.Run("large_offset", func(t *testing.T) {

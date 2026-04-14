@@ -5219,6 +5219,8 @@ func (p *joinExprParser) evalFunction(name string) *vdbe.Mem {
 			return vdbe.NewMemStr(strings.ToUpper(funcArgs[0].StringValue()))
 		}
 		return vdbe.NewMemNull()
+	case "substr", "substring":
+			return evalSubstr(funcArgs)
 	case "cast":
 		// Handled by the caller
 		return vdbe.NewMemNull()
@@ -5553,7 +5555,7 @@ type exprParser struct {
 	args      []interface{}
 	colNames  []string
 	colValues []vdbe.Value
-	err       error // set if a parse/eval error occurs
+	err       error
 }
 
 func (p *exprParser) peek() byte {
@@ -6467,9 +6469,97 @@ func (p *exprParser) evalFunction(name string) *vdbe.Mem {
 		if len(args) > 0 && !isNull(args[0]) {
 			return vdbe.NewMemInt(int64(len(memStr(args[0]))))
 		}
+	case "substr", "substring":
+			if len(args) < 2 || len(args) > 3 {
+				p.err = fmt.Errorf("wrong number of arguments to function substr()")
+				return vdbe.NewMemNull()
+			}
+			return evalSubstr(args)
 	}
 	return vdbe.NewMemNull()
 }
+
+	// evalSubstr implements substr()/substring() for the hack-layer expression parser.
+	func evalSubstr(args []*vdbe.Mem) *vdbe.Mem {
+		if len(args) < 2 || isNull(args[0]) || isNull(args[1]) {
+			return vdbe.NewMemNull()
+		}
+		if len(args) >= 3 && isNull(args[2]) {
+			return vdbe.NewMemNull()
+		}
+
+		s := memStr(args[0])
+		start := args[1].IntValue()
+
+		runes := []rune(s)
+		runeCount := int64(len(runes))
+
+		var length int64
+		hasLen := len(args) >= 3
+		if hasLen {
+			length = args[2].IntValue()
+		} else {
+			length = runeCount
+		}
+
+		// Convert from 1-indexed to 0-indexed
+		if start > 0 {
+			start--
+		} else if start == 0 {
+			// start=0 is special: "before position 1"
+			// For 3-arg, length counts from this phantom position
+			if hasLen {
+				if length <= 0 {
+					return vdbe.NewMemStr("")
+				}
+				length--
+			}
+			start = 0
+		} else {
+			// Negative start: count from end
+			start = runeCount + start
+			if start < 0 {
+				// Overshot the beginning
+				if hasLen {
+					// 3-arg: reduce length by overshoot amount
+					length += start
+					if length < 0 {
+						length = 0
+					}
+				}
+				start = 0
+			}
+		}
+
+		if length < 0 {
+			// Negative length: take chars before start
+			end := start
+			start = start + length
+			if start < 0 {
+				start = 0
+			}
+			length = end - start
+		}
+
+		if start >= runeCount {
+			return vdbe.NewMemStr("")
+		}
+
+		end := start + length
+		if end > runeCount {
+			end = runeCount
+		}
+		if end <= start {
+			return vdbe.NewMemStr("")
+		}
+
+		return vdbe.NewMemStr(string(runes[start:end]))
+	}
+
+
+
+
+
 
 // --- Expression helper functions ---
 

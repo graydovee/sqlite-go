@@ -358,39 +358,48 @@ func substrImpl(strMem, startMem, lenMem *vdbe.Mem) *vdbe.Mem {
 	s := strMem.TextValue()
 	start := startMem.IntValue()
 
-	length := int64(utf8.RuneCountInString(s))
-	if lenMem != nil {
-		length = lenMem.IntValue()
-	}
-
-	// Convert 1-indexed start
-	if start == 0 {
-		return vdbe.NewMemStr("")
-	}
-
 	runes := []rune(s)
 	runeCount := int64(len(runes))
 
-	if start < 0 {
+	var length int64
+	hasLen := lenMem != nil
+	if hasLen {
+		length = lenMem.IntValue()
+	} else {
+		length = runeCount
+	}
+
+	// Convert from 1-indexed to 0-indexed
+	if start > 0 {
+		start--
+	} else if start == 0 {
+		// start=0 is special: it means "before position 1"
+		// For 3-arg, length counts from this phantom position
+		if hasLen {
+			if length <= 0 {
+				return vdbe.NewMemStr("")
+			}
+			length--
+		}
+		start = 0 // 0-indexed position 0 = first char
+	} else {
+		// Negative start: count from end
 		start = runeCount + start
 		if start < 0 {
-			if length < 0 {
-				length = 0
-			} else {
+			// Overshot the beginning
+			if hasLen {
+				// 3-arg: reduce length by overshoot amount
 				length += start
+				if length < 0 {
+					length = 0
+				}
 			}
 			start = 0
 		}
-	} else {
-		start-- // convert 1-indexed to 0-indexed
-	}
-
-	if start >= runeCount {
-		return vdbe.NewMemStr("")
 	}
 
 	if length < 0 {
-		// negative length means return characters *before* start
+		// Negative length: take chars before start
 		end := start
 		start = start + length
 		if start < 0 {
@@ -399,12 +408,13 @@ func substrImpl(strMem, startMem, lenMem *vdbe.Mem) *vdbe.Mem {
 		length = end - start
 	}
 
+	if start >= runeCount {
+		return vdbe.NewMemStr("")
+	}
+
 	end := start + length
 	if end > runeCount {
 		end = runeCount
-	}
-	if start < 0 {
-		start = 0
 	}
 	if end <= start {
 		return vdbe.NewMemStr("")

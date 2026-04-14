@@ -3006,7 +3006,7 @@ func (v *VDBE) execFunction(pOp *Instruction) {
 		return
 	}
 
-	// Collect arguments from registers starting at P2
+	// Collect arguments from registers starting at P1
 	argCount := fi.ArgCount
 	if argCount < 0 {
 		// Variable args: P5 contains the actual count
@@ -3018,7 +3018,7 @@ func (v *VDBE) execFunction(pOp *Instruction) {
 
 	args := make([]*Mem, argCount)
 	for i := 0; i < argCount; i++ {
-		idx := pOp.P2 + i
+		idx := pOp.P1 + i
 		if idx < len(v.regs) {
 			args[i] = &v.regs[idx]
 		} else {
@@ -3030,13 +3030,13 @@ func (v *VDBE) execFunction(pOp *Instruction) {
 	if fc, ok := v.db.(FunctionCaller); ok {
 		result := fc.CallFunction(fi.Name, args)
 		if result != nil {
-			v.regs[pOp.P3] = *result
+			v.regs[pOp.P2] = *result
 		} else {
-			v.regs[pOp.P3].SetNull()
+			v.regs[pOp.P2].SetNull()
 		}
 	} else {
 		// No function registry available; result is null
-		v.regs[pOp.P3].SetNull()
+		v.regs[pOp.P2].SetNull()
 	}
 }
 
