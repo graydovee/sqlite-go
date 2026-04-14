@@ -120,6 +120,9 @@ type Pager interface {
 	// JournalMode returns the current journal mode.
 	GetJournalMode() JournalMode
 
+	// CacheSize returns the current page cache size.
+	CacheSize() int
+
 	// SetCacheSize changes the page cache size.
 	SetCacheSize(size int) error
 

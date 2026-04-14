@@ -606,6 +606,12 @@ func (p *PagerImpl) GetJournalMode() JournalMode {
 	return p.journalMode
 }
 
+func (p *PagerImpl) CacheSize() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cacheSize
+}
+
 func (p *PagerImpl) SetCacheSize(size int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()

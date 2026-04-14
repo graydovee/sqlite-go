@@ -130,6 +130,12 @@ func (e *Engine) handlePragma(tokens []compile.Token) ([]PragmaRow, bool, error)
 		return e.pragmaIndexInfo(valueStr)
 	case "stats":
 		return e.pragmaStats()
+	case "encoding":
+		return e.pragmaEncoding()
+	case "auto_vacuum":
+		return e.pragmaAutoVacuum()
+	case "page_count":
+		return e.pragmaPageCount()
 	default:
 		return nil, false, fmt.Errorf("unknown pragma: %s", pragmaName)
 	}
@@ -524,6 +530,31 @@ func (e *Engine) pragmaIndexInfo(indexName string) ([]PragmaRow, bool, error) {
 	}
 
 	return nil, false, fmt.Errorf("no such index: %s", indexName)
+}
+
+// pragmaEncoding returns the database encoding.
+// Columns: encoding
+func (e *Engine) pragmaEncoding() ([]PragmaRow, bool, error) {
+	return []PragmaRow{{Values: []interface{}{"UTF-8"}}}, true, nil
+}
+
+// pragmaAutoVacuum returns the auto_vacuum setting.
+// Columns: auto_vacuum
+func (e *Engine) pragmaAutoVacuum() ([]PragmaRow, bool, error) {
+	return []PragmaRow{{Values: []interface{}{0}}}, true, nil // 0 = none
+}
+
+// pragmaPageCount returns the number of pages in the database.
+// Columns: page_count
+func (e *Engine) pragmaPageCount() ([]PragmaRow, bool, error) {
+	count := 0
+	if e.pgr != nil {
+		count = e.pgr.PageCount()
+	}
+	if count < 1 {
+		count = 1
+	}
+	return []PragmaRow{{Values: []interface{}{count}}}, true, nil
 }
 
 // pragmaStats returns database statistics.
