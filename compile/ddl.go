@@ -1252,7 +1252,7 @@ func (b *Build) compileAttach(stmt *AttachStmt) {
 	fileReg := b.b.AllocReg(2)
 	b.emitString(stmt.File, fileReg)
 	b.emitString(stmt.Schema, fileReg+1)
-	b.b.EmitP4(vdbe.OpFunction, fileReg, 0, 2, &FuncInfo{Name: "ATTACH", ArgCount: 2},
+	b.b.EmitP4(vdbe.OpFunction, fileReg, 0, 2, &vdbe.FuncInfo{Name: "ATTACH", ArgCount: 2},
 		"attach "+stmt.Schema)
 	b.emitHalt(0)
 }
@@ -1262,7 +1262,7 @@ func (b *Build) compileDetach(stmt *DetachStmt) {
 	b.emitInit()
 	schemaReg := b.b.AllocReg(1)
 	b.emitString(stmt.Schema, schemaReg)
-	b.b.EmitP4(vdbe.OpFunction, schemaReg, 0, 1, &FuncInfo{Name: "DETACH", ArgCount: 1},
+	b.b.EmitP4(vdbe.OpFunction, schemaReg, 0, 1, &vdbe.FuncInfo{Name: "DETACH", ArgCount: 1},
 		"detach "+stmt.Schema)
 	b.emitHalt(0)
 }

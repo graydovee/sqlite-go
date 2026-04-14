@@ -15,6 +15,7 @@ import (
 
 	"github.com/sqlite-go/sqlite-go/btree"
 	"github.com/sqlite-go/sqlite-go/compile"
+	"github.com/sqlite-go/sqlite-go/functions"
 	"github.com/sqlite-go/sqlite-go/pager"
 	"github.com/sqlite-go/sqlite-go/vdbe"
 	"github.com/sqlite-go/sqlite-go/vfs"
@@ -55,6 +56,8 @@ type Database struct {
 
 	// CTE temporary data (populated during WITH query execution)
 	cteData map[string]*cteTable
+
+	funcRegistry *functions.FuncRegistry
 }
 
 // sqliteMasterEntry represents one row in the sqlite_master system table.
@@ -117,6 +120,7 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 		views:          make(map[string]*viewEntry),
 		columnDefaults: make(map[string]interface{}),
 		autoCommit:     true,
+		funcRegistry:   functions.NewFuncRegistry(),
 	}
 
 	if filename == ":memory:" || flags&OpenMemory != 0 {
@@ -2426,6 +2430,20 @@ func (v vdbeDB) DestroyBTree(rootPage int) error {
 	return v.db.bt.Drop(btree.PageNumber(rootPage))
 }
 
+// CallFunction implements vdbe.FunctionCaller.
+func (v vdbeDB) CallFunction(name string, args []*vdbe.Mem) *vdbe.Mem {
+	reg := v.db.funcRegistry
+	if reg == nil {
+		return nil
+	}
+	fn := reg.Lookup(strings.ToLower(name), len(args))
+	if fn == nil || fn.ScalarFunc == nil {
+		return nil
+	}
+	ctx := &functions.Context{}
+	return fn.ScalarFunc(ctx, args)
+}
+
 // buildCompileSchema converts in-memory table metadata into a compile.Schema.
 func (db *Database) buildCompileSchema() *compile.Schema {
 	schema := compile.NewSchema()
@@ -2505,7 +2523,8 @@ func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, er
 			for i := 0; i < count; i++ {
 				idx := startIdx + i
 				if idx < len(regs) {
-					cp := regs[idx]; row.values = append(row.values, &cp)
+					cp := regs[idx]
+					row.values = append(row.values, heapCopyMem(&cp))
 				} else {
 					row.values = append(row.values, vdbe.NewMemNull())
 				}
@@ -7300,4 +7319,12 @@ func (db *Database) resolveSubqueries(expr string, args []interface{}) string {
 		expr = expr[:idx] + result + expr[end+1:]
 	}
 	return expr
+}
+
+// heapCopyMem returns a heap-allocated copy of a Mem value.
+// This is needed to avoid escape analysis issues when taking
+// the address of a loop variable in a closure.
+func heapCopyMem(m *vdbe.Mem) *vdbe.Mem {
+	cp := *m
+	return &cp
 }

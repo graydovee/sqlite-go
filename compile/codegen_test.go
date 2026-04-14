@@ -561,7 +561,7 @@ func TestCompileFunctionCall(t *testing.T) {
 	for _, instr := range prog.Instructions {
 		if instr.Op == vdbe.OpFunction {
 			found = true
-			fi := instr.P4.(*FuncInfo)
+			fi := instr.P4.(*vdbe.FuncInfo)
 			if fi.Name != "ABS" {
 				t.Fatalf("expected function name ABS, got %s", fi.Name)
 			}

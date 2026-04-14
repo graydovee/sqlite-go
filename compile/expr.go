@@ -7,14 +7,6 @@ import (
 	"github.com/sqlite-go/sqlite-go/vdbe"
 )
 
-// FuncInfo describes a SQL function for the VDBE Function opcode.
-type FuncInfo struct {
-	Name      string
-	ArgCount  int // -1 for variable args
-	Distinct  bool
-	IsAggregate bool
-}
-
 // compileExpr compiles an expression tree into VDBE instructions.
 // The result is stored in targetReg.
 func (b *Build) compileExpr(expr *Expr, targetReg int) error {
@@ -369,7 +361,7 @@ func (b *Build) compileFunctionCall(expr *Expr, targetReg int) error {
 	}
 
 	// Encode function metadata in P4
-	fi := &FuncInfo{
+	fi := &vdbe.FuncInfo{
 		Name:      fnName,
 		ArgCount:  nArgs,
 		Distinct:  expr.Distinct,
@@ -461,7 +453,7 @@ func (b *Build) compileTypeof(expr *Expr, targetReg int) error {
 	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
 		return err
 	}
-	fi := &FuncInfo{Name: "TYPEOF", ArgCount: 1}
+	fi := &vdbe.FuncInfo{Name: "TYPEOF", ArgCount: 1}
 	b.b.EmitP4(vdbe.OpFunction, argReg, targetReg, 1, fi, "TYPEOF")
 	return nil
 }
@@ -475,7 +467,7 @@ func (b *Build) compileLength(expr *Expr, targetReg int) error {
 	if err := b.compileExpr(expr.Args[0], argReg); err != nil {
 		return err
 	}
-	fi := &FuncInfo{Name: "LENGTH", ArgCount: 1}
+	fi := &vdbe.FuncInfo{Name: "LENGTH", ArgCount: 1}
 	b.b.EmitP4(vdbe.OpFunction, argReg, targetReg, 1, fi, "LENGTH")
 	return nil
 }
@@ -762,7 +754,7 @@ func (b *Build) compileGroupConcat(expr *Expr, targetReg int) error {
 		}
 	}
 	nArgs := len(expr.Args)
-	fi := &FuncInfo{Name: "GROUP_CONCAT", ArgCount: nArgs}
+	fi := &vdbe.FuncInfo{Name: "GROUP_CONCAT", ArgCount: nArgs}
 	b.b.EmitP4(vdbe.OpAggStep, argReg, targetReg, nArgs, fi, "GROUP_CONCAT STEP")
 	return nil
 }
@@ -1026,7 +1018,7 @@ func (b *Build) compilePatternMatch(expr *Expr, targetReg int, fnName string) er
 		nArgs = 3
 	}
 
-	fi := &FuncInfo{Name: fnName, ArgCount: nArgs}
+	fi := &vdbe.FuncInfo{Name: fnName, ArgCount: nArgs}
 	argBase := strReg
 	b.b.EmitP4(vdbe.OpFunction, argBase, targetReg, nArgs, fi, fnName)
 
