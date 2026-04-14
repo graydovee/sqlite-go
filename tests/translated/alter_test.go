@@ -588,7 +588,34 @@ func TestAlterSkippedFeatures(t *testing.T) {
 		t.Skip("AUTOINCREMENT tests skipped")
 	})
 	t.Run("alter-9_rtree", func(t *testing.T) {
-		t.Skip("rtree tests skipped")
+		// Based on SQLite alter-17.100: rtree virtual table
+		db := openTestDB(t)
+
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE VIRTUAL TABLE t2 USING rtree(id,x0,x1)")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1,'apple')")
+		mustExec(t, db, "INSERT INTO t1 VALUES(2,'fig')")
+		mustExec(t, db, "INSERT INTO t1 VALUES(3,'pear')")
+		mustExec(t, db, "INSERT INTO t2 VALUES(1,1.0,2.0)")
+		mustExec(t, db, "INSERT INTO t2 VALUES(2,2.0,3.0)")
+		mustExec(t, db, "INSERT INTO t2 VALUES(3,1.5,3.5)")
+
+		// Verify rtree data
+		got := queryFlatStrings(t, db, "SELECT * FROM t2 ORDER BY 1")
+		want := []string{"1", "1", "2", "2", "2", "3", "3", "1.5", "3.5"}
+		assertResults(t, got, want)
+
+		// Delete a row and verify
+		mustExec(t, db, "DELETE FROM t2 WHERE id = 2")
+		got = queryFlatStrings(t, db, "SELECT * FROM t2 ORDER BY 1")
+		want = []string{"1", "1", "2", "3", "1.5", "3.5"}
+		assertResults(t, got, want)
+
+		// ALTER TABLE RENAME should work alongside virtual tables
+		mustExec(t, db, "ALTER TABLE t1 RENAME TO t3")
+		got = queryFlatStrings(t, db, "SELECT * FROM t3 ORDER BY 1")
+		want = []string{"1", "apple", "2", "fig", "3", "pear"}
+		assertResults(t, got, want)
 	})
 	t.Run("alter-10_strict", func(t *testing.T) {
 		t.Skip("STRICT table tests skipped")

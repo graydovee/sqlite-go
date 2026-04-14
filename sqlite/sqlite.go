@@ -61,6 +61,9 @@ type Database struct {
 	// Trigger storage
 	triggers map[string]*triggerEntry
 
+	// Virtual table storage
+	vtabTables map[string]*vtabTableEntry
+
 	funcRegistry *functions.FuncRegistry
 }
 
@@ -137,6 +140,7 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 		views:          make(map[string]*viewEntry),
 		triggers:       make(map[string]*triggerEntry),
 		columnDefaults: make(map[string]interface{}),
+		vtabTables:     make(map[string]*vtabTableEntry),
 		autoCommit:     true,
 		funcRegistry:   functions.NewFuncRegistry(),
 	}
@@ -408,6 +412,8 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execDropTable(filtered)
 	case "drop_index":
 		return db.execDropIndex(filtered)
+	case "create_virtual":
+		return db.execCreateVirtualTable(filtered, sql)
 	case "create_trigger":
 		return db.execCreateTrigger(filtered, sql)
 	case "drop_trigger":
@@ -828,6 +834,210 @@ func (db *Database) execCreateTable(tokens []compile.Token) error {
 			RootPage: 0,
 			SQL:      "",
 		})
+	}
+
+	return nil
+}
+
+
+// execCreateVirtualTable handles CREATE VIRTUAL TABLE statements.
+func (db *Database) execCreateVirtualTable(tokens []compile.Token, sql string) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "create")
+	expectKeyword(tokens, &pos, "virtual")
+	expectKeyword(tokens, &pos, "table")
+
+	ifNotExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "not")
+		expectKeyword(tokens, &pos, "exists")
+		ifNotExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected virtual table name")
+	}
+	tableName := tokens[pos].Value
+	pos++
+
+	if ifNotExists {
+		if _, ok := db.tables[tableName]; ok {
+			return nil
+		}
+		if db.vtabTables != nil {
+			if _, ok := db.vtabTables[strings.ToLower(tableName)]; ok {
+				return nil
+			}
+		}
+	}
+
+	expectKeyword(tokens, &pos, "using")
+	if pos >= len(tokens) {
+		return NewError(Error, "expected module name after USING")
+	}
+	moduleName := tokens[pos].Value
+	pos++
+
+	// Parse optional arguments inside parentheses
+	var args []string
+	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+		pos++ // skip (
+		depth := 1
+		var buf strings.Builder
+		for pos < len(tokens) && depth > 0 {
+			if tokens[pos].Type == compile.TokenLParen {
+				depth++
+				buf.WriteString(tokens[pos].Value)
+			} else if tokens[pos].Type == compile.TokenRParen {
+				depth--
+				if depth == 0 {
+					break
+				}
+				buf.WriteString(tokens[pos].Value)
+			} else if tokens[pos].Type == compile.TokenComma && depth == 1 {
+				args = append(args, strings.TrimSpace(buf.String()))
+				buf.Reset()
+			} else {
+				buf.WriteString(tokens[pos].Value)
+			}
+			pos++
+		}
+		if buf.Len() > 0 {
+			args = append(args, strings.TrimSpace(buf.String()))
+		}
+		if pos < len(tokens) {
+			pos++ // skip )
+		}
+	}
+
+	// Look up module
+	vtabModulesMu.Lock()
+	mod, ok := vtabModules[strings.ToLower(moduleName)]
+	vtabModulesMu.Unlock()
+	if !ok {
+		return NewErrorf(Error, "no such module: %s", moduleName)
+	}
+
+	// Create the virtual table instance
+	vtab, cols, err := mod.factory(db, true, args)
+	if err != nil {
+		return NewErrorf(Error, "virtual table constructor: %s", err)
+	}
+
+	if db.vtabTables == nil {
+		db.vtabTables = make(map[string]*vtabTableEntry)
+	}
+	vtEntry := &vtabTableEntry{
+		moduleName: strings.ToLower(moduleName),
+		vtab:       vtab,
+		columns:    cols,
+	}
+	db.vtabTables[strings.ToLower(tableName)] = vtEntry
+
+	// Also register in sqlite_master for schema visibility
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:     "table",
+		Name:     tableName,
+		TblName:  tableName,
+		RootPage: 0,
+		SQL:      sql,
+	})
+
+	return nil
+}
+
+// execInsertVTab handles INSERT into a virtual table.
+func (db *Database) execInsertVTab(tableName string, vt *vtabTableEntry, tokens []compile.Token, startPos int, args []interface{}) error {
+	pos := startPos
+
+	// Optional column list
+	var colList []string
+	if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+		scanPos := pos + 1
+		hasValuesKeyword := false
+		for scanPos < len(tokens) {
+			if isKeyword(tokens[scanPos], "values") {
+				hasValuesKeyword = true
+				break
+			}
+			if tokens[scanPos].Type == compile.TokenRParen {
+				if scanPos+1 < len(tokens) && isKeyword(tokens[scanPos+1], "values") {
+					hasValuesKeyword = true
+				}
+				break
+			}
+			scanPos++
+		}
+		if hasValuesKeyword {
+			pos++ // skip (
+			for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+				if tokens[pos].Type == compile.TokenID || tokens[pos].Type == compile.TokenKeyword {
+					colList = append(colList, tokens[pos].Value)
+				}
+				pos++
+			}
+			if pos < len(tokens) {
+				pos++ // skip )
+			}
+		}
+	}
+
+	// DEFAULT VALUES
+	if pos < len(tokens) && isKeyword(tokens[pos], "default") {
+		pos++
+		expectKeyword(tokens, &pos, "values")
+		_, err := vt.vtab.VTabUpdate([]interface{}{nil, nil})
+		return err
+	}
+
+	// VALUES clause
+	if pos < len(tokens) && isKeyword(tokens[pos], "select") {
+		// INSERT INTO vtab SELECT ... — not supported for virtual tables
+		return NewError(Error, "INSERT INTO virtual table with SELECT not supported")
+	}
+
+	expectKeyword(tokens, &pos, "values")
+
+	for pos < len(tokens) {
+		var values []interface{}
+		if pos < len(tokens) && tokens[pos].Type == compile.TokenLParen {
+			pos++ // skip (
+			for pos < len(tokens) && tokens[pos].Type != compile.TokenRParen {
+				val, err := parseInsertExprValue(tokens, &pos, args, new(int))
+				if err != nil {
+					return err
+				}
+				values = append(values, val)
+				if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+					pos++
+				}
+			}
+			if pos < len(tokens) {
+				pos++ // skip )
+			}
+		}
+
+		// Build args for VTabUpdate: [oldRowid=nil, newRowid, col1, col2, ...]
+		updateArgs := []interface{}{nil, nil}
+		for i := range vt.columns {
+			if i < len(values) {
+				updateArgs = append(updateArgs, values[i])
+			} else {
+				updateArgs = append(updateArgs, nil)
+			}
+		}
+
+		_, err := vt.vtab.VTabUpdate(updateArgs)
+		if err != nil {
+			return err
+		}
+
+		if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+			pos++
+			continue
+		}
+		break
 	}
 
 	return nil
@@ -1907,6 +2117,12 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 
 	tbl, ok := db.tables[tableName]
 	if !ok {
+		// Check if it's a virtual table
+		if db.vtabTables != nil {
+			if vt, vok := db.vtabTables[strings.ToLower(tableName)]; vok {
+				return db.execInsertVTab(tableName, vt, tokens, pos, args)
+			}
+		}
 		return NewErrorf(Error, "no such table: %s", tableName)
 	}
 
@@ -2168,6 +2384,12 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 
 	tbl, ok := db.tables[tableName]
 	if !ok {
+		// Check if it's a virtual table
+		if db.vtabTables != nil {
+			if vt, vok := db.vtabTables[strings.ToLower(tableName)]; vok {
+				return db.execDeleteVTab(tableName, vt, tokens, pos, args)
+			}
+		}
 		return NewErrorf(Error, "no such table: %s", tableName)
 	}
 
@@ -2796,6 +3018,19 @@ func (db *Database) executeDMLWithTriggers(sql string, args []interface{}, filte
 		}
 	}
 
+	// Check if target is a virtual table
+	if tableName != "" && db.vtabTables != nil {
+		if _, vok := db.vtabTables[strings.ToLower(tableName)]; vok {
+			// Route directly to execDelete/execUpdate which handle virtual tables
+			switch strings.ToLower(filtered[0].Value) {
+			case "delete":
+				return db.execDelete(filtered, args)
+			case "update":
+				return db.execUpdate(filtered, args)
+			}
+		}
+	}
+
 	// Fire BEFORE triggers
 	if tableName != "" {
 		if err := db.fireTriggers(tableName, "BEFORE", trigEvent); err != nil {
@@ -3162,6 +3397,12 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		// Check if it's a view
 		if v, vok := db.views[tableName]; vok {
 			return db.queryView(v, cols, args)
+		}
+		// Check if it's a virtual table
+		if db.vtabTables != nil {
+			if vt, vok := db.vtabTables[strings.ToLower(tableName)]; vok {
+				return db.queryVTab(tableName, vt, filtered, pos, cols, distinct, args)
+			}
 		}
 		return nil, NewErrorf(Error, "no such table: %s", tableName)
 	}
@@ -4481,6 +4722,250 @@ func rowKey(values []*vdbe.Mem) string {
 }
 
 // queryView executes a SELECT by expanding a view definition.
+// execDeleteVTab handles DELETE from a virtual table.
+func (db *Database) execDeleteVTab(tableName string, vt *vtabTableEntry, tokens []compile.Token, startPos int, args []interface{}) error {
+	pos := startPos
+
+	// Parse WHERE clause
+	var whereCol string
+	var whereOp string
+	var whereVal interface{}
+	if pos < len(tokens) && isKeyword(tokens[pos], "where") {
+		pos++
+		if pos < len(tokens) {
+			whereCol = tokens[pos].Value
+			pos++
+		}
+		if pos < len(tokens) {
+			whereOp = tokens[pos].Value
+			pos++
+		}
+		if pos < len(tokens) {
+			val, _ := parseInsertExprValue(tokens, &pos, args, new(int))
+			whereVal = val
+		}
+	}
+
+	// Open cursor and scan to find matching rows
+	cursor, err := vt.vtab.VTabOpen()
+	if err != nil {
+		return NewErrorf(Error, "vtab open: %s", err)
+	}
+	defer cursor.VTabClose()
+
+	if err := cursor.VTabFilter(0, "", nil); err != nil {
+		return NewErrorf(Error, "vtab filter: %s", err)
+	}
+
+	for !cursor.VTabEof() {
+		rowid, _ := cursor.VTabRowid()
+		shouldDelete := false
+
+		if whereCol == "" {
+			// DELETE all
+			shouldDelete = true
+		} else if whereOp == "=" {
+			// Simple equality check against id column
+			colIdx := -1
+			for i, c := range vt.columns {
+				if strings.EqualFold(c.Name, whereCol) {
+					colIdx = i
+					break
+				}
+			}
+			if colIdx == 0 {
+				// id column
+				shouldDelete = toInt64(whereVal) == rowid
+			} else if colIdx >= 0 {
+				v, _ := cursor.VTabColumn(colIdx)
+				shouldDelete = fmt.Sprintf("%v", v) == fmt.Sprintf("%v", whereVal)
+			}
+		}
+
+		cursor.VTabNext()
+
+		if shouldDelete {
+			vt.vtab.VTabUpdate([]interface{}{rowid, nil})
+		}
+	}
+
+	return nil
+}
+
+// queryVTab executes a SELECT against a virtual table.
+func (db *Database) queryVTab(tableName string, vt *vtabTableEntry, filtered []compile.Token, startPos int, cols []selectCol, distinct bool, args []interface{}) (*ResultSet, error) {
+	// Parse WHERE clause for MATCH support
+	pos := startPos
+	var matchValue interface{}
+	if pos < len(filtered) && isKeyword(filtered[pos], "where") {
+		pos++
+		// Simple WHERE parsing - look for column MATCH 'value'
+		for pos+2 < len(filtered) {
+			if isKeyword(filtered[pos+1], "match") {
+				colName := filtered[pos].Value
+				_ = colName
+				pos += 2 // skip column and MATCH
+				if pos < len(filtered) {
+					val, _ := parseInsertExprValue(filtered, &pos, args, new(int))
+					matchValue = val
+				}
+				break
+			}
+			pos++
+			if isKeyword(filtered[pos], "order") || isKeyword(filtered[pos], "limit") || isKeyword(filtered[pos], "group") {
+				break
+			}
+		}
+	}
+
+	// Parse ORDER BY
+	var orderByCol int = -1
+	var orderByDesc bool
+	for i := startPos; i < len(filtered); i++ {
+		if isKeyword(filtered[i], "order") && i+2 < len(filtered) && isKeyword(filtered[i+1], "by") {
+			// Simple: ORDER BY column_number [ASC|DESC]
+			if filtered[i+2].Type == compile.TokenInteger {
+				orderByCol, _ = strconv.Atoi(filtered[i+2].Value)
+				orderByCol-- // 1-based to 0-based
+			}
+			if i+3 < len(filtered) && isKeyword(filtered[i+3], "desc") {
+				orderByDesc = true
+			}
+			break
+		}
+	}
+
+	// Open cursor and scan
+	cursor, err := vt.vtab.VTabOpen()
+	if err != nil {
+		return nil, NewErrorf(Error, "vtab open: %s", err)
+	}
+	defer cursor.VTabClose()
+
+	// Start scan
+	filterArgs := []interface{}{}
+	if matchValue != nil {
+		filterArgs = append(filterArgs, matchValue)
+	}
+	if err := cursor.VTabFilter(0, "", filterArgs); err != nil {
+		return nil, NewErrorf(Error, "vtab filter: %s", err)
+	}
+
+	// Collect rows
+	type vtabRow struct {
+		rowid  int64
+		values []interface{}
+	}
+	var rows []vtabRow
+	for !cursor.VTabEof() {
+		rowid, _ := cursor.VTabRowid()
+		var values []interface{}
+		for i := range vt.columns {
+			v, _ := cursor.VTabColumn(i)
+			values = append(values, v)
+		}
+		rows = append(rows, vtabRow{rowid: rowid, values: values})
+		cursor.VTabNext()
+	}
+
+	// Apply ORDER BY
+	if orderByCol >= 0 {
+		sort.SliceStable(rows, func(i, j int) bool {
+			var vi, vj float64
+			if orderByCol < len(rows[i].values) && rows[i].values[orderByCol] != nil {
+				vi = toFloat64(rows[i].values[orderByCol])
+			}
+			if orderByCol < len(rows[j].values) && rows[j].values[orderByCol] != nil {
+				vj = toFloat64(rows[j].values[orderByCol])
+			}
+			if orderByDesc {
+				return vi > vj
+			}
+			return vi < vj
+		})
+	}
+
+	// Build result set
+	var resultCols []ResultColumnInfo
+	var colNames []string
+	if len(cols) == 0 || (len(cols) == 1 && cols[0].expr == "*") {
+		// SELECT *
+		for _, c := range vt.columns {
+			if !c.Hidden {
+				colNames = append(colNames, c.Name)
+			}
+		}
+	} else {
+		for _, c := range cols {
+			if c.as != "" {
+				colNames = append(colNames, c.as)
+			} else {
+				colNames = append(colNames, c.expr)
+			}
+		}
+	}
+
+	resultCols = make([]ResultColumnInfo, len(colNames))
+	for i, n := range colNames {
+		resultCols[i] = ResultColumnInfo{Name: n, Type: ColNull}
+	}
+
+	var resultRows []Row
+	for _, r := range rows {
+		row := Row{cols: resultCols}
+		if len(cols) == 0 || (len(cols) == 1 && cols[0].expr == "*") {
+			for i, c := range vt.columns {
+				if !c.Hidden {
+					if i < len(r.values) && r.values[i] != nil {
+						row.values = append(row.values, vdbe.MakeMem(r.values[i]))
+					} else {
+						row.values = append(row.values, vdbe.NewMemNull())
+					}
+				}
+			}
+		} else {
+			for _, c := range cols {
+				if c.expr == "*" {
+					for i, vc := range vt.columns {
+						if !vc.Hidden {
+							if i < len(r.values) && r.values[i] != nil {
+								row.values = append(row.values, vdbe.MakeMem(r.values[i]))
+							} else {
+								row.values = append(row.values, vdbe.NewMemNull())
+							}
+						}
+					}
+				} else {
+					// Find column by name
+					found := false
+					for ci, vc := range vt.columns {
+						if strings.EqualFold(vc.Name, c.expr) && !vc.Hidden {
+							if ci < len(r.values) && r.values[ci] != nil {
+								row.values = append(row.values, vdbe.MakeMem(r.values[ci]))
+							} else {
+								row.values = append(row.values, vdbe.NewMemNull())
+							}
+							found = true
+							break
+						}
+					}
+					if !found {
+						row.values = append(row.values, vdbe.NewMemNull())
+					}
+				}
+			}
+		}
+		resultRows = append(resultRows, row)
+	}
+
+	if resultRows == nil {
+		resultRows = []Row{}
+	}
+
+	return newResultSet(resultRows, resultCols), nil
+}
+
+
 func (db *Database) queryView(v *viewEntry, cols []selectCol, args []interface{}) (*ResultSet, error) {
 	// Re-execute the view's SELECT statement
 	return db.querySingle(v.sql, args)
@@ -7413,6 +7898,8 @@ func classifyStatement(tokens []compile.Token) string {
 				return "create_index"
 			case "trigger":
 				return "create_trigger"
+			case "virtual":
+				return "create_virtual"
 			}
 		}
 		return "create"
