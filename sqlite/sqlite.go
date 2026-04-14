@@ -49,7 +49,8 @@ type Database struct {
 	busyTimeoutMs   int
 
 	// Transaction state
-	inTx bool
+	inTx          bool
+	savepoints    []string // savepoint name stack
 
 	// Foreign key enforcement
 	foreignKeys bool
@@ -432,6 +433,10 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		db.mu.Lock()
 		return err
 	case "rollback":
+		// Check if this is ROLLBACK TO savepoint
+		if len(filtered) >= 4 && isKeyword(filtered[1], "to") {
+			return db.execRollbackTo(filtered)
+		}
 		db.mu.Unlock()
 		err := db.Rollback()
 		db.mu.Lock()
@@ -442,6 +447,14 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return err
 	case "pragma":
 		return db.execPragma(filtered)
+	case "savepoint":
+		return db.execSavepoint(filtered)
+	case "release":
+		return db.execRelease(filtered)
+	case "attach":
+		return db.execAttach(filtered)
+	case "detach":
+		return db.execDetach(filtered)
 	default:
 		return NewErrorf(Error, "unsupported SQL statement: %s", stmtType)
 	}
@@ -7430,6 +7443,14 @@ func classifyStatement(tokens []compile.Token) string {
 		return "rename_table"
 	case "pragma":
 		return "pragma"
+	case "savepoint":
+		return "savepoint"
+	case "release":
+		return "release"
+	case "attach":
+		return "attach"
+	case "detach":
+		return "detach"
 	}
 	return first
 }
