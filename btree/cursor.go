@@ -149,7 +149,15 @@ func (c *CursorImpl) moveToNextLeaf() (bool, error) {
 		c.path[len(c.path)-1].childIdx = nextChildIdx
 		if nextChild > 0 {
 			c.currentPage = nextChild
-			return c.descendToLeftmost()
+			hasRow, err := c.descendToLeftmost()
+			if err != nil {
+				return false, err
+			}
+			if hasRow {
+				return true, nil
+			}
+			// Empty leaf page — continue to next sibling
+			continue
 		}
 		c.path = c.path[:len(c.path)-1]
 	}
@@ -190,7 +198,15 @@ func (c *CursorImpl) moveToPrevLeaf() (bool, error) {
 		c.path[len(c.path)-1].childIdx = prevChildIdx
 		if prevChild > 0 {
 			c.currentPage = prevChild
-			return c.descendToRightmost()
+			hasRow, err := c.descendToRightmost()
+			if err != nil {
+				return false, err
+			}
+			if hasRow {
+				return true, nil
+			}
+			// Empty leaf page — continue to previous sibling
+			continue
 		}
 		c.path = c.path[:len(c.path)-1]
 	}
