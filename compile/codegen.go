@@ -127,6 +127,21 @@ func (b *Builder) SetP2(addr, p2 int) {
 	}
 }
 
+// SetP3 sets the P3 field of the instruction at the given address.
+func (b *Builder) SetP3(addr, p3 int) {
+	if addr >= 0 && addr < len(b.instrs) {
+		b.instrs[addr].P3 = p3
+	}
+}
+
+// LabelAddr returns the address of a label, or -1 if not defined.
+func (b *Builder) LabelAddr(labelID int) int {
+	if info, ok := b.labels[labelID]; ok && info.defined {
+		return info.addr
+	}
+	return -1
+}
+
 // SetP4 sets the P4 field of the instruction at the given address.
 func (b *Builder) SetP4(addr int, p4 interface{}) {
 	if addr >= 0 && addr < len(b.instrs) {
@@ -139,7 +154,7 @@ func (b *Builder) SetP4(addr int, p4 interface{}) {
 func (b *Builder) ResolveLabels() error {
 	for id, info := range b.labels {
 		if !info.defined {
-			return fmt.Errorf("label %d referenced but never defined", id)
+			return fmt.Errorf("label %d referenced but never defined (refs: %v)", id, info.refs)
 		}
 		for _, addr := range info.refs {
 			b.instrs[addr].P2 = info.addr

@@ -885,44 +885,69 @@ func (b *Build) compileInList(expr *Expr, targetReg int) error {
 }
 
 // compileInSelect compiles expr IN (SELECT ...).
+// Compiles the subquery into an ephemeral table, then checks membership.
 func (b *Build) compileInSelect(expr *Expr, targetReg int) error {
+	if expr.InSelect == nil {
+		return fmt.Errorf("nil IN (SELECT ...) subquery")
+	}
+
 	// Open an ephemeral table for the subquery results
 	cursor := b.b.AllocCursor()
 	b.emitOpenEphemeral(cursor, 1)
 
 	// Compile the subquery to populate the ephemeral table
-	// (simplified: in full implementation, would use coroutine)
-	subProg := newBuild(b.schema)
-	if err := subProg.compileSelect(expr.InSelect); err != nil {
+	savedTables := b.tables
+	savedTableMap := b.tableMap
+	b.tables = nil
+	b.tableMap = make(map[string]*tableEntry)
+
+	if err := b.compileSelectInner(expr.InSelect, cursor); err != nil {
+		b.tables = savedTables
+		b.tableMap = savedTableMap
 		return err
 	}
-	// For now, just evaluate the left side and set result to 0
-	// (subquery IN compilation is complex and requires coroutine support)
+
+	b.tables = savedTables
+	b.tableMap = savedTableMap
+
+	// Evaluate the left-hand side
 	lhsReg := b.b.AllocReg(1)
 	if err := b.compileExpr(expr.Left, lhsReg); err != nil {
 		return err
 	}
-	// Use OP_Found to check if lhs is in the ephemeral table
-	foundLabel := b.b.NewLabel()
+
+	// Scan the ephemeral table looking for a match
+	notFoundLabel := b.b.NewLabel()
 	endLabel := b.b.NewLabel()
 
-	b.b.Emit(vdbe.OpRowid, cursor, lhsReg, 0) // ensure cursor context
-	b.b.EmitJump(vdbe.OpNotFound, cursor, endLabel, lhsReg)
+	b.b.EmitJump(vdbe.OpRewind, cursor, notFoundLabel, 0)
 
-	b.b.DefineLabel(foundLabel)
+	loopBody := b.b.NewLabel()
+	b.b.DefineLabel(loopBody)
+
+	valReg := b.b.AllocReg(1)
+	b.emitColumn(cursor, 0, valReg)
+	b.b.EmitJump(vdbe.OpEq, lhsReg, endLabel, valReg)
+
+	b.emitNext(cursor, loopBody)
+
+	// Exhausted all rows without a match
+	b.b.DefineLabel(notFoundLabel)
 	if expr.Not {
-		b.emitInteger(0, targetReg)
-	} else {
 		b.emitInteger(1, targetReg)
+	} else {
+		b.emitInteger(0, targetReg)
 	}
 	b.emitGoto(endLabel)
 
+	// Found a match (jumped from OpEq)
 	b.b.DefineLabel(endLabel)
 	if expr.Not {
-		b.emitInteger(1, targetReg)
-	} else {
 		b.emitInteger(0, targetReg)
+	} else {
+		b.emitInteger(1, targetReg)
 	}
+
 	b.emitClose(cursor)
 	return nil
 }
@@ -1090,14 +1115,18 @@ func (b *Build) compileCast(expr *Expr, targetReg int) error {
 }
 
 // compileSubquery compiles a scalar subquery (SELECT ...).
+// Executes the subquery once into an ephemeral table, then reads the result.
+// The result is reused for all subsequent accesses (OpOnce pattern).
 func (b *Build) compileSubquery(expr *Expr, targetReg int) error {
-	// In a full implementation, this would use a coroutine.
-	// For now, compile the subquery inline.
 	if expr.Select == nil {
 		return fmt.Errorf("nil subquery")
 	}
 
-	// Open an ephemeral table to collect the result
+	// Use OpOnce: first time executes the subquery, subsequent times skip to the result
+	onceAddr := b.b.EmitP4(vdbe.OpOnce, 0, 0, 0, nil, "once: skip to result")
+	endOnceLabel := b.b.NewLabel()
+
+	// Open an ephemeral table for the subquery result
 	cursor := b.b.AllocCursor()
 	nCols := len(expr.Select.Columns)
 	if nCols == 0 {
@@ -1105,33 +1134,45 @@ func (b *Build) compileSubquery(expr *Expr, targetReg int) error {
 	}
 	b.emitOpenEphemeral(cursor, nCols)
 
-	// Save and restore table context
+	// Save and restore table context for the subquery
 	savedTables := b.tables
 	savedTableMap := b.tableMap
 	b.tables = nil
 	b.tableMap = make(map[string]*tableEntry)
 
-	// Compile subquery
 	if err := b.compileSelectInner(expr.Select, cursor); err != nil {
 		b.tables = savedTables
 		b.tableMap = savedTableMap
 		return err
 	}
 
-	// Restore context
 	b.tables = savedTables
 	b.tableMap = savedTableMap
 
-	// Read the first (and only) row from the ephemeral table
+	b.b.DefineLabel(endOnceLabel)
+	b.b.SetP2(onceAddr, b.b.LabelAddr(endOnceLabel))
+
+	// Read the result: rewind the ephemeral table, read column 0
+	// If empty, targetReg stays NULL
+	b.emitNull(targetReg)
 	b.b.Emit(vdbe.OpRewind, cursor, b.b.CurrentAddr()+3, 0)
 	b.emitColumn(cursor, 0, targetReg)
-	b.emitClose(cursor)
+
 	return nil
 }
 
 // compileExists compiles EXISTS (SELECT ...).
+// Executes the subquery into an ephemeral table, then checks if it has any rows.
+// Uses OpOnce for one-time execution.
 func (b *Build) compileExists(expr *Expr, targetReg int) error {
-	// EXISTS is true if the subquery returns at least one row
+	if expr.Select == nil {
+		return fmt.Errorf("nil EXISTS subquery")
+	}
+
+	onceAddr := b.b.EmitP4(vdbe.OpOnce, 0, 0, 0, nil, "once: skip to check")
+	endOnceLabel := b.b.NewLabel()
+
+	// Open an ephemeral table for the subquery result
 	cursor := b.b.AllocCursor()
 	b.emitOpenEphemeral(cursor, 1)
 
@@ -1149,7 +1190,10 @@ func (b *Build) compileExists(expr *Expr, targetReg int) error {
 	b.tables = savedTables
 	b.tableMap = savedTableMap
 
-	// Check if there's at least one row
+	b.b.DefineLabel(endOnceLabel)
+	b.b.SetP2(onceAddr, b.b.LabelAddr(endOnceLabel))
+
+	// Check if the ephemeral table has any rows
 	falseLabel := b.b.NewLabel()
 	endLabel := b.b.NewLabel()
 
@@ -1159,11 +1203,10 @@ func (b *Build) compileExists(expr *Expr, targetReg int) error {
 
 	b.b.DefineLabel(falseLabel)
 	b.emitInteger(0, targetReg)
+
 	b.b.DefineLabel(endLabel)
-	b.emitClose(cursor)
 	return nil
 }
-
 // compileCondition compiles a boolean expression with jump targets.
 // This is used for WHERE/HAVING conditions where we want to jump
 // directly on comparison results rather than storing 0/1.
@@ -1233,8 +1276,10 @@ func (b *Build) compileCondition(expr *Expr, trueLabel, falseLabel int, jumpIfTr
 	}
 	if jumpIfTrue {
 		b.b.EmitJump(vdbe.OpIf, reg, trueLabel, 0)
+		b.emitGoto(falseLabel)
 	} else {
 		b.b.EmitJump(vdbe.OpIfNot, reg, trueLabel, 0)
+		b.emitGoto(falseLabel)
 	}
 	return nil
 }
@@ -1254,6 +1299,7 @@ func (b *Build) compileConditionComparison(expr *Expr, cmpOp vdbe.Opcode, trueLa
 
 	if jumpIfTrue {
 		b.b.EmitJump(cmpOp, leftReg, trueLabel, rightReg)
+		b.emitGoto(falseLabel)
 	} else {
 		// Jump to true label when condition IS true, meaning we skip the
 		// false path. Use the inverse comparison for NOT cases.
@@ -1261,6 +1307,7 @@ func (b *Build) compileConditionComparison(expr *Expr, cmpOp vdbe.Opcode, trueLa
 		if invOp != vdbe.OpGoto {
 			b.b.EmitJump(invOp, leftReg, trueLabel, rightReg)
 		}
+		b.emitGoto(falseLabel)
 	}
 	return nil
 }

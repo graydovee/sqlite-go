@@ -507,9 +507,11 @@ func (b *Build) emitGroupOutput(stmt *SelectStmt, resultCols []*resultColumn, nR
 	// Check HAVING
 	if stmt.Having != nil {
 		havingSkip := b.b.NewLabel()
-		if err := b.compileCondition(stmt.Having, havingSkip, havingSkip, true); err != nil {
+		havingReg := b.b.AllocReg(1)
+		if err := b.compileExpr(stmt.Having, havingReg); err != nil {
 			_ = err
 		}
+		b.b.EmitJump(vdbe.OpIfNot, havingReg, havingSkip, 0)
 		if needOutSorter {
 			recReg := b.b.AllocReg(1)
 			b.emitMakeRecord(aggBase, nResult, recReg)
@@ -816,6 +818,12 @@ func (b *Build) compileSelectInner(stmt *SelectStmt, destCursor int) error {
 		return err
 	}
 	nResult := len(resultCols)
+
+	// Check if this SELECT has aggregate functions
+	if b.hasAggregates(stmt) {
+		return b.compileInnerAggregateSelect(stmt, destCursor, resultCols, nResult)
+	}
+
 	resultBase := b.b.AllocReg(nResult)
 
 	emptyLabel := b.b.NewLabel()
@@ -849,9 +857,82 @@ func (b *Build) compileSelectInner(stmt *SelectStmt, destCursor int) error {
 	b.emitMakeRecord(resultBase, nResult, recReg)
 	b.emitSorterInsert(destCursor, recReg)
 
-	b.emitNext(b.tables[0].cursor, loopBody)
+	if len(b.tables) > 0 {
+		b.emitNext(b.tables[0].cursor, loopBody)
+	}
 	b.b.DefineLabel(loopEndLabel)
 	b.b.DefineLabel(emptyLabel)
+
+	// Close cursors
+	for _, entry := range b.tables {
+		b.emitClose(entry.cursor)
+	}
+	b.tables = nil
+	b.tableMap = make(map[string]*tableEntry)
+
+	return nil
+}
+
+// compileInnerAggregateSelect compiles an aggregate SELECT for use inside a subquery.
+// It scans all rows, accumulates aggregates, finalizes, and inserts one row into destCursor.
+func (b *Build) compileInnerAggregateSelect(stmt *SelectStmt, destCursor int, resultCols []*resultColumn, nResult int) error {
+	aggBase := b.b.AllocReg(nResult)
+
+	// Initialize accumulators to NULL
+	for i := 0; i < nResult; i++ {
+		b.emitNull(aggBase + i)
+	}
+
+	emptyLabel := b.b.NewLabel()
+	loopEndLabel := b.b.NewLabel()
+
+	if len(b.tables) > 0 {
+		b.b.EmitJump(vdbe.OpRewind, b.tables[0].cursor, emptyLabel, 0)
+	}
+
+	loopBody := b.b.NewLabel()
+	b.b.DefineLabel(loopBody)
+
+	// Evaluate WHERE
+	if stmt.Where != nil {
+		skipLabel := b.b.NewLabel()
+		if err := b.compileCondition(stmt.Where, skipLabel, loopEndLabel, true); err != nil {
+			return err
+		}
+		b.b.DefineLabel(skipLabel)
+	}
+
+	// Accumulate aggregates for each result column
+	for i, rc := range resultCols {
+		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				return err
+			}
+		}
+	}
+
+	if len(b.tables) > 0 {
+		b.emitNext(b.tables[0].cursor, loopBody)
+	}
+	b.b.DefineLabel(loopEndLabel)
+	b.b.DefineLabel(emptyLabel)
+
+	// Finalize aggregates and output single row
+	for i, rc := range resultCols {
+		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+			b.emitAggFinalForCol(rc.Expr, aggBase+i)
+		} else if rc.Expr != nil {
+			// Non-aggregate column without GROUP BY: evaluate once
+			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Insert into destination ephemeral table
+	recReg := b.b.AllocReg(1)
+	b.emitMakeRecord(aggBase, nResult, recReg)
+	b.emitSorterInsert(destCursor, recReg)
 
 	// Close cursors
 	for _, entry := range b.tables {
