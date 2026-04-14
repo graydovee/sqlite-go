@@ -500,3 +500,16 @@ func compareKeys(a, b []byte) int {
 	}
 	return 0
 }
+
+// RestoreAfterDelete fixes cursor state after a delete operation.
+// After deleting the current cell, cells shift down so the next cell
+// is now at the current index. We restore validity and decrement
+// cellIndex so that Next() will re-read the correct cell.
+func (c *CursorImpl) RestoreAfterDelete() {
+	c.valid = true
+	if c.cellIndex > 0 {
+		c.cellIndex--
+	} else {
+		c.cellIndex = -1
+	}
+}

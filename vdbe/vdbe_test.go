@@ -107,6 +107,7 @@ func (m *mockDB) AutoCommit() bool          { return m.autoCommit }
 func (m *mockDB) SetAutoCommit(on bool)     { m.autoCommit = on }
 func (m *mockDB) Changes() int64            { return m.changes }
 func (m *mockDB) TotalChanges() int64       { return m.totalChanges }
+func (m *mockDB) AddChanges(n int64)        { m.changes += n; m.totalChanges += n }
 func (m *mockDB) LastInsertRowID() int64    { return m.lastInsertID }
 func (m *mockDB) SetLastInsertRowID(id int64) { m.lastInsertID = id }
 
@@ -119,7 +120,8 @@ func (m *mockDB) Delete(cursor interface{}) error {
 }
 
 // Mock cursor implementing btree.BTCursor interface
-func (c *mockCursor) Close() error       { c.closed = true; c.valid = false; return nil }
+func (c *mockCursor) Close() error              { c.closed = true; c.valid = false; return nil }
+func (c *mockCursor) RestoreAfterDelete()        {}
 func (c *mockCursor) First() (bool, error) {
 	if len(c.rows) == 0 {
 		c.valid = false

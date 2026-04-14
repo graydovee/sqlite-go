@@ -398,9 +398,9 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
-		return db.execDelete(filtered, args)
+		return db.executeDML(sql, args)
 	case "update":
-		return db.execUpdate(filtered, args)
+		return db.executeDML(sql, args)
 	case "begin":
 		db.mu.Unlock()
 		err := db.Begin()
@@ -2501,6 +2501,11 @@ func (v vdbeDB) TotalChanges() int64    { return v.db.totalChanges }
 func (v vdbeDB) LastInsertRowID() int64 { return v.db.lastInsertRowID }
 func (v vdbeDB) SetLastInsertRowID(id int64) { v.db.lastInsertRowID = id }
 
+func (v vdbeDB) AddChanges(n int64) {
+	v.db.changes += n
+	v.db.totalChanges += n
+}
+
 // Insert adapts btree insert for vdbe.Inserter interface.
 func (v vdbeDB) Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error {
 	cur, ok := cursor.(btree.BTCursor)
@@ -2517,6 +2522,79 @@ func (v vdbeDB) Delete(cursor interface{}) error {
 		return fmt.Errorf("invalid cursor type for delete")
 	}
 	return v.db.bt.Delete(cur)
+}
+
+// fkTableByRootPage finds a table entry by its root page number.
+func (v vdbeDB) fkTableByRootPage(rootPage int) *tableEntry {
+	for _, tbl := range v.db.tables {
+		if tbl.rootPage == rootPage {
+			return tbl
+		}
+	}
+	return nil
+}
+
+// fkDecodeRecord decodes a serialized record into a column name -> value map.
+func (v vdbeDB) fkDecodeRecord(tbl *tableEntry, data []byte) map[string]interface{} {
+	values, err := vdbe.ParseRecord(data)
+	if err != nil {
+		return nil
+	}
+	valMap := make(map[string]interface{})
+	for i, col := range tbl.columns {
+		if i < len(values) {
+			valMap[col.name] = fkValueToInterface(values[i])
+		}
+	}
+	return valMap
+}
+
+// CheckFKInsert implements vdbe.FKChecker.
+func (v vdbeDB) CheckFKInsert(rootPage int, data []byte) error {
+	tbl := v.fkTableByRootPage(rootPage)
+	if tbl == nil {
+		return nil
+	}
+	valMap := v.fkDecodeRecord(tbl, data)
+	if valMap == nil {
+		return nil
+	}
+	return v.db.fkCheckInsert(tbl, valMap)
+}
+
+// CheckFKDelete implements vdbe.FKChecker.
+func (v vdbeDB) CheckFKDelete(rootPage int, data []byte) error {
+	tbl := v.fkTableByRootPage(rootPage)
+	if tbl == nil {
+		return nil
+	}
+	valMap := v.fkDecodeRecord(tbl, data)
+	if valMap == nil {
+		return nil
+	}
+	return v.db.fkCheckDelete(tbl.name, valMap)
+}
+
+// CheckFKUpdate implements vdbe.FKChecker.
+func (v vdbeDB) CheckFKUpdate(rootPage int, oldData, newData []byte) error {
+	tbl := v.fkTableByRootPage(rootPage)
+	if tbl == nil {
+		return nil
+	}
+	oldVals := v.fkDecodeRecord(tbl, oldData)
+	newVals := v.fkDecodeRecord(tbl, newData)
+	if oldVals == nil || newVals == nil {
+		return nil
+	}
+	// Check parent-side FK constraints (if referenced columns changed)
+	if err := v.db.fkCheckUpdate(tbl.name, oldVals, newVals); err != nil {
+		return err
+	}
+	// Check child-side FK constraints (new FK column values must reference valid parent rows)
+	if err := v.db.fkCheckInsert(tbl, newVals); err != nil {
+		return err
+	}
+	return nil
 }
 
 // CreateBTree implements vdbe.BTreeCreator.
@@ -2562,6 +2640,70 @@ func (db *Database) buildCompileSchema() *compile.Schema {
 	return schema
 }
 
+
+// executeDML runs a DML statement (UPDATE/DELETE) through the compile pipeline and VDBE.
+func (db *Database) executeDML(sql string, args []interface{}) error {
+	stmts, err := compile.Parse(sql)
+	if err != nil {
+		return NewErrorf(Error, "parse: %s", err)
+	}
+	if len(stmts) == 0 {
+		return NewError(Error, "empty SQL statement")
+	}
+
+	db.changes = 0
+	schema := db.buildCompileSchema()
+
+	for _, stmt := range stmts {
+		prog, err := compile.Compile(stmt, schema)
+		if err != nil {
+			return NewErrorf(Error, "compile: %s", err)
+		}
+
+		vprog := &vdbe.Program{
+			Instructions: prog.Instructions,
+			NumRegs:      prog.NumRegs,
+			NumCursors:   prog.NumCursors,
+			SQL:          sql,
+		}
+
+		vm := vdbe.NewVDBE(vdbeDB{db: db})
+		vm.SetProgram(vprog)
+
+		// Bind parameters
+		if len(args) > 0 {
+			vmRegs := vm.Registers()
+			for i, arg := range args {
+				if i+1 < len(vmRegs) {
+					vmRegs[i+1] = *vdbe.MakeMem(arg)
+				}
+			}
+		}
+
+		ctx := context.Background()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic during VDBE execution: %v", r)
+				}
+			}()
+			for {
+				hasRow, stepErr := vm.Step(ctx)
+				if stepErr != nil {
+					err = stepErr
+					return
+				}
+				if !hasRow {
+					return
+				}
+			}
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 // executeQuery runs a SQL query through the compile pipeline and VDBE.
 func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, error) {
 	// Parse

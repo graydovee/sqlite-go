@@ -47,6 +47,7 @@ type BTCursor interface {
 	RowID() RowID
 	IsValid() bool
 	SetRowID(rowid RowID) error
+	RestoreAfterDelete()
 }
 
 // BTree represents a B-Tree structure (table or index).

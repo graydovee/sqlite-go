@@ -69,6 +69,8 @@ type Database interface {
 	Changes() int64
 	// TotalChanges returns the total number of rows changed.
 	TotalChanges() int64
+	// AddChanges increments the change counters by n.
+	AddChanges(n int64)
 	// LastInsertRowID returns the last inserted rowid.
 	LastInsertRowID() int64
 	// SetLastInsertRowID sets the last inserted rowid.
@@ -77,6 +79,21 @@ type Database interface {
 	Insert(cursor interface{}, key []byte, data []byte, rowid int64, seekResult int) error
 	// Delete deletes the row at the cursor position.
 	Delete(cursor interface{}) error
+}
+
+// FKChecker is an optional interface that Database implementations can
+// satisfy to provide foreign key constraint checking during DML operations.
+type FKChecker interface {
+	// CheckFKInsert checks FK constraints for a row being inserted.
+	// rootPage identifies the table, data is the serialized record.
+	CheckFKInsert(rootPage int, data []byte) error
+	// CheckFKDelete checks FK constraints for a row being deleted.
+	// rootPage identifies the table, data is the serialized record.
+	CheckFKDelete(rootPage int, data []byte) error
+	// CheckFKUpdate checks FK constraints for a row being updated.
+	// rootPage identifies the table. oldData/newData are serialized records.
+	// Also checks that new FK column values reference valid parent rows.
+	CheckFKUpdate(rootPage int, oldData, newData []byte) error
 }
 
 // Seeker is the interface for cursor seek operations.
@@ -556,6 +573,10 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 
 		case OpDelete:
 			v.execDelete(pOp)
+			if v.err != nil {
+				return false, v.err
+			}
+			v.db.AddChanges(1)
 
 		case OpResultRow:
 			if v.resultRowFunc != nil {
@@ -1563,11 +1584,37 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			}
 			keyBuf := make([]byte, 9)
 			keyLen := putVarint(keyBuf, rowid)
+
+			// Save old data for FK checking before update
+			var oldData []byte
+			fkChecker, hasFK := v.db.(FKChecker)
+			if hasFK && cursor != nil {
+				if btCur, ok := cursor.(btree.BTCursor); ok {
+					if d, err := btCur.Data(); err == nil {
+						oldData = make([]byte, len(d))
+						copy(oldData, d)
+					}
+				}
+			}
+
 			if cursor != nil {
-				if err := v.db.Insert(cursor, keyBuf[:keyLen], data, rowid, 0); err != nil {
+				if err := v.db.Insert(cursor, keyBuf[:keyLen], data, rowid, 1); err != nil {
 					v.err = err
 					v.rc = ResultError
 				}
+			}
+			// FK constraint check after write (so self-referencing works)
+			if v.err == nil && hasFK && oldData != nil && data != nil {
+				if err := fkChecker.CheckFKUpdate(vc.RootPage, oldData, data); err != nil {
+					// Rollback: restore old data
+					v.db.Insert(cursor, keyBuf[:keyLen], oldData, rowid, 1)
+					v.err = err
+					v.rc = ResultError
+					return false, err
+				}
+			}
+			if v.err == nil {
+				v.db.AddChanges(1)
 			}
 
 		// ─── Part 2: New opcodes from C version ─────────────────────
@@ -2119,9 +2166,43 @@ func (v *VDBE) execDelete(pOp *Instruction) {
 	cursor := vc.Cursor
 
 	if cursor != nil {
+		// Save row data for FK checking before delete
+		var savedData []byte
+		var savedKey []byte
+		var savedRowid int64
+		fkChecker, hasFK := v.db.(FKChecker)
+		if hasFK {
+			if btCur, ok := cursor.(btree.BTCursor); ok {
+				if data, err := btCur.Data(); err == nil {
+					savedData = make([]byte, len(data))
+					copy(savedData, data)
+				}
+				savedRowid = int64(btCur.RowID())
+				keyBuf := make([]byte, 9)
+				keyLen := putVarint(keyBuf, savedRowid)
+				savedKey = keyBuf[:keyLen]
+			}
+		}
+
 		if err := v.db.Delete(cursor); err != nil {
 			v.err = err
 			v.rc = ResultError
+		} else {
+			// FK constraint check after delete (so self-referencing works)
+			if hasFK && savedData != nil {
+				if err := fkChecker.CheckFKDelete(vc.RootPage, savedData); err != nil {
+					// Rollback: re-insert the deleted row
+					v.db.Insert(cursor, savedKey, savedData, savedRowid, 1)
+					v.err = err
+					v.rc = ResultError
+					v.halt = true
+					return
+				}
+			}
+			// After delete, cells shift down. Restore cursor so Next() works.
+			if btCur, ok := cursor.(btree.BTCursor); ok {
+				btCur.RestoreAfterDelete()
+			}
 		}
 	}
 }

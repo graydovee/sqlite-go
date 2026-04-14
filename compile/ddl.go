@@ -1042,7 +1042,7 @@ func (b *Build) compileAlterAddColumn(stmt *AlterTableStmt) error {
 
 	recReg := b.b.AllocReg(1)
 	b.emitMakeRecord(newRecReg, 5, recReg)
-	b.emitUpdate(schemaCursor, recReg)
+	b.emitUpdate(schemaCursor, rowidReg, recReg)
 
 	b.b.DefineLabel(skipLabel)
 	b.b.DefineLabel(skipLabel2)
@@ -1099,7 +1099,7 @@ func (b *Build) compileAlterRenameTable(stmt *AlterTableStmt) error {
 
 	recReg := b.b.AllocReg(1)
 	b.emitMakeRecord(newRecReg, 5, recReg)
-	b.emitUpdate(schemaCursor, recReg)
+	b.emitUpdate(schemaCursor, rowidReg, recReg)
 
 	b.b.DefineLabel(skipLabel)
 	b.emitNext(schemaCursor, loopBody)
@@ -1188,7 +1188,7 @@ func (b *Build) compileAlterRenameColumn(stmt *AlterTableStmt) error {
 
 	recReg := b.b.AllocReg(1)
 	b.emitMakeRecord(newRecReg, 5, recReg)
-	b.emitUpdate(schemaCursor, recReg)
+	b.emitUpdate(schemaCursor, rowidReg, recReg)
 
 	b.b.DefineLabel(skipLabel)
 
@@ -1262,7 +1262,7 @@ func (b *Build) compileAlterDropColumn(stmt *AlterTableStmt) error {
 
 	recReg := b.b.AllocReg(1)
 	b.emitMakeRecord(newRecReg, 5, recReg)
-	b.emitUpdate(schemaCursor, recReg)
+	b.emitUpdate(schemaCursor, rowidReg, recReg)
 
 	b.b.DefineLabel(skipLabel)
 

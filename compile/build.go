@@ -495,8 +495,9 @@ func (b *Build) emitDelete(cursor int) {
 }
 
 // emitUpdate emits OP_Update to update the current row.
-func (b *Build) emitUpdate(cursor, recordReg int) {
-	b.b.Emit(vdbe.OpUpdate, cursor, recordReg, 0)
+// P1=cursor, P2=rowid register, P3=record register (matches OpInsert convention).
+func (b *Build) emitUpdate(cursor, rowidReg, recordReg int) {
+	b.b.Emit(vdbe.OpUpdate, cursor, rowidReg, recordReg)
 }
 
 // emitColumn reads a column from the current row.

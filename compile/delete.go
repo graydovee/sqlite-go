@@ -64,13 +64,15 @@ func (b *Build) compileDelete(stmt *DeleteStmt) error {
 		b.emitColumn(cursor, i, valueBase+i)
 	}
 
+	var skipDelete int
 	if stmt.Where != nil {
 		// Evaluate WHERE condition
-		skipDelete := b.b.NewLabel()
-		if err := b.compileCondition(stmt.Where, skipDelete, loopEndLabel, true); err != nil {
+		skipDelete = b.b.NewLabel()
+		doDelete := b.b.NewLabel()
+		if err := b.compileCondition(stmt.Where, doDelete, skipDelete, true); err != nil {
 			return err
 		}
-		b.b.DefineLabel(skipDelete)
+		b.b.DefineLabel(doDelete)
 	}
 
 	// Emit RETURNING before deleting (so we can still read the row)
@@ -88,6 +90,10 @@ func (b *Build) compileDelete(stmt *DeleteStmt) error {
 
 	// Delete from the main table
 	b.emitDelete(cursor)
+
+	if stmt.Where != nil {
+		b.b.DefineLabel(skipDelete)
+	}
 
 	// Handle ORDER BY + LIMIT for DELETE (SQLite extension)
 	// For ORDER BY + LIMIT, we need a counter

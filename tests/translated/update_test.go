@@ -42,17 +42,41 @@ func TestUpdate(t *testing.T) {
 
 	// update-3.2: Unknown column in SET expression
 	t.Run("update-3.2", func(t *testing.T) {
-		t.Skip("unknown column validation in UPDATE not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE test1(f1 int,f2 int)")
+		err := catchSQLErr(t, db, "UPDATE test1 SET f2=no_such_col+1")
+		if err == nil {
+			t.Fatal("expected error for unknown column in expression, got success")
+		}
+		if !strings.Contains(err.Error(), "no such column") {
+			t.Fatalf("expected 'no such column' error, got %q", err.Error())
+		}
 	})
 
 	// update-3.3: Qualified unknown column
 	t.Run("update-3.3", func(t *testing.T) {
-		t.Skip("unknown column validation in UPDATE not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE test1(f1 int,f2 int)")
+		err := catchSQLErr(t, db, "UPDATE test1 SET f2=test1.no_such_col+1")
+		if err == nil {
+			t.Fatal("expected error for qualified unknown column, got success")
+		}
+		if !strings.Contains(err.Error(), "no such column") {
+			t.Fatalf("expected 'no such column' error, got %q", err.Error())
+		}
 	})
 
 	// update-3.4: Unknown column in SET target
 	t.Run("update-3.4", func(t *testing.T) {
-		t.Skip("unknown column validation in UPDATE not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE test1(f1 int,f2 int)")
+		err := catchSQLErr(t, db, "UPDATE test1 SET no_such_col=5")
+		if err == nil {
+			t.Fatal("expected error for unknown column in SET target, got success")
+		}
+		if !strings.Contains(err.Error(), "no such column") {
+			t.Fatalf("expected 'no such column' error, got %q", err.Error())
+		}
 	})
 
 	// update-3.5: UPDATE all rows SET f2=f2*3
@@ -86,62 +110,146 @@ func TestUpdate(t *testing.T) {
 
 	// update-3.7: UPDATE test1 SET f2=f2/3 WHERE f1<=5
 	t.Run("update-3.7", func(t *testing.T) {
-		t.Skip("WHERE clause in UPDATE not fully implemented")
+		db := openTestDB(t)
+		setupTest1Table(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f2*3")
+		mustExec(t, db, "UPDATE test1 SET f2=f2/3 WHERE f1<=5")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		want := []int64{1, 2, 2, 4, 3, 8, 4, 16, 5, 32, 6, 192, 7, 384, 8, 768, 9, 1536, 10, 3072}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-3.9: UPDATE test1 SET f2=f2/3 WHERE f1>5
 	t.Run("update-3.9", func(t *testing.T) {
-		t.Skip("WHERE clause in UPDATE not fully implemented")
+		db := openTestDB(t)
+		setupTest1Table(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f2*3")
+		// First restore f1<=5 rows
+		mustExec(t, db, "UPDATE test1 SET f2=f2/3 WHERE f1<=5")
+		// Now restore f1>5 rows
+		mustExec(t, db, "UPDATE test1 SET f2=f2/3 WHERE f1>5")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		want := []int64{1, 2, 2, 4, 3, 8, 4, 16, 5, 32, 6, 64, 7, 128, 8, 256, 9, 512, 10, 1024}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-3.11: Swap columns F2=f1, F1=f2
 	t.Run("update-3.11", func(t *testing.T) {
-		t.Skip("simultaneous column swap in UPDATE not yet supported")
+		db := openTestDB(t)
+		setupTest1Table(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f1, f1=f2")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		// After swap: f1=2,4,8,...,1024 and f2=1,2,3,...,10 (sorted by f1)
+		want := []int64{2, 1, 4, 2, 8, 3, 16, 4, 32, 5, 64, 6, 128, 7, 256, 8, 512, 9, 1024, 10}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-3.13: Swap back F2=f1, F1=f2
 	t.Run("update-3.13", func(t *testing.T) {
-		t.Skip("simultaneous column swap in UPDATE not yet supported")
+		db := openTestDB(t)
+		setupTest1Table(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f1, f1=f2")
+		mustExec(t, db, "UPDATE test1 SET f2=f1, f1=f2")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		// After double swap, should be back to original
+		want := []int64{1, 2, 2, 4, 3, 8, 4, 16, 5, 32, 6, 64, 7, 128, 8, 256, 9, 512, 10, 1024}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-4.0: Delete rows <=5, add duplicates
 	t.Run("update-4.0", func(t *testing.T) {
-		t.Skip("DELETE with WHERE not fully implemented, needed for test setup")
+		db := openTestDB(t)
+		setupTest1Table(t, db)
+		mustExec(t, db, "DELETE FROM test1 WHERE f1<=5")
+		mustExec(t, db, "INSERT INTO test1(f1,f2) VALUES(8,88)")
+		mustExec(t, db, "INSERT INTO test1(f1,f2) VALUES(8,888)")
+		mustExec(t, db, "INSERT INTO test1(f1,f2) VALUES(77,128)")
+		mustExec(t, db, "INSERT INTO test1(f1,f2) VALUES(777,128)")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		want := []int64{6, 64, 7, 128, 8, 256, 8, 88, 8, 888, 9, 512, 10, 1024, 77, 128, 777, 128}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-4.1: UPDATE test1 SET f2=f2+1 WHERE f1==8
 	t.Run("update-4.1", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f2+1 WHERE f1==8")
+		if got := db.Changes(); got != 3 {
+			t.Fatalf("db.Changes() = %d, want 3", got)
+		}
 	})
 
 	// update-4.2: UPDATE test1 SET f2=f2-1 WHERE f1==8 and f2>800
 	t.Run("update-4.2", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f2-1 WHERE f1==8 and f2>800")
+		if got := db.Changes(); got != 1 {
+			t.Fatalf("db.Changes() = %d, want 1", got)
+		}
 	})
 
 	// update-4.3: UPDATE test1 SET f2=f2-1 WHERE f1==8 and f2<800
 	t.Run("update-4.3", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f2=f2-1 WHERE f1==8 and f2<800")
+		if got := db.Changes(); got != 2 {
+			t.Fatalf("db.Changes() = %d, want 2", got)
+		}
 	})
 
 	// update-4.4: UPDATE test1 SET f1=f1+1 WHERE f2==128
 	t.Run("update-4.4", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f1=f1+1 WHERE f2==128")
+		if got := db.Changes(); got != 3 {
+			t.Fatalf("db.Changes() = %d, want 3", got)
+		}
 	})
 
 	// update-4.5: UPDATE test1 SET f1=f1-1 WHERE f1>100 and f2==128
 	t.Run("update-4.5", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f1=f1-1 WHERE f1>100 and f2==128")
+		if got := db.Changes(); got != 1 {
+			t.Fatalf("db.Changes() = %d, want 1", got)
+		}
 	})
 
 	// update-4.6: UPDATE test1 SET f1=f1-1 WHERE f1<=100 and f2==128; verify changes=2
 	t.Run("update-4.6", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f1=f1-1 WHERE f1<=100 and f2==128")
+		if got := db.Changes(); got != 2 {
+			t.Fatalf("db.Changes() = %d, want 2", got)
+		}
 	})
 
 	// update-4.7: Verify final state after update-4.6
 	t.Run("update-4.7", func(t *testing.T) {
-		t.Skip("depends on DELETE with WHERE for test setup")
+		db := openTestDB(t)
+		setupUpdate4State(t, db)
+		mustExec(t, db, "UPDATE test1 SET f1=f1-1 WHERE f1<=100 and f2==128")
+		got := queryFlatInts(t, db, "SELECT * FROM test1 ORDER BY f1")
+		want := []int64{6, 64, 6, 128, 8, 256, 8, 88, 8, 888, 9, 512, 10, 1024, 76, 128, 777, 128}
+		if !sliceEqual(got, want) {
+			t.Fatalf("got %v, want %v", got, want)
+		}
 	})
 
 	// update-5.x through 7.x: Tests with indexes - SKIP
@@ -157,22 +265,38 @@ func TestUpdate(t *testing.T) {
 
 	// update-9.1: Unknown column x in SET target
 	t.Run("update-9.1", func(t *testing.T) {
-		t.Skip("unknown column/function validation in UPDATE not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE test1(f1 int,f2 int)")
+		err := catchSQLErr(t, db, "UPDATE test1 SET x=5")
+		if err == nil {
+			t.Fatal("expected error for unknown column in SET target")
+		}
+		if !strings.Contains(err.Error(), "no such column") {
+			t.Fatalf("expected 'no such column' error, got %q", err.Error())
+		}
 	})
 
 	// update-9.2: Unknown function x in SET expression
 	t.Run("update-9.2", func(t *testing.T) {
-		t.Skip("unknown column/function validation in UPDATE not yet supported")
+		t.Skip("unknown function validation not yet implemented")
 	})
 
 	// update-9.3: Unknown column x in WHERE
 	t.Run("update-9.3", func(t *testing.T) {
-		t.Skip("unknown column/function validation in UPDATE not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE test1(f1 int,f2 int)")
+		err := catchSQLErr(t, db, "UPDATE test1 SET f1=5 WHERE x=3")
+		if err == nil {
+			t.Fatal("expected error for unknown column in WHERE")
+		}
+		if !strings.Contains(err.Error(), "no such column") {
+			t.Fatalf("expected 'no such column' error, got %q", err.Error())
+		}
 	})
 
 	// update-9.4: Unknown function x in WHERE
 	t.Run("update-9.4", func(t *testing.T) {
-		t.Skip("unknown column/function validation in UPDATE not yet supported")
+		t.Skip("unknown function validation not yet implemented")
 	})
 
 	// update-10.x: UNIQUE constraint tests

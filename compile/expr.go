@@ -1246,13 +1246,17 @@ func (b *Build) compileCondition(expr *Expr, trueLabel, falseLabel int, jumpIfTr
 		switch op {
 		case "AND":
 			if jumpIfTrue {
-				// AND: both must be true. Check left first.
-				andFalse := b.b.NewLabel()
-				if err := b.compileCondition(expr.Left, andFalse, falseLabel, false); err != nil {
+				// AND: both must be true. If left is FALSE, short-circuit to falseLabel.
+				// If left is TRUE, fall through to check right.
+				// With jumpIfTrue=false on inner call: condition FALSE jumps to trueLabel,
+				// condition TRUE goes to falseLabel. So we pass:
+				//   trueLabel=falseLabel (short-circuit target for FALSE)
+				//   falseLabel=andContinue (continue target for TRUE)
+				andContinue := b.b.NewLabel()
+				if err := b.compileCondition(expr.Left, falseLabel, andContinue, false); err != nil {
 					return err
 				}
-				b.b.DefineLabel(andFalse)
-				// Left was true (didn't jump to false), now check right
+				b.b.DefineLabel(andContinue)
 				return b.compileCondition(expr.Right, trueLabel, falseLabel, true)
 			}
 			// AND jump-to-false: if either is false, jump
@@ -1263,12 +1267,17 @@ func (b *Build) compileCondition(expr *Expr, trueLabel, falseLabel int, jumpIfTr
 
 		case "OR":
 			if jumpIfTrue {
-				// OR jump-to-true: if either is true, jump
-				orTrue := b.b.NewLabel()
-				if err := b.compileCondition(expr.Left, orTrue, falseLabel, true); err != nil {
+				// OR jump-to-true: if left is TRUE, short-circuit to trueLabel.
+				// If left is FALSE, fall through to check right.
+				// With jumpIfTrue=true: condition TRUE jumps to trueLabel,
+				// condition FALSE goes to falseLabel. So we pass:
+				//   trueLabel=trueLabel (short-circuit to TRUE target)
+				//   falseLabel=orContinue (continue target for FALSE)
+				orContinue := b.b.NewLabel()
+				if err := b.compileCondition(expr.Left, trueLabel, orContinue, true); err != nil {
 					return err
 				}
-				b.b.DefineLabel(orTrue)
+				b.b.DefineLabel(orContinue)
 				return b.compileCondition(expr.Right, trueLabel, falseLabel, true)
 			}
 			// OR jump-to-false: both must be false
