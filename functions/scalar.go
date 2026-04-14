@@ -100,6 +100,7 @@ func typeofFunc(_ *Context, args []*vdbe.Mem) *vdbe.Mem {
 	default:
 		typ = "null"
 	}
+	fmt.Printf("typeofFunc: m.Type=%d -> typ=%q\n", m.Type, typ)
 	return vdbe.NewMemStr(typ)
 }
 

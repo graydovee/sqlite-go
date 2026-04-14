@@ -195,7 +195,7 @@ func TestExpr1NullLogic(t *testing.T) {
 
 // TestExpr1Between tests the BETWEEN operator.
 func TestExpr1Between(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(i1 int, i2 int, r1 real, r2 real, t1 text, t2 text)")
 	mustExec(t, db, "INSERT INTO test1 VALUES(1,2,1.1,2.2,'hello','world')")
@@ -213,7 +213,7 @@ func TestExpr1Between(t *testing.T) {
 
 // TestExpr1IS tests IS / IS NOT operator.
 func TestExpr1IS(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(i1 int, i2 int, r1 real, r2 real, t1 text, t2 text)")
 	mustExec(t, db, "INSERT INTO test1 VALUES(1,2,1.1,2.2,'hello','world')")
@@ -230,7 +230,7 @@ func TestExpr1IS(t *testing.T) {
 
 // TestExpr1StringComparison tests string comparison operators.
 func TestExpr1StringComparison(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(i1 int, i2 int, r1 real, r2 real, t1 text, t2 text)")
 	mustExec(t, db, "INSERT INTO test1 VALUES(1,2,1.1,2.2,'hello','world')")
@@ -351,7 +351,7 @@ func TestExpr1LIKE(t *testing.T) {
 
 // TestExpr1GLOB tests GLOB operator with table columns.
 func TestExpr1GLOB(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(i1 int, i2 int, r1 real, r2 real, t1 text, t2 text)")
 	mustExec(t, db, "INSERT INTO test1 VALUES(1,2,1.1,2.2,'hello','world')")
@@ -409,7 +409,7 @@ func TestExprCase(t *testing.T) {
 
 // TestExpr7Where tests WHERE clause expressions.
 func TestExpr7Where(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(a int, b int)")
 	for i := 1; i <= 20; i++ {
@@ -465,7 +465,7 @@ func TestExpr7Where(t *testing.T) {
 
 // TestExpr7LikeGlobWhere tests LIKE/GLOB in WHERE clauses.
 func TestExpr7LikeGlobWhere(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "CREATE TABLE test1(a int, b int)")
 	for i := 1; i <= 20; i++ {
@@ -498,7 +498,7 @@ func TestExpr7LikeGlobWhere(t *testing.T) {
 
 // TestExpr10EscapeError tests LIKE ESCAPE errors.
 func TestExpr10EscapeError(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	ok, _ := catchSQL(t, db, "SELECT 'abc' LIKE 'abc' ESCAPE ''")
 	if !ok {
@@ -529,7 +529,7 @@ func TestExpr11Typeof(t *testing.T) {
 
 // TestExpr14Boolean tests boolean expression evaluation.
 func TestExpr14Boolean(t *testing.T) {
-	t.Skip("expression evaluation incomplete")
+	// t.Skip("expression evaluation incomplete")
 	db := openTestDB(t)
 	mustExec(t, db, "DROP TABLE IF EXISTS t1")
 	mustExec(t, db, "CREATE TABLE t1(x)")

@@ -2465,6 +2465,16 @@ func (p *Parser) parsePrimaryExpr() *Expr {
 		return &Expr{Kind: ExprLiteral, LiteralType: "null", StringValue: "NULL"}
 	}
 
+	// TRUE / FALSE boolean literals
+	if p.isKw(KwTrue) {
+		p.advance()
+		return &Expr{Kind: ExprLiteral, LiteralType: "true"}
+	}
+	if p.isKw(KwFalse) {
+		p.advance()
+		return &Expr{Kind: ExprLiteral, LiteralType: "false"}
+	}
+
 	// TRUE / FALSE (as keywords)
 	if p.isKw(KwCurrentDate) || p.isKw(KwCurrentTime) || p.isKw(KwCurrentTimestamp) {
 		p.advance()

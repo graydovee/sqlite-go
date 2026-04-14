@@ -80,10 +80,13 @@ func (b *Build) compileLiteral(expr *Expr, targetReg int) error {
 	case "null":
 		b.emitNull(targetReg)
 	case "true":
+		fmt.Printf("compileLiteral: true -> reg %d\n", targetReg)
 		b.emitInteger(1, targetReg)
 	case "false":
+		fmt.Printf("compileLiteral: false -> reg %d\n", targetReg)
 		b.emitInteger(0, targetReg)
 	default:
+		fmt.Printf("compileLiteral: unknown type %q\n", expr.LiteralType)
 		b.emitNull(targetReg)
 	}
 	return nil
@@ -155,9 +158,9 @@ func (b *Build) compileBinaryOp(expr *Expr, targetReg int) error {
 	case ">=":
 		return b.compileComparison(expr, targetReg, vdbe.OpGe)
 	case "IS":
-		return b.compileComparison(expr, targetReg, vdbe.OpEq)
+		return b.compileNullSafeComparison(expr, targetReg, vdbe.OpEq)
 	case "IS NOT":
-		return b.compileComparison(expr, targetReg, vdbe.OpNe)
+		return b.compileNullSafeComparison(expr, targetReg, vdbe.OpNe)
 	}
 
 	// For arithmetic/bitwise operators, compile both operands then apply op.
@@ -217,6 +220,38 @@ func (b *Build) compileComparison(expr *Expr, targetReg int, cmpOp vdbe.Opcode) 
 
 	// If comparison is true, jump to trueLabel
 	b.b.EmitJump(cmpOp, leftReg, trueLabel, rightReg)
+
+	// False path: targetReg = 0
+	b.emitInteger(0, targetReg)
+	b.emitGoto(endLabel)
+
+	// True path: targetReg = 1
+	b.b.DefineLabel(trueLabel)
+	b.emitInteger(1, targetReg)
+
+	b.b.DefineLabel(endLabel)
+	return nil
+}
+
+// compileNullSafeComparison compiles IS / IS NOT with NULL-safe semantics.
+// Uses P5=1 flag on the jump instruction to signal NULL-safe comparison.
+func (b *Build) compileNullSafeComparison(expr *Expr, targetReg int, cmpOp vdbe.Opcode) error {
+	leftReg := b.b.AllocReg(1)
+	rightReg := b.b.AllocReg(1)
+
+	if err := b.compileExpr(expr.Left, leftReg); err != nil {
+		return err
+	}
+	if err := b.compileExpr(expr.Right, rightReg); err != nil {
+		return err
+	}
+
+	trueLabel := b.b.NewLabel()
+	endLabel := b.b.NewLabel()
+
+	// P5=1 signals NULL-safe comparison in the VDBE
+	addr := b.b.EmitJump(cmpOp, leftReg, trueLabel, rightReg)
+	b.b.SetP5(addr, 1)
 
 	// False path: targetReg = 0
 	b.emitInteger(0, targetReg)
@@ -1254,7 +1289,8 @@ func (b *Build) compileCondition(expr *Expr, trueLabel, falseLabel int, jumpIfTr
 		// Comparison operators: compile both sides and emit direct jump
 		cmpOp, ok := comparisonOpcode(op)
 		if ok {
-			return b.compileConditionComparison(expr, cmpOp, trueLabel, falseLabel, jumpIfTrue)
+			nullSafe := op == "IS" || op == "IS NOT"
+			return b.compileConditionComparison(expr, cmpOp, trueLabel, falseLabel, jumpIfTrue, nullSafe)
 		}
 
 	// Fall through to general case
@@ -1278,7 +1314,7 @@ func (b *Build) compileCondition(expr *Expr, trueLabel, falseLabel int, jumpIfTr
 
 // compileConditionComparison compiles a comparison in condition context
 // (jumps directly without storing boolean result).
-func (b *Build) compileConditionComparison(expr *Expr, cmpOp vdbe.Opcode, trueLabel, falseLabel int, jumpIfTrue bool) error {
+func (b *Build) compileConditionComparison(expr *Expr, cmpOp vdbe.Opcode, trueLabel, falseLabel int, jumpIfTrue bool, nullSafe bool) error {
 	leftReg := b.b.AllocReg(1)
 	rightReg := b.b.AllocReg(1)
 
@@ -1290,14 +1326,20 @@ func (b *Build) compileConditionComparison(expr *Expr, cmpOp vdbe.Opcode, trueLa
 	}
 
 	if jumpIfTrue {
-		b.b.EmitJump(cmpOp, leftReg, trueLabel, rightReg)
+		addr := b.b.EmitJump(cmpOp, leftReg, trueLabel, rightReg)
+		if nullSafe {
+			b.b.SetP5(addr, 1)
+		}
 		b.emitGoto(falseLabel)
 	} else {
 		// Jump to true label when condition IS true, meaning we skip the
 		// false path. Use the inverse comparison for NOT cases.
 		invOp := inverseComparison(cmpOp)
 		if invOp != vdbe.OpGoto {
-			b.b.EmitJump(invOp, leftReg, trueLabel, rightReg)
+			addr := b.b.EmitJump(invOp, leftReg, trueLabel, rightReg)
+			if nullSafe {
+				b.b.SetP5(addr, 1)
+			}
 		}
 		b.emitGoto(falseLabel)
 	}

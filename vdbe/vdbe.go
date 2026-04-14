@@ -1460,6 +1460,9 @@ func (v *VDBE) Step(ctx context.Context) (bool, error) {
 			// Load a 64-bit integer from P4 into register P2.
 			if p4val, ok := pOp.P4.(int64); ok {
 				v.regs[pOp.P2].SetInt(p4val)
+				fmt.Printf("OpInt64: reg[%d] = int64(%d)\n", pOp.P2, p4val)
+			} else {
+				fmt.Printf("OpInt64: P4 type assertion FAILED, P4 type is %T, value is %v\n", pOp.P4, pOp.P4)
 			}
 
 		case OpString:
@@ -1890,15 +1893,18 @@ func (v *VDBE) compare(pOp *Instruction, cmpOp int) bool {
 
 	// NULL handling: per SQLite semantics, NULL comparisons never jump
 	if pIn1.Type == MemNull || pIn3.Type == MemNull {
-		// SQLite: if either operand is NULL, the comparison never succeeds
-		// unless OP_Ne with NULL-equal flag in P5
-		if cmpOp == 1 && pOp.P5 != 0 {
-			// Ne with NULL-equal flag: NULL == NULL
+		// NULL-safe comparison (P5 flag): used for IS/IS NOT operators
+		if pOp.P5 != 0 {
 			if pIn1.Type == MemNull && pIn3.Type == MemNull {
+				// Both NULL: equal
 				v.lastCompare = 0
-				return true
+				return cmpOp == 0 // Eq with NULL-equal → true, Ne → false
 			}
+			// One NULL, one not: not equal
+			v.lastCompare = 1
+			return cmpOp == 1 // Ne with NULL-equal → true, Eq → false
 		}
+		// Standard NULL handling: comparison never succeeds
 		return false
 	}
 

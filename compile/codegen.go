@@ -134,6 +134,13 @@ func (b *Builder) SetP3(addr, p3 int) {
 	}
 }
 
+// SetP5 sets the P5 field of the instruction at the given address.
+func (b *Builder) SetP5(addr, p5 int) {
+	if addr >= 0 && addr < len(b.instrs) {
+		b.instrs[addr].P5 = p5
+	}
+}
+
 // LabelAddr returns the address of a label, or -1 if not defined.
 func (b *Builder) LabelAddr(labelID int) int {
 	if info, ok := b.labels[labelID]; ok && info.defined {

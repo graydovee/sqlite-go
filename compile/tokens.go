@@ -114,6 +114,7 @@ const (
 	KwFail
 	KwFilter
 	KwFirst
+	KwFalse
 	KwFollowing
 	KwFor
 	KwForeign
@@ -193,6 +194,7 @@ const (
 	KwTo
 	KwTransaction
 	KwTrigger
+	KwTrue
 	KwUnbounded
 	KwUnion
 	KwUnique
