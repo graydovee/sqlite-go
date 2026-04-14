@@ -683,6 +683,7 @@ func (m *fuzzMockDB) Rollback() error                                         { 
 func (m *fuzzMockDB) AutoCommit() bool                                        { return true }
 func (m *fuzzMockDB) SetAutoCommit(on bool)                                   {}
 func (m *fuzzMockDB) Changes() int64                                          { return 0 }
+func (m *fuzzMockDB) AddChanges(n int64)                                       {}
 func (m *fuzzMockDB) TotalChanges() int64                                     { return 0 }
 func (m *fuzzMockDB) LastInsertRowID() int64                                  { return 0 }
 func (m *fuzzMockDB) SetLastInsertRowID(id int64)                             {}
