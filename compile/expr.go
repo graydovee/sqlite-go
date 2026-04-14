@@ -80,13 +80,10 @@ func (b *Build) compileLiteral(expr *Expr, targetReg int) error {
 	case "null":
 		b.emitNull(targetReg)
 	case "true":
-		fmt.Printf("compileLiteral: true -> reg %d\n", targetReg)
 		b.emitInteger(1, targetReg)
 	case "false":
-		fmt.Printf("compileLiteral: false -> reg %d\n", targetReg)
 		b.emitInteger(0, targetReg)
 	default:
-		fmt.Printf("compileLiteral: unknown type %q\n", expr.LiteralType)
 		b.emitNull(targetReg)
 	}
 	return nil

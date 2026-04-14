@@ -26,7 +26,6 @@ func TestSelect3BasicAggregate(t *testing.T) {
 	setupSelect3Tables(t, db)
 
 	t.Run("1.0 - distinct log", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		got := queryFlat(t, db, "SELECT DISTINCT log FROM t1 ORDER BY log")
 		want := []interface{}{int64(0), int64(1), int64(2), int64(3), int64(4), int64(5)}
 		if !equalValues(got, want) {
@@ -35,7 +34,6 @@ func TestSelect3BasicAggregate(t *testing.T) {
 	})
 
 	t.Run("1.1 - count(*)", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		got := queryFlat(t, db, "SELECT count(*) FROM t1")
 		if len(got) != 1 || !isNumericEqual(got[0], 31) {
 			t.Errorf("got %v, want 31", got)
@@ -43,7 +41,6 @@ func TestSelect3BasicAggregate(t *testing.T) {
 	})
 
 	t.Run("1.2 - basic aggregate functions", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		got := queryFlat(t, db, "SELECT min(n),min(log),max(n),max(log),sum(n),sum(log),avg(n),avg(log) FROM t1")
 		if len(got) != 8 {
 			t.Fatalf("expected 8 values, got %d: %v", len(got), got)
@@ -79,7 +76,6 @@ func TestSelect3BasicAggregate(t *testing.T) {
 	})
 
 	t.Run("1.3 - max(n)/avg(n), max(log)/avg(log)", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		got := queryFlat(t, db, "SELECT max(n)/avg(n), max(log)/avg(log) FROM t1")
 		if len(got) != 2 {
 			t.Fatalf("expected 2 values, got %d: %v", len(got), got)
@@ -342,17 +338,15 @@ func TestSelect3EmptyAggregate(t *testing.T) {
 	setupSelect3Tables(t, db)
 
 	t.Run("7.1 - aggregate with no matching rows returns empty", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
-		got := queryFlat(t, db, "CREATE TABLE t2(a,b)")
+		db.Exec("CREATE TABLE t2(a,b)")
 		db.Exec("INSERT INTO t2 VALUES(1,2)")
-		got = queryFlat(t, db, "SELECT a, sum(b) FROM t2 WHERE b=5 GROUP BY a")
+		got := queryFlat(t, db, "SELECT a, sum(b) FROM t2 WHERE b=5 GROUP BY a")
 		if len(got) != 0 {
 			t.Errorf("expected empty result, got %v", got)
 		}
 	})
 
 	t.Run("7.2 - aggregate without GROUP BY returns NULL", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		db.Exec("CREATE TABLE t2b(a,b)")
 		db.Exec("INSERT INTO t2b VALUES(1,2)")
 		got := queryFlat(t, db, "SELECT a, sum(b) FROM t2b WHERE b=5")
@@ -375,7 +369,6 @@ func TestSelect3ComplexAggregate(t *testing.T) {
 	setupSelect3Tables(t, db)
 
 	t.Run("5.1 - multiple aggregates with complex ORDER BY", func(t *testing.T) {
-		t.Skip("feature not yet implemented: aggregate functions")
 		got := queryFlat(t, db, "SELECT log, count(*), avg(n), max(n+log*2) FROM t1 GROUP BY log ORDER BY max(n+log*2)+0, avg(n)+0")
 		if len(got) != 24 {
 			t.Fatalf("expected 24 values, got %d: %v", len(got), got)

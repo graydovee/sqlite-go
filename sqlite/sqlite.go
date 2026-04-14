@@ -3285,10 +3285,38 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 
 	hackRS := newResultSet(rows, resultCols)
 
-	// If compile pipeline succeeded and results match, use compile result
+// If compile pipeline succeeded, check if its result is better than hack layer
 	if compileErr == nil && compileRS != nil {
 		cRows := compileRS.Rows()
 		hRows := hackRS.Rows()
+
+		// If compile produced non-nil values but hack produced all nil, trust compile
+		// (handles aggregate expressions like max(n)/avg(n) that hack layer can't evaluate)
+		if len(cRows) == len(hRows) {
+			allHackNil := true
+			anyCompileNonNil := false
+			for i := range hRows {
+				if hRows[i].ColumnCount() != cRows[i].ColumnCount() {
+					allHackNil = false
+					break
+				}
+				for j := 0; j < hRows[i].ColumnCount(); j++ {
+					hv := hRows[i].ColumnValue(j)
+					cv := cRows[i].ColumnValue(j)
+					if hv != nil {
+						allHackNil = false
+					}
+					if cv != nil {
+						anyCompileNonNil = true
+					}
+				}
+			}
+			if allHackNil && anyCompileNonNil {
+				return compileRS, nil
+			}
+		}
+
+		// If both produced the same values, use compile result
 		if len(cRows) == len(hRows) {
 			match := true
 			for i := range cRows {

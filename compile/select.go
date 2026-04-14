@@ -174,10 +174,32 @@ func (b *Build) compileAggregateSelect(stmt *SelectStmt) error {
 // compileAggregateNoGroup compiles an aggregate SELECT without GROUP BY.
 // It scans all rows, accumulating aggregate state, then outputs a single result row.
 func (b *Build) compileAggregateNoGroup(stmt *SelectStmt, resultCols []*resultColumn, nResult int) error {
-	// Allocate registers for aggregate accumulators (one per result column)
+	// Collect all aggregate Expr nodes from result columns
+	var allAggs []*Expr
+	for _, rc := range resultCols {
+		b.collectAggFuncs(rc.Expr, &allAggs)
+	}
+
+	// Allocate dedicated registers for each aggregate function
+	b.aggFuncRegs = make(map[*Expr]int)
+	for _, agg := range allAggs {
+		if _, exists := b.aggFuncRegs[agg]; !exists {
+			reg := b.b.AllocReg(1)
+			b.aggFuncRegs[agg] = reg
+		}
+	}
+
+	// Allocate result registers
 	aggBase := b.b.AllocReg(nResult)
 
-	// Initialize accumulators to NULL
+	// Flag register: tracks whether any rows matched the WHERE clause
+	rowFlagReg := b.b.AllocReg(1)
+	b.emitInteger(0, rowFlagReg)
+
+	// Initialize aggregate accumulator registers to NULL
+	for _, reg := range b.aggFuncRegs {
+		b.emitNull(reg)
+	}
 	for i := 0; i < nResult; i++ {
 		b.emitNull(aggBase + i)
 	}
@@ -201,9 +223,19 @@ func (b *Build) compileAggregateNoGroup(stmt *SelectStmt, resultCols []*resultCo
 		b.b.DefineLabel(skipLabel)
 	}
 
-	// Accumulate aggregates for each result column
+	// Mark that at least one row was processed
+	b.emitInteger(1, rowFlagReg)
+
+	// Run aggregate step functions only
+	for agg, reg := range b.aggFuncRegs {
+		if err := b.compileAggregate(agg, reg); err != nil {
+			return err
+		}
+	}
+
+	// Also evaluate non-aggregate columns in the loop (to capture last row's value)
 	for i, rc := range resultCols {
-		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
+		if rc.Expr != nil && !b.exprHasAggregate(rc.Expr) {
 			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
 				return err
 			}
@@ -214,19 +246,27 @@ func (b *Build) compileAggregateNoGroup(stmt *SelectStmt, resultCols []*resultCo
 	b.b.DefineLabel(loopEndLabel)
 	b.b.DefineLabel(emptyLabel)
 
-	// Finalize aggregates and output single row
+	// Finalize all aggregate registers
+	for agg, reg := range b.aggFuncRegs {
+		afi := b.makeAggFuncInfo(agg)
+		b.b.EmitP4(vdbe.OpAggFinal, reg, reg, 0, afi, "AGG FINAL")
+	}
+
+	// Evaluate result columns in output mode (aggregates read from registers)
+	// Skip non-aggregate columns: they were already evaluated in the loop body
+	// (and remain NULL if no rows matched)
+	b.inAggOutput = true
 	for i, rc := range resultCols {
 		if rc.Expr != nil && b.exprHasAggregate(rc.Expr) {
-			b.emitAggFinalForCol(rc.Expr, aggBase+i)
-		} else if rc.Expr != nil {
-			// Non-aggregate column without GROUP BY: evaluate once
 			if err := b.compileExpr(rc.Expr, aggBase+i); err != nil {
 				return err
 			}
 		}
 	}
-	b.emitResultRow(aggBase, nResult)
+	b.inAggOutput = false
+	b.aggFuncRegs = nil
 
+	b.emitResultRow(aggBase, nResult)
 	b.emitHalt(0)
 	return nil
 }
