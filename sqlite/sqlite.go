@@ -3291,8 +3291,9 @@ func (db *Database) querySingle(sql string, args []interface{}) (*ResultSet, err
 		hRows := hackRS.Rows()
 
 		// If compile produced non-nil values but hack produced all nil, trust compile
-		// (handles aggregate expressions like max(n)/avg(n) that hack layer can't evaluate)
-		if len(cRows) == len(hRows) {
+		// ONLY for aggregate queries. Non-aggregate queries (e.g., BETWEEN with NULL)
+		// legitimately produce NULL values that should not be overridden.
+		if hasAgg && len(cRows) == len(hRows) && len(hRows) > 0 {
 			allHackNil := true
 			anyCompileNonNil := false
 			for i := range hRows {
