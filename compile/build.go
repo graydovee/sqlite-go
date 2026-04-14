@@ -276,11 +276,15 @@ func (b *Build) addTableRef(name string, alias string, tbl *TableInfo, cursor in
 		name:   name,
 	}
 	b.tables = append(b.tables, entry)
-	// Register by alias and by name.
+	// Register by alias (always unique due to caller deduplication).
 	if alias != "" {
 		b.tableMap[strings.ToUpper(alias)] = entry
 	}
-	b.tableMap[strings.ToUpper(name)] = entry
+	// Register by name only if not already registered (handles self-joins).
+	nameKey := strings.ToUpper(name)
+	if _, exists := b.tableMap[nameKey]; !exists {
+		b.tableMap[nameKey] = entry
+	}
 }
 
 // resolveColumnRef resolves a column reference to (cursor, column_index).
@@ -301,6 +305,9 @@ func (b *Build) resolveColumnRef(table, col string) (cursor int, colIdx int, err
 	}
 
 	// No table qualifier: search all tables.
+	// Skip columns that are USING/NATURAL columns in right tables,
+	// so they don't cause false ambiguity errors for self-joins and
+	// shared USING columns resolve to the left table.
 	var found bool
 	for _, entry := range b.tables {
 		if entry.table == nil {
@@ -308,6 +315,10 @@ func (b *Build) resolveColumnRef(table, col string) (cursor int, colIdx int, err
 		}
 		for i, c := range entry.table.Columns {
 			if strings.ToUpper(c.Name) == colUpper {
+				// Skip if this column is a USING column in this table
+				if entry.usingCols != nil && entry.usingCols[i] {
+					continue
+				}
 				if found {
 					return 0, 0, fmt.Errorf("ambiguous column: %s", col)
 				}

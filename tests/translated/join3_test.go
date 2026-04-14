@@ -17,7 +17,6 @@ import (
 // ============================================================================
 
 func TestJoin3_1Unrestricted(t *testing.T) {
-	t.Skip("JOIN execution not fully working")
 	// Test with a reasonable number of tables
 	maxN := 10
 
