@@ -11,7 +11,6 @@ import (
 // ============================================================================
 
 func TestJoin2_1NaturalChains(t *testing.T) {
-	t.Skip("JOIN execution not fully working")
 	db := openTestDB(t)
 
 	// Setup tables t1(a,b), t2(b,c), t3(c,d)
@@ -274,7 +273,6 @@ func TestJoin2_7ViewSubquery(t *testing.T) {
 // ============================================================================
 
 func TestJoin2_8Between(t *testing.T) {
-	t.Skip("JOIN execution not fully working")
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t0(c0)")

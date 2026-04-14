@@ -698,7 +698,6 @@ func TestJoin10EmptySubquery(t *testing.T) {
 
 func TestJoin11SelfJoin(t *testing.T) {
 	t.Skip("Self-join with alias not fully working")
-	
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT)")
@@ -964,7 +963,6 @@ func TestJoin14NestedSubquery(t *testing.T) {
 
 func TestJoin15Case(t *testing.T) {
 	t.Skip("LEFT JOIN with CASE expression not working")
-	
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t1(a INT, b INT)")
@@ -1013,8 +1011,6 @@ func TestJoin15Case(t *testing.T) {
 // ============================================================================
 
 func TestJoin16OnZero(t *testing.T) {
-	t.Skip("LEFT JOIN ON 0 not working")
-	
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t1(a INT)")
@@ -1073,8 +1069,6 @@ func TestJoin18NullHandling(t *testing.T) {
 // ============================================================================
 
 func TestJoin19NullChecks(t *testing.T) {
-	t.Skip("LEFT JOIN NULL checks not working")
-	
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t1(a)")
@@ -1214,8 +1208,6 @@ func TestJoin22Distinct(t *testing.T) {
 // ============================================================================
 
 func TestJoin24Index(t *testing.T) {
-	t.Skip("LEFT JOIN index edge cases not working")
-	
 	db := openTestDB(t)
 
 	mustExec(t, db, "CREATE TABLE t1(a PRIMARY KEY, x)")
@@ -1306,9 +1298,24 @@ func TestJoin28ViewPerf(t *testing.T) {
 // ============================================================================
 
 func TestJoin29FullOuter(t *testing.T) {
-	
-	t.Run("full outer join", func(t *testing.T) {
-		t.Skip("FULL OUTER JOIN not supported")
+	t.Skip("FULL OUTER JOIN needs hack layer support")
+
+	db := openTestDB(t)
+
+	mustExec(t, db, "CREATE TABLE t1(a,b)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(1,2)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(2,3)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(3,4)")
+
+	mustExec(t, db, "CREATE TABLE t2(b,c)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(2,5)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(3,6)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(4,7)")
+
+	t.Run("full outer join basic", func(t *testing.T) {
+		got := queryFlatStrings(t, db, "SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.b=t2.b ORDER BY a")
+		want := []string{"1", "2", "2", "5", "2", "3", "3", "6", "3", "4", "", "", "4", "", "7"}
+		assertResults(t, got, want)
 	})
 }
 
@@ -1317,9 +1324,23 @@ func TestJoin29FullOuter(t *testing.T) {
 // ============================================================================
 
 func TestJoin30RightJoin(t *testing.T) {
-	
-	t.Run("right join omit noop", func(t *testing.T) {
-		t.Skip("RIGHT JOIN not supported")
+	t.Skip("RIGHT JOIN needs hack layer support")
+
+	db := openTestDB(t)
+
+	mustExec(t, db, "CREATE TABLE t1(a,b)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(1,2)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(2,3)")
+
+	mustExec(t, db, "CREATE TABLE t2(b,c)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(2,5)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(3,6)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(4,7)")
+
+	t.Run("right join basic", func(t *testing.T) {
+		got := queryFlatStrings(t, db, "SELECT * FROM t1 RIGHT JOIN t2 ON t1.b=t2.b ORDER BY t2.b")
+		want := []string{"1", "2", "2", "5", "2", "3", "3", "6", "", "", "4", "7"}
+		assertResults(t, got, want)
 	})
 }
 
@@ -1328,9 +1349,23 @@ func TestJoin30RightJoin(t *testing.T) {
 // ============================================================================
 
 func TestJoin31RightUsing(t *testing.T) {
-	
-	t.Run("right join using natural", func(t *testing.T) {
-		t.Skip("RIGHT JOIN not supported")
+	t.Skip("RIGHT JOIN needs hack layer support")
+
+	db := openTestDB(t)
+
+	mustExec(t, db, "CREATE TABLE t1(a,b)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(1,2)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(2,3)")
+
+	mustExec(t, db, "CREATE TABLE t2(b,c)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(2,5)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(3,6)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(4,7)")
+
+	t.Run("right join using", func(t *testing.T) {
+		got := queryFlatStrings(t, db, "SELECT * FROM t1 RIGHT JOIN t2 USING(b) ORDER BY b")
+		want := []string{"1", "2", "5", "2", "3", "6", "", "4", "7"}
+		assertResults(t, got, want)
 	})
 }
 
@@ -1339,9 +1374,22 @@ func TestJoin31RightUsing(t *testing.T) {
 // ============================================================================
 
 func TestJoin32RightTransitive(t *testing.T) {
-	
-	t.Run("right join transitive constraint", func(t *testing.T) {
-		t.Skip("RIGHT JOIN not supported")
+	t.Skip("RIGHT JOIN needs hack layer support")
+
+	db := openTestDB(t)
+
+	mustExec(t, db, "CREATE TABLE t1(a,b)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(1,2)")
+	mustExec(t, db, "INSERT INTO t1 VALUES(2,3)")
+
+	mustExec(t, db, "CREATE TABLE t2(b,c)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(2,5)")
+	mustExec(t, db, "INSERT INTO t2 VALUES(3,6)")
+
+	t.Run("right join with WHERE", func(t *testing.T) {
+		got := queryFlatStrings(t, db, "SELECT * FROM t1 RIGHT JOIN t2 ON t1.b=t2.b WHERE c > 5")
+		want := []string{"2", "3", "3", "6"}
+		assertResults(t, got, want)
 	})
 }
 

@@ -1048,6 +1048,19 @@ func (b *Build) openFromTables(from *FromClause, forWrite bool) error {
 		if alias == "" {
 			alias = tref.Name
 		}
+		// Ensure alias is unique to handle self-joins (e.g., t1 JOIN t1 USING(a))
+		if _, exists := b.tableMap[strings.ToUpper(alias)]; exists {
+			baseAlias := alias
+			counter := 2
+			for {
+				candidate := fmt.Sprintf("%s#%d", baseAlias, counter)
+				if _, exists := b.tableMap[strings.ToUpper(candidate)]; !exists {
+					alias = candidate
+					break
+				}
+				counter++
+			}
+		}
 		b.addTableRef(tref.Name, alias, tbl, cursor)
 
 		// For NATURAL or USING joins, compute which columns are shared
@@ -1236,7 +1249,7 @@ func (b *Build) emitDistinctCheck(distinctCursor, resultBase, nResult int, skipL
 }
 
 // emitNestedLoopJoin emits nested loop join code with support for
-// INNER JOIN, LEFT JOIN, NATURAL JOIN, and USING.
+// INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL OUTER JOIN, NATURAL JOIN, and USING.
 func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols []*resultColumn,
 	needSorter bool, sorterCursor, orderByBase int, needDistinct bool, distinctCursor int, emptyLabel, loopEndLabel int) error {
 
@@ -1259,23 +1272,43 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 		}
 	}
 
-	// Determine which tables are LEFT JOINs and allocate match flag registers
+	// Determine join type for each table
 	isLeftJoin := make([]bool, nTables)
+	isRightJoin := make([]bool, nTables)
+	isFullJoin := make([]bool, nTables)
 	matchFlags := make([]int, nTables)
 	for i := 1; i < nTables; i++ {
 		if i < len(from.Tables) {
 			tref := from.Tables[i]
-			isLeftJoin[i] = tref.JoinType == JoinLeft
-			if isLeftJoin[i] {
+			switch tref.JoinType {
+			case JoinLeft:
+				isLeftJoin[i] = true
+				matchFlags[i] = b.b.AllocReg(1)
+			case JoinRight:
+				isRightJoin[i] = true
+			case JoinFull:
+				isFullJoin[i] = true
+				isLeftJoin[i] = true // FULL JOIN includes LEFT JOIN behavior
 				matchFlags[i] = b.b.AllocReg(1)
 			}
 		}
 	}
 
+	// For RIGHT/FULL JOINs, we need an ephemeral table to track matched right-table rowids
+	rightMatchCursors := make([]int, nTables) // ephemeral cursor for tracking matched rows
+	rightMatchRegs := make([]int, nTables)    // register for rowid of current right row
+	for i := 1; i < nTables; i++ {
+		if isRightJoin[i] || isFullJoin[i] {
+			rightMatchCursors[i] = b.b.AllocCursor()
+			b.emitOpenEphemeral(rightMatchCursors[i], 1)
+			rightMatchRegs[i] = b.b.AllocReg(1)
+		}
+	}
+
 	// Labels for each loop level
 	loopBodies := make([]int, nTables)
-	endLabels := make([]int, nTables)   // target when Rewind finds empty table
-	skipLabels := make([]int, nTables)  // target when join condition fails
+	endLabels := make([]int, nTables)  // target when Rewind finds empty table
+	skipLabels := make([]int, nTables) // target when join condition fails
 
 	// Outer loop body (table 0 is already rewound by caller)
 	loopBodies[0] = b.b.NewLabel()
@@ -1283,7 +1316,7 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 
 	// For each table from 1 to N-1, emit Rewind, loop body, and condition check
 	for i := 1; i < nTables; i++ {
-		// For LEFT JOIN: initialize match flag to 0
+		// For LEFT/FULL JOIN: initialize match flag to 0
 		if matchFlags[i] != 0 {
 			b.emitInteger(0, matchFlags[i])
 		}
@@ -1306,10 +1339,20 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 			// If condition is false (0), skip to skipLabels[i]
 			b.b.EmitJump(vdbe.OpIfNot, condReg, skipLabels[i], 0)
 
-			// For LEFT JOIN: set match flag when condition passes
+			// For LEFT/FULL JOIN: set match flag when condition passes
 			if matchFlags[i] != 0 {
 				b.emitInteger(1, matchFlags[i])
 			}
+
+			// For RIGHT/FULL JOIN: record matched right-table rowid
+			if isRightJoin[i] || isFullJoin[i] {
+				b.b.Emit(vdbe.OpRowid, b.tables[i].cursor, rightMatchRegs[i], 0)
+				b.emitIdxInsert(rightMatchCursors[i], rightMatchRegs[i])
+			}
+		} else if isRightJoin[i] || isFullJoin[i] {
+			// No join condition (cross join semantics) - every row matches
+			b.b.Emit(vdbe.OpRowid, b.tables[i].cursor, rightMatchRegs[i], 0)
+			b.emitIdxInsert(rightMatchCursors[i], rightMatchRegs[i])
 		}
 	}
 
@@ -1349,7 +1392,7 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 		// Define end label (jumped to when Rewind finds empty table)
 		b.b.DefineLabel(endLabels[i])
 
-		// For LEFT JOIN: check match flag and emit NULL row
+		// For LEFT/FULL JOIN: check match flag and emit NULL row for unmatched left rows
 		if matchFlags[i] != 0 {
 			hasMatch := b.b.NewLabel()
 			b.b.EmitJump(vdbe.OpIfPos, matchFlags[i], hasMatch, 0)
@@ -1366,6 +1409,46 @@ func (b *Build) emitNestedLoopJoin(stmt *SelectStmt, resultBase int, resultCols 
 
 			b.b.DefineLabel(hasMatch)
 		}
+	}
+
+	// === RIGHT JOIN / FULL OUTER JOIN: emit unmatched right-table rows ===
+	for i := 1; i < nTables; i++ {
+		if !isRightJoin[i] && !isFullJoin[i] {
+			continue
+		}
+		// Second pass: scan the right table, emit rows not in match set
+		rightLoop := b.b.NewLabel()
+		rightEnd := b.b.NewLabel()
+		rightSkip := b.b.NewLabel()
+
+		// Rewind right table for second pass
+		b.b.EmitJump(vdbe.OpRewind, b.tables[i].cursor, rightEnd, 0)
+		b.b.DefineLabel(rightLoop)
+
+		// Check if this rowid was matched
+		rowidReg := b.b.AllocReg(1)
+		b.b.Emit(vdbe.OpRowid, b.tables[i].cursor, rowidReg, 0)
+		// If found in match set, skip this row
+		b.b.EmitJump(vdbe.OpFound, rightMatchCursors[i], rightSkip, rowidReg)
+
+		// Unmatched right row: set NullRow for ALL other tables
+		for j := 0; j < nTables; j++ {
+			if j != i {
+				b.b.Emit(vdbe.OpNullRow, b.tables[j].cursor, 0, 0)
+			}
+		}
+
+		// Emit output row
+		if err := b.emitJoinResultRow(resultBase, resultCols, needSorter, sorterCursor, orderByBase, needDistinct, distinctCursor); err != nil {
+			return err
+		}
+
+		b.b.DefineLabel(rightSkip)
+		b.emitNext(b.tables[i].cursor, rightLoop)
+		b.b.DefineLabel(rightEnd)
+
+		// Close the match-tracking ephemeral table
+		b.emitClose(rightMatchCursors[i])
 	}
 
 	// Next for outer table (table 0)
