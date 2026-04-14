@@ -314,9 +314,18 @@ func TestUpdate(t *testing.T) {
 		t.Skip("rowid UPDATE tests not yet supported")
 	})
 
-	// update-14.x: Trigger WHEN clause
+	// update-14.x: Trigger WHEN clause and trigger firing on UPDATE
 	t.Run("update-14.x", func(t *testing.T) {
-		t.Skip("trigger WHEN clause tests not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES('updated'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'x')")
+		mustExec(t, db, "UPDATE t1 SET b = 'y' WHERE a = 1")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "updated" {
+			t.Errorf("expected [updated], got %v", got)
+		}
 	})
 
 	// update-15.x through 21.x: Complex features

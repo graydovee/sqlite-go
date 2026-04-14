@@ -437,13 +437,20 @@ func TestAlter2AddColumnNonNullDefault(t *testing.T) {
 	})
 }
 
-// --- alter2-8.x: ADD COLUMN with triggers (skipped) ---
+// --- alter2-8.x: Triggers coexist with ALTER TABLE ---
 
-// TestAlter2AddColumnTriggers skips trigger-related tests.
+// TestAlter2AddColumnTriggers tests that triggers work alongside tables.
 func TestAlter2AddColumnTriggers(t *testing.T) {
-	// t.Skip("ALTER TABLE not fully implemented")
 	t.Run("alter2-8_triggers", func(t *testing.T) {
-		t.Skip("trigger tests skipped for ALTER TABLE ADD COLUMN")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('ok'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'x')")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "ok" {
+			t.Errorf("expected [ok], got %v", got)
+		}
 	})
 }
 

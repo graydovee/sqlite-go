@@ -179,14 +179,20 @@ func TestAlterRenameErrors(t *testing.T) {
 	})
 }
 
-// --- alter-3.x: ALTER TABLE with triggers (simplified, no triggers) ---
+// --- alter-3.x: ALTER TABLE with triggers ---
 
-// TestAlterRenameTriggers tests basic rename in the presence of trigger-like
-// structures. Full trigger tests are skipped.
+// TestAlterRenameTriggers tests triggers exist alongside ALTER TABLE.
 func TestAlterRenameTriggers(t *testing.T) {
-	// t.Skip("ALTER TABLE not fully implemented")
-	t.Run("alter-3_skip_triggers", func(t *testing.T) {
-		t.Skip("trigger tests skipped for ALTER TABLE")
+	t.Run("alter-3_triggers_exist", func(t *testing.T) {
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('trigger_fired'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'x')")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "trigger_fired" {
+			t.Errorf("expected [trigger_fired], got %v", got)
+		}
 	})
 }
 

@@ -239,9 +239,17 @@ func TestInsert(t *testing.T) {
 		t.Skip("randomblob not yet supported")
 	})
 
-	// insert-16.x: Triggers - SKIP
+	// insert-16.x: Triggers
 	t.Run("insert-16.x", func(t *testing.T) {
-		t.Skip("triggers not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('inserted'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'hello')")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "inserted" {
+			t.Errorf("expected [inserted], got %v", got)
+		}
 	})
 
 	// insert-17.x: Triggers with REPLACE - SKIP

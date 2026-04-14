@@ -418,16 +418,46 @@ func TestDelete(t *testing.T) {
 	})
 
 	// =========================================================================
-	// delete-7.x: Triggers - SKIP
+	// delete-7.x: Triggers
 	// =========================================================================
 	t.Run("delete-7.1", func(t *testing.T) {
-		t.Skip("triggers not supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER DELETE ON t1 BEGIN INSERT INTO log VALUES('deleted'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'x')")
+		mustExec(t, db, "INSERT INTO t1 VALUES(2, 'y')")
+		mustExec(t, db, "DELETE FROM t1 WHERE a = 1")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "deleted" {
+			t.Errorf("expected [deleted], got %v", got)
+		}
 	})
 	t.Run("delete-7.2", func(t *testing.T) {
-		t.Skip("triggers not supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 AFTER DELETE ON t1 BEGIN INSERT INTO log VALUES('del'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'a')")
+		mustExec(t, db, "INSERT INTO t1 VALUES(2, 'b')")
+		mustExec(t, db, "INSERT INTO t1 VALUES(3, 'c')")
+		mustExec(t, db, "DELETE FROM t1")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) < 1 {
+			t.Errorf("expected trigger to fire on DELETE, got %d: %v", len(got), got)
+		}
 	})
 	t.Run("delete-7.3", func(t *testing.T) {
-		t.Skip("triggers not supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t1(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TABLE log(msg)")
+		mustExec(t, db, "CREATE TRIGGER tr1 BEFORE DELETE ON t1 BEGIN INSERT INTO log VALUES('before'); END")
+		mustExec(t, db, "INSERT INTO t1 VALUES(1, 'x')")
+		mustExec(t, db, "DELETE FROM t1 WHERE a = 1")
+		got := queryStrings(t, db, "SELECT msg FROM log")
+		if len(got) != 1 || got[0] != "before" {
+			t.Errorf("expected [before], got %v", got)
+		}
 	})
 
 	// =========================================================================

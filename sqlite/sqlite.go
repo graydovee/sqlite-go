@@ -57,7 +57,22 @@ type Database struct {
 	// CTE temporary data (populated during WITH query execution)
 	cteData map[string]*cteTable
 
+	// Trigger storage
+	triggers map[string]*triggerEntry
+
 	funcRegistry *functions.FuncRegistry
+}
+
+// triggerEntry stores metadata about a trigger.
+type triggerEntry struct {
+	name       string
+	tableName  string
+	time       string // "BEFORE", "AFTER", "INSTEAD OF"
+	event      string // "INSERT", "DELETE", "UPDATE", "UPDATE OF"
+	updateCols []string
+	forEachRow bool
+	whenExpr   string
+	bodySQLs   []string // individual statements in the trigger body
 }
 
 // sqliteMasterEntry represents one row in the sqlite_master system table.
@@ -119,6 +134,7 @@ func Open(filename string, flags OpenFlag) (*Database, error) {
 		tables:         make(map[string]*tableEntry),
 		rootPageMap:    make(map[int]*tableEntry),
 		views:          make(map[string]*viewEntry),
+		triggers:       make(map[string]*triggerEntry),
 		columnDefaults: make(map[string]interface{}),
 		autoCommit:     true,
 		funcRegistry:   functions.NewFuncRegistry(),
@@ -391,6 +407,10 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 		return db.execDropTable(filtered)
 	case "drop_index":
 		return db.execDropIndex(filtered)
+	case "create_trigger":
+		return db.execCreateTrigger(filtered, sql)
+	case "drop_trigger":
+		return db.execDropTrigger(filtered)
 	case "alter":
 		return db.execAlterTable(filtered, sql)
 	case "rename_table":
@@ -398,9 +418,9 @@ func (db *Database) execSingle(sql string, args []interface{}) error {
 	case "insert":
 		return db.execInsert(filtered, args)
 	case "delete":
-		return db.executeDML(sql, args)
+		return db.executeDMLWithTriggers(sql, args, filtered)
 	case "update":
-		return db.executeDML(sql, args)
+		return db.executeDMLWithTriggers(sql, args, filtered)
 	case "begin":
 		db.mu.Unlock()
 		err := db.Begin()
@@ -1948,7 +1968,12 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 			}
 		}
 
-		if isReplace {
+		if db.hasInsteadOfTrigger(tableName, "INSERT") {
+			// INSTEAD OF trigger: fire trigger body instead of actual insert
+			if err := db.fireTriggers(tableName, "INSTEAD OF", "INSERT"); err != nil {
+				return err
+			}
+		} else if isReplace {
 			if err := db.handleReplace(tbl, colList, values, args); err != nil {
 				return err
 			}
@@ -1956,8 +1981,8 @@ func (db *Database) execInsert(tokens []compile.Token, args []interface{}) error
 			if err := db.insertRow(tbl, colList, values, args); err != nil {
 				return err
 			}
-		}
 
+		}
 		if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
 			pos++
 			continue
@@ -2072,6 +2097,11 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 	keyBuf := make([]byte, 9)
 	keyLen := encodeVarintKey(keyBuf, newRowID)
 
+	// Fire BEFORE INSERT triggers
+	if err := db.fireTriggers(tbl.name, "BEFORE", "INSERT"); err != nil {
+		return err
+	}
+
 	err = db.bt.Insert(cursor, keyBuf[:keyLen], data, btree.RowID(newRowID), btree.SeekNotFound)
 	if err != nil {
 		return NewErrorf(Error, "insert: %s", err)
@@ -2091,6 +2121,11 @@ func (db *Database) insertRow(tbl *tableEntry, colList []string, values []interf
 			db.bt.Rollback()
 			db.pgr.Rollback()
 		}
+		return err
+	}
+
+	// Fire AFTER INSERT triggers
+	if err := db.fireTriggers(tbl.name, "AFTER", "INSERT"); err != nil {
 		return err
 	}
 
@@ -2204,6 +2239,11 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 	}
 	cursor.Close()
 
+	// Fire BEFORE DELETE triggers
+	if err := db.fireTriggers(tableName, "BEFORE", "DELETE"); err != nil {
+		return err
+	}
+
 	// Delete rows first, then check FK constraints (so self-referencing works)
 	for _, row := range rowsToDelete {
 		if err := db.deleteRowByID(tbl, row.rowID); err != nil {
@@ -2238,6 +2278,12 @@ func (db *Database) execDelete(tokens []compile.Token, args []interface{}) error
 
 	db.changes = count
 	db.totalChanges += count
+
+	// Fire AFTER DELETE triggers
+	if err := db.fireTriggers(tableName, "AFTER", "DELETE"); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -2405,6 +2451,11 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 	}
 
 
+			// Fire BEFORE UPDATE triggers
+			if err := db.fireTriggers(tableName, "BEFORE", "UPDATE"); err != nil {
+				return err
+			}
+
 		// Now apply all updates
 		var count int64
 		for _, upd := range updates {
@@ -2431,6 +2482,12 @@ func (db *Database) execUpdate(tokens []compile.Token, args []interface{}) error
 
 		db.changes = count
 		db.totalChanges += count
+
+			// Fire AFTER UPDATE triggers
+			if err := db.fireTriggers(tableName, "AFTER", "UPDATE"); err != nil {
+				return err
+			}
+
 		return nil
 	}
 
@@ -2704,6 +2761,50 @@ func (db *Database) executeDML(sql string, args []interface{}) error {
 	}
 	return nil
 }
+// executeDMLWithTriggers runs a DML statement through VDBE with trigger support.
+func (db *Database) executeDMLWithTriggers(sql string, args []interface{}, filtered []compile.Token) error {
+	tableName := ""
+	trigEvent := ""
+	if len(filtered) > 0 {
+		switch strings.ToLower(filtered[0].Value) {
+		case "delete":
+			trigEvent = "DELETE"
+			for i := 1; i < len(filtered); i++ {
+				if isKeyword(filtered[i], "from") && i+1 < len(filtered) {
+					tableName = filtered[i+1].Value
+					break
+				}
+			}
+		case "update":
+			trigEvent = "UPDATE"
+			if len(filtered) > 1 {
+				tableName = filtered[1].Value
+			}
+		}
+	}
+
+	// Fire BEFORE triggers
+	if tableName != "" {
+		if err := db.fireTriggers(tableName, "BEFORE", trigEvent); err != nil {
+			return err
+		}
+	}
+
+	// Execute the DML via VDBE
+	if err := db.executeDML(sql, args); err != nil {
+		return err
+	}
+
+	// Fire AFTER triggers
+	if tableName != "" {
+		if err := db.fireTriggers(tableName, "AFTER", trigEvent); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // executeQuery runs a SQL query through the compile pipeline and VDBE.
 func (db *Database) executeQuery(sql string, args []interface{}) (*ResultSet, error) {
 	// Parse
@@ -7297,6 +7398,8 @@ func classifyStatement(tokens []compile.Token) string {
 				return "create_view"
 			case "index":
 				return "create_index"
+			case "trigger":
+				return "create_trigger"
 			}
 		}
 		return "create"
@@ -7310,6 +7413,8 @@ func classifyStatement(tokens []compile.Token) string {
 				return "drop_table"
 			case "index":
 				return "drop_index"
+			case "trigger":
+				return "drop_trigger"
 			}
 		}
 		return "drop"
@@ -7539,23 +7644,97 @@ func splitStatements(sql string) []string {
 	var stmts []string
 	var current strings.Builder
 	inString := false
+	beginDepth := 0
+	// tokens is used to detect CREATE TRIGGER ... BEGIN pattern
+	triggerPending := false
 
-	for i := 0; i < len(sql); i++ {
+	i := 0
+	for i < len(sql) {
 		c := sql[i]
+
+		// Handle string literals
 		if c == '\'' {
 			inString = !inString
 			current.WriteByte(c)
+			i++
 			continue
 		}
-		if c == ';' && !inString {
+		if inString {
+			current.WriteByte(c)
+			i++
+			continue
+		}
+
+		// Inside a trigger body (BEGIN...END block)
+		if beginDepth > 0 {
+			if c == ';' {
+				// Keep semicolons inside trigger body as part of the statement
+				current.WriteByte(c)
+				i++
+				continue
+			}
+			// Check for END keyword (case-insensitive)
+			if i+3 <= len(sql) {
+				word := sql[i:]
+				if len(word) >= 3 && strings.EqualFold(word[:3], "end") {
+					after := byte(0)
+					if i+3 < len(sql) {
+						after = sql[i+3]
+					}
+					if after == 0 || after == ' ' || after == '\t' || after == '\n' || after == '\r' || after == ';' {
+						current.WriteString(sql[i : i+3])
+						beginDepth--
+						i += 3
+						continue
+					}
+				}
+			}
+			// Check for nested BEGIN
+			if i+5 <= len(sql) {
+				word := sql[i:]
+				if len(word) >= 5 && strings.EqualFold(word[:5], "begin") {
+					after := byte(0)
+					if i+5 < len(sql) {
+						after = sql[i+5]
+					}
+					if after == 0 || after == ' ' || after == '\t' || after == '\n' || after == '\r' {
+						beginDepth++
+						current.WriteString(sql[i : i+5])
+						i += 5
+						continue
+					}
+				}
+			}
+			current.WriteByte(c)
+			i++
+			continue
+		}
+
+		// Top-level: split on semicolons
+		if c == ';' {
 			s := strings.TrimSpace(current.String())
 			if s != "" {
 				stmts = append(stmts, s)
 			}
 			current.Reset()
+			triggerPending = false
+			i++
 			continue
 		}
+
 		current.WriteByte(c)
+
+		// Detect CREATE TRIGGER ... to prepare for BEGIN tracking
+		upper := strings.ToUpper(current.String())
+		if strings.Contains(upper, "TRIGGER") && !triggerPending {
+			triggerPending = true
+		}
+		// When we see BEGIN after TRIGGER, start tracking
+		if triggerPending && strings.HasSuffix(upper, "BEGIN") {
+			beginDepth = 1
+			triggerPending = false
+		}
+		i++
 	}
 
 	s := strings.TrimSpace(current.String())
@@ -7763,4 +7942,234 @@ func (db *Database) resolveSubqueries(expr string, args []interface{}) string {
 func heapCopyMem(m *vdbe.Mem) *vdbe.Mem {
 	cp := *m
 	return &cp
+}
+
+// --- Trigger support ---
+
+// execCreateTrigger handles CREATE TRIGGER statements.
+func (db *Database) execCreateTrigger(tokens []compile.Token, sql string) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "create")
+	expectKeyword(tokens, &pos, "trigger")
+
+	ifNotExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "not")
+		expectKeyword(tokens, &pos, "exists")
+		ifNotExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected trigger name")
+	}
+	name := tokens[pos].Value
+	pos++
+
+	if ifNotExists && db.triggers[name] != nil {
+		return nil
+	}
+	if db.triggers[name] != nil {
+		return NewErrorf(Error, "trigger %s already exists", name)
+	}
+
+	triggerTime := "AFTER"
+	if pos < len(tokens) {
+		if isKeyword(tokens[pos], "before") {
+			triggerTime = "BEFORE"
+			pos++
+		} else if isKeyword(tokens[pos], "after") {
+			triggerTime = "AFTER"
+			pos++
+		} else if isKeyword(tokens[pos], "instead") {
+			pos++
+			expectKeyword(tokens, &pos, "of")
+			triggerTime = "INSTEAD OF"
+		}
+	}
+
+	triggerEvent := ""
+	var updateCols []string
+	if pos < len(tokens) {
+		switch {
+		case isKeyword(tokens[pos], "delete"):
+			triggerEvent = "DELETE"
+			pos++
+		case isKeyword(tokens[pos], "insert"):
+			triggerEvent = "INSERT"
+			pos++
+		case isKeyword(tokens[pos], "update"):
+			triggerEvent = "UPDATE"
+			pos++
+			if pos < len(tokens) && isKeyword(tokens[pos], "of") {
+				triggerEvent = "UPDATE OF"
+				pos++
+				for pos < len(tokens) && !isKeyword(tokens[pos], "on") {
+					col := tokens[pos].Value
+					pos++
+					updateCols = append(updateCols, col)
+					if pos < len(tokens) && tokens[pos].Type == compile.TokenComma {
+						pos++
+					}
+				}
+			}
+		default:
+			return NewErrorf(Error, "expected DELETE, INSERT, or UPDATE in trigger, got: %s", tokens[pos].Value)
+		}
+	}
+
+	expectKeyword(tokens, &pos, "on")
+	if pos >= len(tokens) {
+		return NewError(Error, "expected table name after ON")
+	}
+	tableName := tokens[pos].Value
+	pos++
+
+	if _, ok := db.tables[tableName]; !ok {
+		return NewErrorf(Error, "no such table: %s", tableName)
+	}
+
+	forEachRow := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "for") {
+		pos++
+		expectKeyword(tokens, &pos, "each")
+		expectKeyword(tokens, &pos, "row")
+		forEachRow = true
+	}
+
+	whenExpr := ""
+	if pos < len(tokens) && isKeyword(tokens[pos], "when") {
+		pos++
+		var whenParts []string
+		for pos < len(tokens) && !isKeyword(tokens[pos], "begin") {
+			whenParts = append(whenParts, tokens[pos].Value)
+			pos++
+		}
+		whenExpr = strings.Join(whenParts, " ")
+	}
+
+	expectKeyword(tokens, &pos, "begin")
+
+	var bodySQLs []string
+	var currentStmt []string
+	for pos < len(tokens) && !isKeyword(tokens[pos], "end") {
+		if tokens[pos].Type == compile.TokenSemi {
+			if len(currentStmt) > 0 {
+				bodySQLs = append(bodySQLs, strings.Join(currentStmt, " "))
+				currentStmt = nil
+			}
+			pos++
+			continue
+		}
+		currentStmt = append(currentStmt, tokens[pos].Value)
+		pos++
+	}
+	if len(currentStmt) > 0 {
+		bodySQLs = append(bodySQLs, strings.Join(currentStmt, " "))
+	}
+
+	if pos < len(tokens) && isKeyword(tokens[pos], "end") {
+		pos++
+	}
+
+	trig := &triggerEntry{
+		name:       name,
+		tableName:  tableName,
+		time:       triggerTime,
+		event:      triggerEvent,
+		updateCols: updateCols,
+		forEachRow: forEachRow,
+		whenExpr:   whenExpr,
+		bodySQLs:   bodySQLs,
+	}
+	db.triggers[name] = trig
+
+	db.masterEntries = append(db.masterEntries, sqliteMasterEntry{
+		Type:     "trigger",
+		Name:     name,
+		TblName:  tableName,
+		RootPage: 0,
+		SQL:      sql,
+	})
+
+	return nil
+}
+
+// execDropTrigger handles DROP TRIGGER statements.
+func (db *Database) execDropTrigger(tokens []compile.Token) error {
+	pos := 0
+	expectKeyword(tokens, &pos, "drop")
+	expectKeyword(tokens, &pos, "trigger")
+
+	ifExists := false
+	if pos < len(tokens) && isKeyword(tokens[pos], "if") {
+		expectKeyword(tokens, &pos, "if")
+		expectKeyword(tokens, &pos, "exists")
+		ifExists = true
+	}
+
+	if pos >= len(tokens) {
+		return NewError(Error, "expected trigger name")
+	}
+	name := tokens[pos].Value
+	pos++
+
+	if db.triggers[name] == nil {
+		if ifExists {
+			return nil
+		}
+		return NewErrorf(Error, "no such trigger: %s", name)
+	}
+
+	delete(db.triggers, name)
+
+	for i, entry := range db.masterEntries {
+		if entry.Type == "trigger" && entry.Name == name {
+			db.masterEntries = append(db.masterEntries[:i], db.masterEntries[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+// fireTriggers executes triggers for the given table, time, and event.
+func (db *Database) fireTriggers(tableName, trigTime, trigEvent string) error {
+	for _, trig := range db.triggers {
+		if trig.tableName != tableName || trig.time != trigTime {
+			continue
+		}
+		if !trigEventMatches(trig.event, trigEvent, trig.updateCols) {
+			continue
+		}
+		for _, bodySQL := range trig.bodySQLs {
+			if err := db.execSingle(bodySQL, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// hasInsteadOfTrigger checks if there is an INSTEAD OF trigger for the given table and event.
+func (db *Database) hasInsteadOfTrigger(tableName, trigEvent string) bool {
+	for _, trig := range db.triggers {
+		if trig.tableName == tableName && trig.time == "INSTEAD OF" {
+			if trigEventMatches(trig.event, trigEvent, trig.updateCols) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// trigEventMatches checks if a trigger's event matches the actual event.
+func trigEventMatches(triggerEvent, actualEvent string, updateCols []string) bool {
+	if triggerEvent == actualEvent {
+		return true
+	}
+	if triggerEvent == "UPDATE OF" && actualEvent == "UPDATE" {
+		return true
+	}
+	return false
 }

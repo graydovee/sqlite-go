@@ -1196,9 +1196,12 @@ func TestIndex18(t *testing.T) {
 		t.Skip("CREATE VIEW not yet supported")
 	})
 
-	// index-18.4: CREATE TRIGGER sqlite_tr1
+	// index-18.4: CREATE TRIGGER
 	t.Run("index-18.4", func(t *testing.T) {
-		t.Skip("CREATE TRIGGER not yet supported")
+		db := openTestDB(t)
+		mustExec(t, db, "CREATE TABLE t7(a INTEGER PRIMARY KEY, b)")
+		mustExec(t, db, "CREATE TRIGGER sqlite_tr1 AFTER INSERT ON t7 BEGIN SELECT 1; END")
+		// Trigger should be created without error
 	})
 
 	// index-18.5: DROP TABLE t7
